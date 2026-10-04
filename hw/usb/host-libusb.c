@@ -40,6 +40,10 @@
 #endif
 #include <libusb.h>
 
+#if defined(CONFIG_WIN32) || defined(CONFIG_DARWIN)
+#define USB_HOST_EVENT_THREAD
+#endif
+
 #ifdef CONFIG_LINUX
 #include <sys/ioctl.h>
 #include <linux/usbdevice_fs.h>
@@ -241,7 +245,7 @@ static const char *err_names[] = {
 static libusb_context *ctx;
 static uint32_t loglevel;
 
-#ifndef CONFIG_WIN32
+#ifndef USB_HOST_EVENT_THREAD
 
 static void usb_host_handle_fd(void *opaque)
 {
@@ -267,8 +271,9 @@ static void usb_host_del_fd(int fd, void *user_data)
 #else
 
 /*
- * No pollable fds on Windows: a thread handles libusb events and
- * queues completions; a bottom half runs them under the BQL.
+ * Windows has no pollable libusb fds, and on macOS fd wakeups wait for
+ * the main loop: a thread handles libusb events and queues completions;
+ * a bottom half runs them under the BQL.
  */
 typedef struct USBHostDone {
     libusb_transfer_cb_fn            fn;
@@ -337,18 +342,11 @@ static void LIBUSB_CALL fn##_deferred(struct libusb_transfer *xfer)     \
     usb_host_done_queue(fn, xfer);                                      \
 }
 
-static void usb_host_events_wait(long usec)
-{
-    struct timeval tv = { 0, usec };
-
-    libusb_handle_events_timeout(ctx, &tv);
-}
-
-#endif /* !CONFIG_WIN32 */
+#endif /* !USB_HOST_EVENT_THREAD */
 
 static int usb_host_init(void)
 {
-#ifndef CONFIG_WIN32
+#ifndef USB_HOST_EVENT_THREAD
     const struct libusb_pollfd **poll;
 #endif
     int rc;
@@ -365,7 +363,7 @@ static int usb_host_init(void)
 #else
     libusb_set_debug(ctx, loglevel);
 #endif
-#ifdef CONFIG_WIN32
+#ifdef USB_HOST_EVENT_THREAD
     qemu_mutex_init(&done_lock);
     done_bh = qemu_bh_new(usb_host_done_run, NULL);
     qemu_thread_create(&event_thread, "usb-host-events",
@@ -627,7 +625,7 @@ usb_host_req_complete_iso(struct libusb_transfer *transfer)
     }
 }
 
-#ifdef CONFIG_WIN32
+#ifdef USB_HOST_EVENT_THREAD
 USB_HOST_DEFER(usb_host_req_complete_ctrl)
 USB_HOST_DEFER(usb_host_req_complete_data)
 USB_HOST_DEFER(usb_host_req_complete_iso)
@@ -1228,7 +1226,7 @@ static void usb_host_abort_xfers(USBHostDevice *s)
     }
 
     while (QTAILQ_FIRST(&s->requests) != NULL) {
-#ifdef CONFIG_WIN32
+#ifdef USB_HOST_EVENT_THREAD
         usb_host_events_wait(2500);
 #else
         struct timeval tv;
