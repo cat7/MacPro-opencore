@@ -60,7 +60,7 @@ static void flat_write(void *opaque, uint32_t addr, const void *buf, uint32_t le
     }
 }
 
-static void __attribute__((format(printf, 3, 0))) flat_log(void *opaque, int level, const char *fmt, va_list ap)
+static void R5XX_PRINTF(3, 0) flat_log(void *opaque, int level, const char *fmt, va_list ap)
 {
     R5xxFlatMem *fm = opaque;
     if (level <= fm->log_level) {

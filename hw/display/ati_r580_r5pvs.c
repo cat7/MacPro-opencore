@@ -326,7 +326,7 @@ static void decode_inst(PvsInst *in, const uint32_t *w)
 }
 
 static void set_err(char *err, size_t errlen, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    R5XX_PRINTF(3, 4);
 
 static void set_err(char *err, size_t errlen, const char *fmt, ...)
 {
@@ -1247,7 +1247,7 @@ typedef struct StrBuf {
 } StrBuf;
 
 static void sb_printf(StrBuf *sb, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    R5XX_PRINTF(2, 3);
 
 static void sb_printf(StrBuf *sb, const char *fmt, ...)
 {
@@ -1378,7 +1378,7 @@ typedef struct GlslBuf {
     bool oom;
 } GlslBuf;
 
-static void __attribute__((format(printf, 2, 0)))
+static void R5XX_PRINTF(2, 0)
 gb_vprintf(GlslBuf *g, const char *fmt, va_list ap)
 {
     va_list ap2;
@@ -1408,7 +1408,7 @@ gb_vprintf(GlslBuf *g, const char *fmt, va_list ap)
 }
 
 static void gb_printf(GlslBuf *g, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    R5XX_PRINTF(2, 3);
 
 static void gb_printf(GlslBuf *g, const char *fmt, ...)
 {

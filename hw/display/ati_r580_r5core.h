@@ -15,6 +15,12 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+#if defined(__MINGW32__) && !defined(__clang__)
+#define R5XX_PRINTF(f, a) __attribute__((format(gnu_printf, f, a)))
+#else
+#define R5XX_PRINTF(f, a) __attribute__((format(printf, f, a)))
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Basic math types                                                    */
 /* ------------------------------------------------------------------ */
@@ -54,7 +60,7 @@ typedef struct R5xxMem {
     void (*written)(void *opaque, uint8_t *host, uint32_t len);
     /* diagnostic output, level: 0 = error, 1 = warning, 2 = info, 3 = debug */
     void (*log)(void *opaque, int level, const char *fmt, va_list ap)
-        __attribute__((format(printf, 3, 0)));
+        R5XX_PRINTF(3, 0);
 } R5xxMem;
 
 static inline uint32_t r5xx_mem_read32(const R5xxMem *m, uint32_t addr)
@@ -70,7 +76,7 @@ static inline void r5xx_mem_write32(const R5xxMem *m, uint32_t addr, uint32_t v)
 }
 
 void r5xx_logf(const R5xxMem *m, int level, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+    R5XX_PRINTF(3, 4);
 
 /* A trivial R5xxMem backed by a flat host buffer. */
 typedef struct R5xxFlatMem {

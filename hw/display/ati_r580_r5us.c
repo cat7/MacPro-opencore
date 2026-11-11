@@ -790,7 +790,7 @@ typedef struct UsOut {
     size_t pos;     /* characters that would have been written */
 } UsOut;
 
-static void out_printf(UsOut *o, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void out_printf(UsOut *o, const char *fmt, ...) R5XX_PRINTF(2, 3);
 
 static void out_printf(UsOut *o, const char *fmt, ...)
 {
@@ -1830,8 +1830,8 @@ typedef struct GlslOut {
     size_t len, cap;
 } GlslOut;
 
-static void g_printf(GlslOut *o, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-static void g_printf(GlslOut *o, const char *fmt, ...)
+static void glsl_printf(GlslOut *o, const char *fmt, ...) R5XX_PRINTF(2, 3);
+static void glsl_printf(GlslOut *o, const char *fmt, ...)
 {
     va_list ap;
     int n;
@@ -1937,9 +1937,9 @@ static void glsl_omod(GlslOut *o, const char *v, unsigned omod, bool clamp)
     if (omod == R500_OMOD_DISABLE) {
         return;
     }
-    g_printf(o, "    %s = us_flush(%s%s);\n", v, v, omod < 7 ? mul[omod] : "");
+    glsl_printf(o, "    %s = us_flush(%s%s);\n", v, v, omod < 7 ? mul[omod] : "");
     if (clamp) {
-        g_printf(o, "    %s = (%s >= 0.0) ? min(%s, 1.0) : 0.0;\n", v, v, v);
+        glsl_printf(o, "    %s = (%s >= 0.0) ? min(%s, 1.0) : 0.0;\n", v, v, v);
     }
 }
 
@@ -1960,114 +1960,114 @@ static bool glsl_alu(GlslOut *o, const R500UsDecoded *d, const UsInst *in)
     if (a->rgb_dest_rel || a->alpha_dest_rel) {
         return false;
     }
-    g_printf(o, "  {\n    vec4 S0, S1, S2, SP, A, B, C; vec3 R; float AV;\n");
+    glsl_printf(o, "  {\n    vec4 S0, S1, S2, SP, A, B, C; vec3 R; float AV;\n");
     for (k = 0; k < 3; k++) {
         glsl_src(sr, sizeof(sr), &a->rgb_addr[k]);
         glsl_src(sa, sizeof(sa), &a->alpha_addr[k]);
-        g_printf(o, "    S%d = vec4((%s).xyz, (%s).w);\n", k, sr, sa);
+        glsl_printf(o, "    S%d = vec4((%s).xyz, (%s).w);\n", k, sr, sa);
     }
     for (c = 0; c < 3; c++) {
         char s0[16], s1[16];
         snprintf(s0, sizeof(s0), "S0.%s", chn[c]);
         snprintf(s1, sizeof(s1), "S1.%s", chn[c]);
-        g_printf(o, "    SP.%s = %s;\n", chn[c],
+        glsl_printf(o, "    SP.%s = %s;\n", chn[c],
                  glsl_srcp(a->rgb_srcp_op, s0, s1, e, sizeof(e)));
     }
-    g_printf(o, "    SP.w = %s;\n", glsl_srcp(a->alpha_srcp_op, "S0.w", "S1.w", e, sizeof(e)));
+    glsl_printf(o, "    SP.w = %s;\n", glsl_srcp(a->alpha_srcp_op, "S0.w", "S1.w", e, sizeof(e)));
     for (k = 0; k < 3; k++) {
         static const char *names[3] = { "A", "B", "C" };
         static const char *srcs[4] = { "S0", "S1", "S2", "SP" };
         for (c = 0; c < 3; c++) {
             glsl_swz(a->rgb_arg[k].swz[c], srcs[a->rgb_arg[k].sel], e, sizeof(e));
-            g_printf(o, "    %s.%s = %s;\n", names[k], chn[c],
+            glsl_printf(o, "    %s.%s = %s;\n", names[k], chn[c],
                      glsl_imod(a->rgb_arg[k].mod, e, e2, sizeof(e2)));
         }
         glsl_swz(a->alpha_arg[k].swz, srcs[a->alpha_arg[k].sel], e, sizeof(e));
-        g_printf(o, "    %s.w = %s;\n", names[k],
+        glsl_printf(o, "    %s.w = %s;\n", names[k],
                  glsl_imod(a->alpha_arg[k].mod, e, e2, sizeof(e2)));
     }
     if (a->rgb_op == R500_RGB_OP_MDH || a->rgb_op == R500_RGB_OP_MDV) {
         unsigned q = a->rgb_op == R500_RGB_OP_MDH ? 1 : 2;
         for (c = 0; c < 3; c++) {
             snprintf(e, sizeof(e), "subgroupQuadBroadcast(S0.%s, 0u)", chn[c]);
-            g_printf(o, "    A.%s = %s;\n", chn[c], glsl_imod(a->rgb_arg[0].mod, e, e2, sizeof(e2)));
+            glsl_printf(o, "    A.%s = %s;\n", chn[c], glsl_imod(a->rgb_arg[0].mod, e, e2, sizeof(e2)));
             snprintf(e, sizeof(e), "subgroupQuadBroadcast(S0.%s, %uu)", chn[c], q);
-            g_printf(o, "    C.%s = %s;\n", chn[c], glsl_imod(a->rgb_arg[2].mod, e, e2, sizeof(e2)));
+            glsl_printf(o, "    C.%s = %s;\n", chn[c], glsl_imod(a->rgb_arg[2].mod, e, e2, sizeof(e2)));
         }
     }
     if (a->alpha_op == R500_ALPHA_OP_MDH || a->alpha_op == R500_ALPHA_OP_MDV) {
         unsigned q = a->alpha_op == R500_ALPHA_OP_MDH ? 1 : 2;
-        g_printf(o, "    A.w = %s;\n", glsl_imod(a->alpha_arg[0].mod,
+        glsl_printf(o, "    A.w = %s;\n", glsl_imod(a->alpha_arg[0].mod,
                  "subgroupQuadBroadcast(S0.w, 0u)", e2, sizeof(e2)));
         snprintf(e, sizeof(e), "subgroupQuadBroadcast(S0.w, %uu)", q);
-        g_printf(o, "    C.w = %s;\n", glsl_imod(a->alpha_arg[2].mod, e, e2, sizeof(e2)));
+        glsl_printf(o, "    C.w = %s;\n", glsl_imod(a->alpha_arg[2].mod, e, e2, sizeof(e2)));
     }
 
     /* RGB unit */
     switch (a->rgb_op) {
     case R500_RGB_OP_MAD: case R500_RGB_OP_MDH: case R500_RGB_OP_MDV:
         for (c = 0; c < 3; c++) {
-            g_printf(o, "    R.%s = %s(A.%s, B.%s) + C.%s;\n", chn[c], mul, chn[c], chn[c], chn[c]);
+            glsl_printf(o, "    R.%s = %s(A.%s, B.%s) + C.%s;\n", chn[c], mul, chn[c], chn[c], chn[c]);
         }
         break;
     case R500_RGB_OP_DP3:
-        g_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + %s(A.z, B.z));\n", mul, mul, mul);
+        glsl_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + %s(A.z, B.z));\n", mul, mul, mul);
         break;
     case R500_RGB_OP_DP4:
-        g_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + %s(A.z, B.z) + %s(A.w, B.w));\n",
+        glsl_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + %s(A.z, B.z) + %s(A.w, B.w));\n",
                  mul, mul, mul, mul);
         break;
     case R500_RGB_OP_D2A:
-        g_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + C.z);\n", mul, mul);
+        glsl_printf(o, "    R = vec3(%s(A.x, B.x) + %s(A.y, B.y) + C.z);\n", mul, mul);
         break;
     case R500_RGB_OP_MIN:
         for (c = 0; c < 3; c++) {
-            g_printf(o, "    R.%s = A.%s < B.%s ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c], chn[c]);
+            glsl_printf(o, "    R.%s = A.%s < B.%s ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c], chn[c]);
         }
         break;
     case R500_RGB_OP_MAX:
         for (c = 0; c < 3; c++) {
-            g_printf(o, "    R.%s = A.%s >= B.%s ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c], chn[c]);
+            glsl_printf(o, "    R.%s = A.%s >= B.%s ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c], chn[c]);
         }
         break;
     case R500_RGB_OP_CND:
         for (c = 0; c < 3; c++) {
-            g_printf(o, "    R.%s = C.%s > 0.5 ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c]);
+            glsl_printf(o, "    R.%s = C.%s > 0.5 ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c]);
         }
         break;
     case R500_RGB_OP_CMP:
         for (c = 0; c < 3; c++) {
-            g_printf(o, "    R.%s = C.%s >= 0.0 ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c]);
+            glsl_printf(o, "    R.%s = C.%s >= 0.0 ? A.%s : B.%s;\n", chn[c], chn[c], chn[c], chn[c]);
         }
         break;
     case R500_RGB_OP_FRC:
-        g_printf(o, "    R = A.xyz - floor(A.xyz);\n");
+        glsl_printf(o, "    R = A.xyz - floor(A.xyz);\n");
         break;
     default:
-        g_printf(o, "    R = vec3(0.0);\n");
+        glsl_printf(o, "    R = vec3(0.0);\n");
         break;
     }
     /* alpha unit */
     switch (a->alpha_op) {
     case R500_ALPHA_OP_MAD: case R500_ALPHA_OP_MDH: case R500_ALPHA_OP_MDV:
-        g_printf(o, "    AV = %s(A.w, B.w) + C.w;\n", mul);
+        glsl_printf(o, "    AV = %s(A.w, B.w) + C.w;\n", mul);
         break;
-    case R500_ALPHA_OP_DP:   g_printf(o, "    AV = R.x;\n"); break;
-    case R500_ALPHA_OP_MIN:  g_printf(o, "    AV = A.w < B.w ? A.w : B.w;\n"); break;
-    case R500_ALPHA_OP_MAX:  g_printf(o, "    AV = A.w >= B.w ? A.w : B.w;\n"); break;
-    case R500_ALPHA_OP_CND:  g_printf(o, "    AV = C.w > 0.5 ? A.w : B.w;\n"); break;
-    case R500_ALPHA_OP_CMP:  g_printf(o, "    AV = C.w >= 0.0 ? A.w : B.w;\n"); break;
-    case R500_ALPHA_OP_FRC:  g_printf(o, "    AV = A.w - floor(A.w);\n"); break;
-    case R500_ALPHA_OP_EX2:  g_printf(o, "    AV = exp2(A.w);\n"); break;
-    case R500_ALPHA_OP_LN2:  g_printf(o, "    AV = log2(A.w);\n"); break;
-    case R500_ALPHA_OP_RCP:  g_printf(o, "    AV = 1.0 / A.w;\n"); break;
-    case R500_ALPHA_OP_RSQ:  g_printf(o, "    AV = A.w == 0.0 ? (1.0/0.0) : 1.0 / sqrt(A.w);\n"); break;
-    case R500_ALPHA_OP_SIN:  g_printf(o, "    AV = sin(A.w * 6.283185307179586);\n"); break;
-    case R500_ALPHA_OP_COS:  g_printf(o, "    AV = cos(A.w * 6.283185307179586);\n"); break;
-    default:                 g_printf(o, "    AV = A.w;\n"); break;
+    case R500_ALPHA_OP_DP:   glsl_printf(o, "    AV = R.x;\n"); break;
+    case R500_ALPHA_OP_MIN:  glsl_printf(o, "    AV = A.w < B.w ? A.w : B.w;\n"); break;
+    case R500_ALPHA_OP_MAX:  glsl_printf(o, "    AV = A.w >= B.w ? A.w : B.w;\n"); break;
+    case R500_ALPHA_OP_CND:  glsl_printf(o, "    AV = C.w > 0.5 ? A.w : B.w;\n"); break;
+    case R500_ALPHA_OP_CMP:  glsl_printf(o, "    AV = C.w >= 0.0 ? A.w : B.w;\n"); break;
+    case R500_ALPHA_OP_FRC:  glsl_printf(o, "    AV = A.w - floor(A.w);\n"); break;
+    case R500_ALPHA_OP_EX2:  glsl_printf(o, "    AV = exp2(A.w);\n"); break;
+    case R500_ALPHA_OP_LN2:  glsl_printf(o, "    AV = log2(A.w);\n"); break;
+    case R500_ALPHA_OP_RCP:  glsl_printf(o, "    AV = 1.0 / A.w;\n"); break;
+    case R500_ALPHA_OP_RSQ:  glsl_printf(o, "    AV = A.w == 0.0 ? (1.0/0.0) : 1.0 / sqrt(A.w);\n"); break;
+    case R500_ALPHA_OP_SIN:  glsl_printf(o, "    AV = sin(A.w * 6.283185307179586);\n"); break;
+    case R500_ALPHA_OP_COS:  glsl_printf(o, "    AV = cos(A.w * 6.283185307179586);\n"); break;
+    default:                 glsl_printf(o, "    AV = A.w;\n"); break;
     }
     if (a->rgb_op == R500_RGB_OP_SOP) {
-        g_printf(o, "    R = vec3(AV);\n");
+        glsl_printf(o, "    R = vec3(AV);\n");
     }
     for (c = 0; c < 3; c++) {
         snprintf(e, sizeof(e), "R.%s", chn[c]);
@@ -2075,47 +2075,47 @@ static bool glsl_alu(GlslOut *o, const R500UsDecoded *d, const UsInst *in)
     }
     glsl_omod(o, "AV", a->alpha_omod, in->alpha_clamp);
     if (a->alu_wmask) {
-        g_printf(o, "    alu_result = us_cmp(%s, %uu);\n",
+        glsl_printf(o, "    alu_result = us_cmp(%s, %uu);\n",
                  in->alu_result_sel ? "AV" : "R.x", in->alu_result_op);
     }
-    g_printf(o, "    uint rpm = us_pm(pred, %uu, %s), apm = us_pm(pred, %uu, %s);\n",
+    glsl_printf(o, "    uint rpm = us_pm(pred, %uu, %s), apm = us_pm(pred, %uu, %s);\n",
              rgb_sel_pm, in->rgb_pred_inv ? "true" : "false",
              a_sel_pm, in->alpha_pred_inv ? "true" : "false");
     for (c = 0; c < 3; c++) {
         if ((in->rgb_wmask >> c) & 1) {
-            g_printf(o, "    if ((rpm & %uu) != 0u) t%u.%s = R.%s;\n",
+            glsl_printf(o, "    if ((rpm & %uu) != 0u) t%u.%s = R.%s;\n",
                      1u << c, a->rgb_dest & 127, chn[c], chn[c]);
         }
     }
     if (in->alpha_wmask) {
-        g_printf(o, "    if ((apm & 8u) != 0u) t%u.w = AV;\n", a->alpha_dest & 127);
+        glsl_printf(o, "    if ((apm & 8u) != 0u) t%u.w = AV;\n", a->alpha_dest & 127);
     }
     if (in->type == R500_INST_TYPE_OUT) {
         for (c = 0; c < 3; c++) {
             if ((in->rgb_omask >> c) & 1) {
-                g_printf(o, "    if ((rpm & %uu) != 0u) us_out[%u].%s = R.%s;\n",
+                glsl_printf(o, "    if ((rpm & %uu) != 0u) us_out[%u].%s = R.%s;\n",
                          1u << c, a->rgb_target, chn[c], chn[c]);
             }
         }
         if (in->alpha_omask) {
-            g_printf(o, "    if ((apm & 8u) != 0u) us_out[%u].w = AV;\n", a->alpha_target);
+            glsl_printf(o, "    if ((apm & 8u) != 0u) us_out[%u].w = AV;\n", a->alpha_target);
         }
         if (a->w_omask) {
-            g_printf(o, "    if ((apm & 8u) != 0u) { us_depth = AV; us_depth_written = true; }\n");
+            glsl_printf(o, "    if ((apm & 8u) != 0u) { us_depth = AV; us_depth_written = true; }\n");
         }
     } else {
         for (c = 0; c < 3; c++) {
             if ((in->rgb_omask >> c) & 1) {
-                g_printf(o, "    pred = us_cmp(R.%s, %uu) ? (pred | %uu) : (pred & ~%uu);\n",
+                glsl_printf(o, "    pred = us_cmp(R.%s, %uu) ? (pred | %uu) : (pred & ~%uu);\n",
                          chn[c], a->rgb_target, 1u << c, 1u << c);
             }
         }
         if (in->alpha_omask) {
-            g_printf(o, "    pred = us_cmp(AV, %uu) ? (pred | 8u) : (pred & ~8u);\n",
+            glsl_printf(o, "    pred = us_cmp(AV, %uu) ? (pred | 8u) : (pred & ~8u);\n",
                      a->alpha_target);
         }
     }
-    g_printf(o, "  }\n");
+    glsl_printf(o, "  }\n");
     (void)e3;
     return true;
 }
@@ -2141,13 +2141,13 @@ static bool glsl_tex(GlslOut *o, const UsInst *in)
         return true;
     }
     glsl_texcoord(c, sizeof(c), t->src, t->src_swz);
-    g_printf(o, "  {\n    uint pm = (us_pm(pred, %uu, %s) & 7u) | (us_pm(pred, %uu, %s) & 8u);\n",
+    glsl_printf(o, "  {\n    uint pm = (us_pm(pred, %uu, %s) & 7u) | (us_pm(pred, %uu, %s) & 8u);\n",
              in->rgb_pred_sel, in->rgb_pred_inv ? "true" : "false",
              in->alpha_pred_sel, in->alpha_pred_inv ? "true" : "false");
-    g_printf(o, "    uint mask = %uu & pm;\n", in->rgb_wmask | (in->alpha_wmask << 3));
+    glsl_printf(o, "    uint mask = %uu & pm;\n", in->rgb_wmask | (in->alpha_wmask << 3));
     if (t->op == R500_TEX_INST_TEXKILL) {
-        g_printf(o, "    vec4 kv = t%u;\n", t->src & 127);
-        g_printf(o, "    for (int c = 0; c < 4; c++) {\n"
+        glsl_printf(o, "    vec4 kv = t%u;\n", t->src & 127);
+        glsl_printf(o, "    for (int c = 0; c < 4; c++) {\n"
                     "      if (((mask >> c) & 1u) != 0u && !isnan(kv[c]) &&\n"
                     "          (floatBitsToUint(kv[c]) & 0x80000000u) != 0u) { us_killed = true; break; }\n"
                     "    }\n  }\n");
@@ -2160,18 +2160,18 @@ static bool glsl_tex(GlslOut *o, const UsInst *in)
         snprintf(dx, sizeof(dx), "vec4(0.0)");
         snprintf(dy, sizeof(dy), "vec4(0.0)");
     }
-    g_printf(o, "    vec4 r = us_tex(%u, %u, %s, %s, %s, %s);\n", t->unit, t->op,
+    glsl_printf(o, "    vec4 r = us_tex(%u, %u, %s, %s, %s, %s);\n", t->unit, t->op,
              t->unscaled ? "true" : "false", c, dx, dy);
     if (t->ignore_uncovered) {
-        g_printf(o, "    if (!gl_HelperInvocation && !us_killed) {\n");
+        glsl_printf(o, "    if (!gl_HelperInvocation && !us_killed) {\n");
     } else {
-        g_printf(o, "    {\n");
+        glsl_printf(o, "    {\n");
     }
     for (k = 0; k < 4; k++) {
-        g_printf(o, "      if ((mask & %uu) != 0u) t%u.%c = r.%c;\n", 1u << k,
+        glsl_printf(o, "      if ((mask & %uu) != 0u) t%u.%c = r.%c;\n", 1u << k,
                  t->dst & 127, ch[k], ch[t->dst_swz[k] & 3]);
     }
-    g_printf(o, "    }\n  }\n");
+    glsl_printf(o, "    }\n  }\n");
     return true;
 }
 
@@ -2209,15 +2209,15 @@ char *r500_us_to_glsl(const R500UsDecoded *d, const uint8_t tex_kind[16])
             pc = (pc + 1) % US_NUM_INST;
         }
         steps = 0;
-        g_printf(&o, "void us_run()\n{\n  uint pred = 0u; bool alu_result = false;\n");
+        glsl_printf(&o, "void us_run()\n{\n  uint pred = 0u; bool alu_result = false;\n");
         for (i = 0; i < 128; i++) {
             if (!used[i]) {
                 continue;
             }
             if (i < R500_US_MAX_INPUTS) {
-                g_printf(&o, "  vec4 t%d = us_input(%d);\n", i, i);
+                glsl_printf(&o, "  vec4 t%d = us_input(%d);\n", i, i);
             } else {
-                g_printf(&o, "  vec4 t%d = vec4(0.0);\n", i);
+                glsl_printf(&o, "  vec4 t%d = vec4(0.0);\n", i);
             }
         }
     }
@@ -2251,7 +2251,7 @@ char *r500_us_to_glsl(const R500UsDecoded *d, const uint8_t tex_kind[16])
             return NULL;
         }
     }
-    g_printf(&o, "  if (alu_result) {}\n}\n");
+    glsl_printf(&o, "  if (alu_result) {}\n}\n");
     return o.buf;
 }
 
