@@ -34,6 +34,17 @@
 /* TSC handling */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
+#if defined(__APPLE__) && !defined(__x86_64__)
+    /*
+     * The macOS host tick source is a nanosecond clock (include/qemu/timer.h),
+     * so a TCG guest's TSC would run at exactly 1 GHz.  Mac OS X 10.6 sets
+     * kSlow for TSCs at or below ~1 GHz and then panics building its commpage
+     * ("commpage no match").  Honor -cpu ...,tsc-frequency= by scaling.
+     */
+    if (env->tsc_khz) {
+        return muldiv64(cpus_get_elapsed_ticks(), env->tsc_khz, 1000000);
+    }
+#endif
     return cpus_get_elapsed_ticks();
 }
 

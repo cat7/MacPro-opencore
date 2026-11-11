@@ -966,6 +966,18 @@ static inline int64_t cpu_get_host_ticks(void)
     return val;
 }
 
+#elif defined(__APPLE__)
+/*
+ * macOS on Apple silicon: CLOCK_MONOTONIC (the get_clock() fallback below)
+ * only has microsecond resolution, so a TCG guest's TSC would advance in
+ * 1000-tick steps.  Mac OS X 10.6 times two context switches with it at boot
+ * (sched_startup/time_cswitch) and spins forever when the delta is 0.
+ */
+static inline int64_t cpu_get_host_ticks(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
 #else
 /* The host CPU doesn't have an easily accessible cycle counter.
    Just return a monotonically increasing value.  This will be
