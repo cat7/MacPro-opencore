@@ -1605,15 +1605,15 @@ static void r5g_dump(ATIR580R5Gpu *g, const R5GSurf *sf, const uint8_t *vram)
                             "%s/r5diff-%02u-t%u.bin", g->s->r5g_dump,
                             g->dumps, u);
                         FILE *tf = fopen(tn, "wb");
-                        int w = q->ti[u][0][0], h = q->ti[u][0][1], y, x;
+                        int tw = q->ti[u][0][0], th = q->ti[u][0][1], ty, tx;
                         int bpp = (q->ti[u][2][0] + q->ti[u][2][1] +
                                    q->ti[u][2][2] + q->ti[u][2][3] + 7) / 8;
 
                         bpp = bpp > 2 ? 4 : bpp;
-                        for (y = 0; tf && y < h; y++) {
-                            for (x = 0; x < w; x++) {
+                        for (ty = 0; tf && ty < th; ty++) {
+                            for (tx = 0; tx < tw; tx++) {
                                 uint32_t a = g->vtex[u].addr +
-                                             y * g->vtex[u].pitch + bpp * x;
+                                             ty * g->vtex[u].pitch + bpp * tx;
                                 uint32_t v = ati_r580_mc_read32(g->s, a & ~3u);
 
                                 v >>= 8 * (a & 3);
@@ -1632,11 +1632,11 @@ static void r5g_dump(ATIR580R5Gpu *g, const R5GSurf *sf, const uint8_t *vram)
                         q->consts[4 * i + 3]);
             }
             for (i = 0; i < q->nvert && i < 600; i++) {
-                unsigned k;
+                unsigned c;
 
                 fprintf(f, "v%u", i);
-                for (k = 0; k < fl; k++) {
-                    fprintf(f, " %.9g", q->verts[i * fl + k]);
+                for (c = 0; c < fl; c++) {
+                    fprintf(f, " %.9g", q->verts[i * fl + c]);
                 }
                 fprintf(f, "\n");
             }
