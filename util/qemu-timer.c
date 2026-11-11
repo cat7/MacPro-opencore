@@ -44,6 +44,10 @@
 #include <sys/prctl.h>
 #endif
 
+#ifdef CONFIG_DARWIN
+#include <sys/event.h>
+#endif
+
 /***********************************************************/
 /* timers */
 
@@ -321,6 +325,85 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#ifdef CONFIG_DARWIN
+/*
+ * g_poll() is select() here: the timeout is rounded up to whole
+ * milliseconds and the kernel may defer the wakeup by up to a quarter of
+ * it. A kqueue timer with NOTE_CRITICAL fires on time. The kqueue only
+ * waits; g_poll() with a zero timeout then fills in revents. Descriptors
+ * kqueue cannot watch, and G_IO_PRI or error-only requests, use g_poll()
+ * alone.
+ */
+static int qemu_poll_kqueue(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    struct kevent stack_ch[32], stack_ev[32];
+    struct kevent *ch = stack_ch, *ev = stack_ev;
+    int nch = 0, nev, kq, i, ret = -1;
+    guint j;
+    bool fd_ready = false, fallback = false;
+
+    if (nfds * 2 + 1 > ARRAY_SIZE(stack_ch)) {
+        ch = g_new(struct kevent, nfds * 2 + 1);
+        ev = g_new(struct kevent, nfds * 2 + 1);
+    }
+    for (j = 0; j < nfds; j++) {
+        if (fds[j].fd < 0) {
+            continue;
+        }
+        if (!(fds[j].events & (G_IO_IN | G_IO_OUT)) ||
+            (fds[j].events & G_IO_PRI)) {
+            fallback = true;
+            break;
+        }
+        if (fds[j].events & G_IO_IN) {
+            EV_SET(&ch[nch++], fds[j].fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+        }
+        if (fds[j].events & G_IO_OUT) {
+            EV_SET(&ch[nch++], fds[j].fd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
+        }
+    }
+    kq = fallback ? -1 : kqueue();
+    if (kq < 0) {
+        ret = g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+        goto out;
+    }
+    EV_SET(&ch[nch++], 0, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+           NOTE_NSECONDS | NOTE_CRITICAL, timeout, NULL);
+    nev = kevent(kq, ch, nch, ev, nch, NULL);
+    if (nev < 0) {
+        int err = errno;
+
+        close(kq);
+        errno = err;
+        goto out;
+    }
+    close(kq);
+    for (i = 0; i < nev; i++) {
+        if (ev[i].flags & EV_ERROR) {
+            fallback = true;
+        } else if (ev[i].filter != EVFILT_TIMER) {
+            fd_ready = true;
+        }
+    }
+    if (fallback) {
+        ret = g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    } else if (fd_ready) {
+        ret = g_poll(fds, nfds, 0);
+    } else {
+        for (j = 0; j < nfds; j++) {
+            fds[j].revents = 0;
+        }
+        ret = 0;
+    }
+out:
+    if (ch != stack_ch) {
+        g_free(ch);
+        g_free(ev);
+    }
+    return ret;
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
@@ -343,6 +426,11 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
 #else
+#ifdef CONFIG_DARWIN
+    if (timeout > 0) {
+        return qemu_poll_kqueue(fds, nfds, timeout);
+    }
+#endif
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
 }
