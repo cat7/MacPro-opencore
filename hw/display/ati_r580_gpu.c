@@ -213,6 +213,13 @@ bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
     return g && FWD(g, r5_copy, dst, dx, dy, src, sx, sy, w, h);
 }
 
+bool ati_r580_gl_r5_copy_runs(R580GlCtx *g, struct R5GpuImage *dst,
+                              struct R5GpuImage *src, const int *runs,
+                              unsigned n)
+{
+    return g && FWD(g, r5_copy_runs, dst, src, runs, n);
+}
+
 bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
 {
     return g && FWD(g, r5_draw, d);

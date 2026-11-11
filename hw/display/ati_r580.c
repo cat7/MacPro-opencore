@@ -22,6 +22,7 @@
 #include "hw/i2c/i2c.h"
 
 #include "exec/target_page.h"
+#include "hw/core/cpu.h"
 #include "system/physmem.h"
 #include "system/qtest.h"
 #include "system/runstate.h"
@@ -2085,6 +2086,149 @@ static const MemoryRegionOps ati_r580_zguard_ops = {
     },
 };
 
+/*
+ * COLOUR GUARDS: windows over aperture 0 laid over the pages of colour
+ * buffers the host GPU holds newer than VRAM across releases (see
+ * "RESIDENCY" in ati_r580_r5gpu.c). A guest CPU access there writes the
+ * GPU's copies of those pages back and lifts their windows; the access
+ * is then done on VRAM, as the depth guard does it.
+ */
+typedef struct ATIR580CgAck {
+    ATIR580State *s;
+    int k;
+    uint32_t gen;
+} ATIR580CgAck;
+
+/* on a vCPU, after the TLB flush the window's transaction queued there */
+static void ati_r580_cguard_ack(CPUState *cpu, run_on_cpu_data d)
+{
+    ATIR580CgAck *a = d.host_ptr;
+    ATIR580State *s = a->s;
+
+    if (qatomic_read(&s->cg_gen[a->k]) == a->gen &&
+        qatomic_inc_fetch(&s->cg_acks[a->k]) == s->cg_need[a->k]) {
+        qatomic_set(&s->cg_live[a->k], a->gen);
+    }
+    object_unref(OBJECT(s));
+    g_free(a);
+}
+
+bool ati_r580_cguard_set(ATIR580State *s, int k, uint32_t lo, uint32_t hi)
+{
+    CPUState *cpu;
+    unsigned n = 0;
+    bool bql;
+
+    if (!s->cg_ready || k < 0 || k >= ATI_R580_CGUARDS || hi < lo ||
+        hi > ATI_R580_VRAM_SIZE) {
+        return false;
+    }
+    if (s->cg_lo[k] == lo && s->cg_hi[k] == hi) {
+        return true;
+    }
+    bql = !bql_locked();
+    if (bql) {
+        bql_lock();
+    }
+    memory_region_transaction_begin();
+    memory_region_set_enabled(&s->cg_win[k], false);
+    if (hi > lo) {
+        memory_region_set_alias_offset(&s->cg_win[k], lo);
+        memory_region_set_size(&s->cg_win[k], hi - lo);
+        memory_region_set_address(&s->cg_win[k], lo);
+        memory_region_set_enabled(&s->cg_win[k], true);
+    }
+    qatomic_set(&s->cg_gen[k], s->cg_gen[k] + 1);
+    qatomic_set(&s->cg_acks[k], 0);
+    memory_region_transaction_commit();
+    s->cg_lo[k] = lo;
+    s->cg_hi[k] = hi;
+    if (hi > lo) {
+        CPU_FOREACH(cpu) {
+            n++;
+        }
+        s->cg_need[k] = n;
+        CPU_FOREACH(cpu) {
+            ATIR580CgAck *a = g_new(ATIR580CgAck, 1);
+
+            a->s = s;
+            a->k = k;
+            a->gen = s->cg_gen[k];
+            object_ref(OBJECT(s));
+            async_run_on_cpu(cpu, ati_r580_cguard_ack, RUN_ON_CPU_HOST_PTR(a));
+        }
+    }
+    if (bql) {
+        bql_unlock();
+    }
+    return true;
+}
+
+/* the BQL is held: this is an ordinary MMIO region */
+static void ati_r580_cguard_hit(ATIR580State *s, uint32_t off, unsigned len)
+{
+    unsigned lift;
+    int k;
+
+    if (s->zg_on) {
+        ati_r580_zguard_hit(s, off, len);
+    }
+    if (s->lockless) {
+        ati_r580_engine_claim(s);
+    } else {
+        ati_r580_engine_wait(s);
+    }
+    lift = ati_r580_r5gpu_guard(s, off, len);
+    for (k = 0; k < ATI_R580_CGUARDS; k++) {
+        if (lift & (1u << k)) {
+            ati_r580_cguard_set(s, k, 0, 0);
+        }
+    }
+    if (s->lockless) {
+        ati_r580_engine_unclaim(s, false);
+    }
+}
+
+static uint64_t ati_r580_cguard_read(void *opaque, hwaddr addr,
+                                     unsigned size)
+{
+    ATIR580State *s = opaque;
+
+    if (addr + size > ATI_R580_VRAM_SIZE) {
+        return 0;
+    }
+    ati_r580_cguard_hit(s, addr, size);
+    return ati_r580_aper_ld(s, addr, size, ati_r580_aper_xor(s, addr));
+}
+
+static void ati_r580_cguard_write(void *opaque, hwaddr addr,
+                                  uint64_t data, unsigned size)
+{
+    ATIR580State *s = opaque;
+
+    if (addr + size > ATI_R580_VRAM_SIZE) {
+        return;
+    }
+    ati_r580_cguard_hit(s, addr, size);
+    ati_r580_aper_st(s, addr, data, size, ati_r580_aper_xor(s, addr));
+}
+
+static const MemoryRegionOps ati_r580_cguard_ops = {
+    .read = ati_r580_cguard_read,
+    .write = ati_r580_cguard_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
 /* ---------------------------------------------------------------- */
 
 static void ati_r580_reset_hold(Object *obj, ResetType type)
@@ -2102,6 +2246,9 @@ static void ati_r580_reset_hold(Object *obj, ResetType type)
     s->zclr_pend = false;
     if (s->zg_on) {
         ati_r580_zguard_set(s, 0, 0, 0, 0);
+    }
+    for (int k = 0; k < ATI_R580_CGUARDS; k++) {
+        ati_r580_cguard_set(s, k, 0, 0);
     }
     memset(s->regs, 0, sizeof(s->regs));
     ati_r580_r5xx_reset(s);
@@ -2385,6 +2532,18 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
         memory_region_add_subregion_overlap(&s->aper, 0, &s->zg_win, 2);
         s->zg_ready = true;
     }
+    if (s->gl_ctx && s->r500 && s->gl_cres && s->gl_mode != R580_GL_VERIFY) {
+        memory_region_init_io(&s->cg_io, obj, &ati_r580_cguard_ops, s,
+                              "ati-r580-cguard", ATI_R580_VRAM_SIZE);
+        for (int k = 0; k < ATI_R580_CGUARDS; k++) {
+            memory_region_init_alias(&s->cg_win[k], obj, "ati-r580-cguard-win",
+                                     &s->cg_io, 0, qemu_target_page_size());
+            memory_region_set_enabled(&s->cg_win[k], false);
+            /* above the depth guard, whose traps this one passes on */
+            memory_region_add_subregion_overlap(&s->aper, 0, &s->cg_win[k], 4);
+        }
+        s->cg_ready = true;
+    }
 
     memory_region_init_io(&s->mmio, obj, &ati_r580_mmio_ops, s,
                           "ati-r580-mmio", ATI_R580_MMIO_SIZE);
@@ -2484,6 +2643,8 @@ static void ati_r580_exit(PCIDevice *dev)
 static int ati_r580_pre_save(void *opaque)
 {
     ati_r580_engine_wait(opaque);
+    /* colour kept on the GPU goes into the saved VRAM */
+    ati_r580_gl_release(opaque, R580_GLR_READ);
     return 0;
 }
 
@@ -2596,6 +2757,11 @@ static const Property ati_r580_properties[] = {
      * when something reads it; off writes it back at every release.
      */
     DEFINE_PROP_BOOL("gl-depth-resident", ATIR580State, gl_zlazy, true),
+    /*
+     * Keep colour buffers the GPU drew there across releases, behind
+     * guards; off writes them back at every release.
+     */
+    DEFINE_PROP_BOOL("gl-colour-resident", ATIR580State, gl_cres, false),
     /* threads a draw's rows are split across: 0 = auto, 1 = serial */
     DEFINE_PROP_UINT32("raster-threads", ATIR580State, raster_threads, 0),
     DEFINE_PROP_UINT64("x-raster-split", ATIR580State, raster_tri_split, 0),
@@ -2844,7 +3010,8 @@ static char *ati_r580_get_engine(Object *obj, Error **errp)
                            "\nlongest claim wait %" PRIu64 " us, register "
                            "0x%04x%s\nclaim waits of 50 ms or more %" PRIu64
                            "\nyields to claimants %" PRIu64
-                           ", inside indirect buffers %" PRIu64,
+                           ", inside indirect buffers %" PRIu64
+                           "\nruns %" PRIu64 ", %" PRIu64 " us",
                            qatomic_read(&s->engine_busy) ? "busy" : "idle",
                            s->engine_kicks, s->engine_waits,
                            s->engine_wait_us, s->engine_bql_writes,
@@ -2856,7 +3023,8 @@ static char *ati_r580_get_engine(Object *obj, Error **errp)
                            s->engine_claim_wait_max_reg & 0xffff,
                            s->engine_claim_wait_max_reg & 0x10000 ?
                            " (write)" : "", s->engine_claim_waits_50ms,
-                           s->engine_yields, s->engine_ib_yields);
+                           s->engine_yields, s->engine_ib_yields,
+                           s->engine_runs, s->engine_run_ns / 1000);
 }
 
 /* any write zeroes the claim and yield counters */

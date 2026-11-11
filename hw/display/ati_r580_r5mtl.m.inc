@@ -273,6 +273,39 @@ bool ati_r580_gl_r5_copy(R580MtlCtx *g, struct R5GpuImage *dst, int dx, int dy,
     return true;
 }
 
+bool ati_r580_gl_r5_copy_runs(R580MtlCtx *g, struct R5GpuImage *dst,
+                              struct R5GpuImage *src, const int *runs,
+                              unsigned n)
+{
+    const int *r;
+    unsigned k;
+
+    if (!g || !dst || !src || src->bpp != dst->bpp) {
+        return false;
+    }
+    for (k = 0, r = runs; k < n; k++, r += 6) {
+        if (r[4] <= 0 || r[5] <= 0 || r[0] < 0 || r[1] < 0 ||
+            r[0] + r[4] > src->w || r[1] + r[5] > src->h || r[2] < 0 ||
+            r[3] < 0 || r[2] + r[4] > dst->w || r[3] + r[5] > dst->h) {
+            return false;
+        }
+    }
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> bl = mtl_blit(g);
+
+        for (k = 0, r = runs; k < n; k++, r += 6) {
+            [bl copyFromTexture:src->tex sourceSlice:0 sourceLevel:0
+                   sourceOrigin:MTLOriginMake(r[0], r[1], 0)
+                     sourceSize:MTLSizeMake(r[4], r[5], 1)
+                      toTexture:dst->tex destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(r[2], r[3], 0)];
+        }
+        [bl endEncoding];
+    }
+    return true;
+}
+
 bool ati_r580_gl_r5_dst_fetch(R580MtlCtx *g)
 {
     return true;

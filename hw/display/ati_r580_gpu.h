@@ -52,6 +52,7 @@
 #define ati_r580_gl_r5_upload       R580_GPU_P(r5_upload)
 #define ati_r580_gl_r5_read         R580_GPU_P(r5_read)
 #define ati_r580_gl_r5_copy         R580_GPU_P(r5_copy)
+#define ati_r580_gl_r5_copy_runs    R580_GPU_P(r5_copy_runs)
 #define ati_r580_gl_r5_draw         R580_GPU_P(r5_draw)
 #define ati_r580_gl_r5_prog_ready   R580_GPU_P(r5_prog_ready)
 #define ati_r580_gl_r5_dst_fetch    R580_GPU_P(r5_dst_fetch)
@@ -104,6 +105,9 @@
                      int h, void *data, unsigned stride);                   \
     bool P##_r5_copy(T *g, struct R5GpuImage *dst, int dx, int dy,          \
                      struct R5GpuImage *src, int sx, int sy, int w, int h); \
+    bool P##_r5_copy_runs(T *g, struct R5GpuImage *dst,                     \
+                          struct R5GpuImage *src, const int *runs,          \
+                          unsigned n);                                      \
     bool P##_r5_draw(T *g, const struct R5GpuDraw *d);                      \
     int P##_r5_prog_ready(T *g, const struct R5GpuDraw *d, int bpp);        \
     bool P##_r5_dst_fetch(T *g);                                            \

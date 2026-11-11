@@ -7023,7 +7023,7 @@ void ati_r580_gl_release(ATIR580State *s, ATIR580GlRel why)
     if (!ati_r580_gl_enter(s, &claimed)) {
         return;         /* the command processor's until it finishes */
     }
-    ati_r580_r5gpu_release(s);
+    ati_r580_r5gpu_release(s, why);
     if (s->gl_texlife == R580_TEXLIFE_BURST) {
         r300_gl_texdrop(s);
     }

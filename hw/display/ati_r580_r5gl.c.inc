@@ -298,6 +298,40 @@ bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
     return ok;
 }
 
+bool ati_r580_gl_r5_copy_runs(R580GlCtx *g, struct R5GpuImage *dst,
+                              struct R5GpuImage *src, const int *runs,
+                              unsigned n)
+{
+    const int *r;
+    unsigned k;
+    bool ok;
+
+    if (!g || !dst || !src || src->bpp != dst->bpp) {
+        return false;
+    }
+    for (k = 0, r = runs; k < n; k++, r += 6) {
+        if (r[4] <= 0 || r[5] <= 0 || r[0] < 0 || r[1] < 0 ||
+            r[0] + r[4] > src->w || r[1] + r[5] > src->h || r[2] < 0 ||
+            r[3] < 0 || r[2] + r[4] > dst->w || r[3] + r[5] > dst->h) {
+            return false;
+        }
+    }
+    r580_gl_makecurrent(&g->plat);
+    ok = r5gl_fbo(src);
+    if (ok) {
+        glActiveTexture(GL_TEXTURE0 + R5GL_UNIT_WORK);
+        glBindTexture(GL_TEXTURE_2D, dst->tex);
+        for (k = 0, r = runs; k < n; k++, r += 6) {
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, r[2], r[3], r[0], r[1],
+                                r[4], r[5]);
+        }
+        ok = glGetError() == GL_NO_ERROR;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, g->fbo);
+    r580_gl_done(&g->plat);
+    return ok;
+}
+
 bool ati_r580_gl_r5_dst_fetch(R580GlCtx *g)
 {
     return false;

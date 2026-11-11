@@ -405,8 +405,9 @@ void ati_r580_gl_unbind(R580GlCtx *g);
  * texture of `levels` levels holding one unsigned integer of `bpp` bytes
  * per pixel. upload() and read() move a rectangle of one level between
  * the image and host memory of `stride` bytes per row; copy() moves a
- * level-0 rectangle between images. r5_draw() returns false when the
- * backend could not run the request, the target then unchanged.
+ * level-0 rectangle between images, copy_runs() several at once.
+ * r5_draw() returns false when the backend could not run the request,
+ * the target then unchanged.
  * r5_dst_fetch() is true when a draw reads its destination in one pass
  * whatever its primitives overlap.
  */
@@ -422,6 +423,10 @@ bool ati_r580_gl_r5_read(R580GlCtx *g, struct R5GpuImage *im, int x, int y,
                          int w, int h, void *data, unsigned stride);
 bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
                          struct R5GpuImage *src, int sx, int sy, int w, int h);
+/* n rectangles, six ints each: sx, sy, dx, dy, w, h */
+bool ati_r580_gl_r5_copy_runs(R580GlCtx *g, struct R5GpuImage *dst,
+                              struct R5GpuImage *src, const int *runs,
+                              unsigned n);
 bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d);
 /* the request's program: 1 built, 0 building (draw on the CPU), -1 never */
 int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,

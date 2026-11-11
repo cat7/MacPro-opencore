@@ -1476,6 +1476,7 @@ void ati_r580_engine_wptr(ATIR580State *s, uint32_t val)
 static void *ati_r580_engine_thread(void *opaque)
 {
     ATIR580State *s = opaque;
+    int64_t t0;
 
     rcu_register_thread();
     ati_r580_engine_ctx = true;
@@ -1505,7 +1506,11 @@ static void *ati_r580_engine_thread(void *opaque)
         s->engine_kick = false;
         qemu_mutex_unlock(&s->engine_lock);
 
+        t0 = get_clock();
         ati_r580_pm4_run(s);
+        t0 = get_clock() - t0;
+        s->engine_run_ns += t0;
+        s->engine_runs++;
 
         qemu_mutex_lock(&s->engine_lock);
         if (s->pm4_rptr != qatomic_load_acquire(&s->pm4_wptr)) {

@@ -20,10 +20,28 @@
  * a later command depends on: a new ring write pointer, and any command
  * submitted outside the command processor thread. Writers inside the
  * device (2D engine, CP write-backs, the CPU rasteriser) invalidate the
- * copies they overlap at once. The drawn rectangles go back to VRAM at
- * every point ati_r580_gl_release() names, before any reader inside the
- * device touches them (ati_r580_gl_sync()), and before a writer
- * overwrites them (ati_r580_gl_wrote()).
+ * copies they overlap at once. The drawn rectangles go back to VRAM
+ * before any reader inside the device touches them (ati_r580_gl_sync()),
+ * before a writer overwrites them (ati_r580_gl_wrote()), and at the
+ * points ati_r580_gl_release() names, as RESIDENCY says.
+ *
+ * RESIDENCY. At a release after which the guest CPU may run (a fence,
+ * the end of a ring or indirect buffer, a FIFO push, the display
+ * refresh) a drawn rectangle goes back only if it meets the scanned out
+ * framebuffer or its surface has no COLOUR GUARD in force. A guard is a
+ * window over the aperture laid on the surface's pages when it is drawn
+ * (ati_r580_cguard_set()); it is in force once every vCPU has run the
+ * work queued behind its own TLB flush, since until then a vCPU may
+ * still reach those pages as RAM. Every guest CPU load or store under a
+ * window traps, writes the surfaces under it back and lifts it before
+ * the access is done on VRAM (ati_r580_r5gpu_guard()). Other releases
+ * (a CPU-rasterised draw, yield, reset, migration) write everything
+ * back. A surface whose window the guest keeps touching is not guarded
+ * again.
+ *
+ * A surface replaced by another layout over the same memory (a new
+ * pitch, more rows) hands its drawn pixels to the new image on the GPU,
+ * placed at the bytes they occupy, instead of going back to VRAM.
  *
  * VERIFY renders each offloaded draw on the GPU, reads the result back,
  * lets the CPU path render it into VRAM, compares the two and makes the
@@ -38,6 +56,7 @@
 #include "qemu/log.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
+#include "exec/target_page.h"
 #include "hw/pci/pci_device.h"
 #include "ati_r580_int.h"
 #include "ati_r580_gl.h"
@@ -111,6 +130,31 @@ static const char *const r5g_fb_names[R5G_FB_MAX] = {
     [R5G_FB_LINK] = "program build failed",
 };
 
+/* who a readback was for: the release reasons, then these */
+enum {
+    R5G_RB_WROTE = R580_GLR_MAX,    /* a writer over drawn bytes */
+    R5G_RB_CPU,                     /* the CPU rasteriser */
+    R5G_RB_FREE,                    /* eviction, overlap, growth */
+    R5G_RB_GUARD,                   /* the guest CPU, through a guard */
+    R5G_RB_MAX
+};
+
+static const char *const r5g_rb_names[R5G_RB_MAX] = {
+    [R580_GLR_SCANOUT] = "scanout", [R580_GLR_RING] = "ring",
+    [R580_GLR_IB] = "ib", [R580_GLR_FIFO] = "fifo",
+    [R580_GLR_READ] = "read", [R580_GLR_2D] = "2d",
+    [R580_GLR_TARGET] = "target", [R580_GLR_FALLBACK] = "fallback",
+    [R580_GLR_BACKEND] = "backend", [R580_GLR_RESET] = "reset",
+    [R580_GLR_FENCE] = "fence", [R580_GLR_YIELD] = "yield",
+    [R5G_RB_WROTE] = "wrote", [R5G_RB_CPU] = "cpu draw",
+    [R5G_RB_FREE] = "free", [R5G_RB_GUARD] = "guest cpu",
+};
+
+/* traps after which a surface is not guarded again */
+#define R5G_GUARD_TRAPS 4
+
+#define R5G_RBSURF 8
+
 typedef struct R5GSurf {
     bool live;
     uint32_t off, pitch, bpp;
@@ -119,6 +163,8 @@ typedef struct R5GSurf {
     uint8_t *shadow;
     int dx0, dy0, dx1, dy1;     /* newer on the host; end exclusive */
     uint64_t epoch, lru;
+    int guard;                  /* colour guard window + 1; 0: none */
+    unsigned traps;
 } R5GSurf;
 
 typedef struct R5GTex {
@@ -173,6 +219,15 @@ struct ATIR580R5Gpu {
     uint64_t up_bytes, up_calls, rd_bytes, rd_calls, flushes, checks;
     uint64_t aliased, feedback, tex_hits, tex_new, surf_new, evicts;
     uint64_t passes, draw_ns, max_draw_ns, verts_n;
+    int rb_why;
+    uint64_t rb_n[R5G_RB_MAX], rb_bytes[R5G_RB_MAX], rb_ns[R5G_RB_MAX];
+    uint64_t rb_read_ns;
+    int gsurf[ATI_R580_CGUARDS];    /* surface + 1 under window k; 0: none */
+    uint64_t g_arms, g_kept, g_traps, g_diff, g_noslot, g_off, adopted;
+    struct {
+        uint32_t off, pitch;
+        uint64_t n, bytes;
+    } rbs[R5G_RBSURF];
     unsigned dumps, dumps_small;
     uint8_t *vpre;
     R5GpuDraw vreq;
@@ -198,6 +253,7 @@ static uint8_t *r5g_vram(ATIR580R5Gpu *g)
 /* ---- surfaces ---- */
 
 static void r5g_surf_flush(ATIR580R5Gpu *g, R5GSurf *sf);
+static void r5g_guard_arm(ATIR580R5Gpu *g, R5GSurf *sf);
 static void r5g_invalidate(ATIR580R5Gpu *g, uint32_t lo, uint32_t hi,
                            const R5GSurf *keep);
 
@@ -221,10 +277,18 @@ static void r5g_res_update(ATIR580R5Gpu *g)
 
 static void r5g_surf_free(ATIR580R5Gpu *g, R5GSurf *sf)
 {
+    int why = g->rb_why;
+
     if (!sf->live) {
         return;
     }
+    g->rb_why = R5G_RB_FREE;
     r5g_surf_flush(g, sf);
+    g->rb_why = why;
+    if (sf->guard) {
+        /* the window stays until a trap or a new owner lifts it */
+        g->gsurf[sf->guard - 1] = 0;
+    }
     ati_r580_gl_r5_image_free(g->ctx, sf->img);
     g_free(sf->shadow);
     memset(sf, 0, sizeof(*sf));
@@ -236,13 +300,50 @@ static void r5g_surf_flush(ATIR580R5Gpu *g, R5GSurf *sf)
     int w = sf->dx1 - sf->dx0, h = sf->dy1 - sf->dy0, y;
     uint8_t *vram = r5g_vram(g);
     uint64_t lo, hi;
+    int64_t t0, t1;
+    bool ok;
 
     if (w <= 0 || h <= 0) {
         return;
     }
+    t0 = get_clock();
     lo = sf->off + (uint64_t)sf->dy0 * sf->pitch + (uint64_t)sf->dx0 * sf->bpp;
-    if (ati_r580_gl_r5_read(g->ctx, sf->img, sf->dx0, sf->dy0, w, h,
-                            vram + lo, sf->pitch)) {
+    if (g->rb_why == R5G_RB_GUARD) {
+        /* what the guest would have read without the guard */
+        size_t row = (size_t)w * sf->bpp, i;
+        g_autofree uint8_t *buf = g_malloc(row * h);
+
+        ok = ati_r580_gl_r5_read(g->ctx, sf->img, sf->dx0, sf->dy0, w, h,
+                                 buf, row);
+        for (y = 0; ok && y < h; y++) {
+            uint8_t *v = vram + lo + (size_t)y * sf->pitch;
+
+            for (i = 0; i < row; i++) {
+                g->g_diff += v[i] != buf[row * y + i];
+            }
+            memcpy(v, buf + row * y, row);
+        }
+    } else {
+        ok = ati_r580_gl_r5_read(g->ctx, sf->img, sf->dx0, sf->dy0, w, h,
+                                 vram + lo, sf->pitch);
+    }
+    t1 = get_clock();
+    g->rb_read_ns += t1 - t0;
+    if (ok) {
+        unsigned k;
+
+        for (k = 0; k < R5G_RBSURF - 1; k++) {
+            if (!g->rbs[k].n || (g->rbs[k].off == sf->off &&
+                                 g->rbs[k].pitch == sf->pitch)) {
+                break;
+            }
+        }
+        g->rbs[k].off = sf->off;
+        g->rbs[k].pitch = sf->pitch;
+        g->rbs[k].n++;
+        g->rbs[k].bytes += (uint64_t)w * h * sf->bpp;
+        g->rb_n[g->rb_why]++;
+        g->rb_bytes[g->rb_why] += (uint64_t)w * h * sf->bpp;
         for (y = sf->dy0; y < sf->dy1; y++) {
             size_t o = (size_t)y * sf->pitch + (size_t)sf->dx0 * sf->bpp;
 
@@ -260,6 +361,7 @@ static void r5g_surf_flush(ATIR580R5Gpu *g, R5GSurf *sf)
     sf->dx0 = sf->dy0 = sf->dx1 = sf->dy1 = 0;
     g->flushes++;
     r5g_invalidate(g, lo, hi, sf);
+    g->rb_ns[g->rb_why] += get_clock() - t0;
 }
 
 /* upload rows [y0, y1) of [x0, x1) from VRAM and keep them as the shadow */
@@ -376,35 +478,132 @@ static R5GSurf *r5g_surf_slot(ATIR580R5Gpu *g)
     return v;
 }
 
+/*
+ * The drawn pixels of `o` into `n`, at the bytes they occupy under n's
+ * layout, on the GPU; n's drawn rectangle grows to cover them. False
+ * when they do not all lie in n, and o must go back to VRAM instead.
+ */
+static bool r5g_surf_adopt(ATIR580R5Gpu *g, R5GSurf *n, const R5GSurf *o)
+{
+    int w = o->dx1 - o->dx0, y, x0 = INT_MAX, y0 = INT_MAX, x1 = 0, y1 = 0;
+    int64_t end = (int64_t)n->pitch * n->h;
+    size_t nr = 0, cap;
+    g_autofree int *runs = NULL;
+
+    if (w <= 0 || o->dy1 <= o->dy0) {
+        return true;
+    }
+    if (o->bpp != n->bpp) {
+        return false;
+    }
+    cap = (size_t)(o->dy1 - o->dy0) *
+          ((size_t)w * o->bpp / n->pitch + 2);
+    runs = g_new(int, cap * 6);
+    for (y = o->dy0; y < o->dy1; y++) {
+        int64_t r = (int64_t)o->off + (int64_t)y * o->pitch +
+                    (int64_t)o->dx0 * o->bpp - n->off;
+        int sx = o->dx0, left = w;
+
+        if (r < 0 || r + (int64_t)w * o->bpp > end || r % n->bpp) {
+            return false;
+        }
+        while (left > 0) {
+            int ny = r / n->pitch, nx = (r % n->pitch) / n->bpp;
+            int c = MIN(left, n->w - nx);
+            int *q = runs + nr * 6;
+
+            if (nr && q[-6] == sx && q[-2] == c && q[-4] == nx &&
+                q[-5] + q[-1] == y && q[-3] + q[-1] == ny) {
+                q[-1]++;
+            } else {
+                if (nr == cap) {
+                    return false;
+                }
+                q[0] = sx;
+                q[1] = y;
+                q[2] = nx;
+                q[3] = ny;
+                q[4] = c;
+                q[5] = 1;
+                nr++;
+            }
+            x0 = MIN(x0, nx);
+            y0 = MIN(y0, ny);
+            x1 = MAX(x1, nx + c);
+            y1 = MAX(y1, ny + 1);
+            sx += c;
+            left -= c;
+            r += (int64_t)c * n->bpp;
+        }
+    }
+    if (!ati_r580_gl_r5_copy_runs(g->ctx, n->img, o->img, runs, nr)) {
+        return false;
+    }
+    if (n->dx1 > n->dx0) {
+        x0 = MIN(x0, n->dx0);
+        y0 = MIN(y0, n->dy0);
+        x1 = MAX(x1, n->dx1);
+        y1 = MAX(y1, n->dy1);
+    }
+    n->dx0 = x0;
+    n->dy0 = y0;
+    n->dx1 = x1;
+    n->dy1 = y1;
+    g->adopted++;
+    return true;
+}
+
 static R5GSurf *r5g_surf_new(ATIR580R5Gpu *g, uint32_t off, uint32_t pitch,
                              uint32_t bpp, int h)
 {
-    R5GSurf *sf = r5g_surf_slot(g);
+    R5GSurf n = { 0 }, *sf;
     int w = pitch / bpp;
     int i;
 
-    /* anything else over this memory goes back and away first */
+    n.img = ati_r580_gl_r5_image(g->ctx, w, h, 1, bpp);
+    if (!n.img) {
+        return NULL;
+    }
+    n.off = off;
+    n.pitch = pitch;
+    n.bpp = bpp;
+    n.w = w;
+    n.h = h;
+    n.shadow = g_malloc((size_t)pitch * h);
+    r5g_surf_put(g, &n, 0, w, 0, h);
+    n.epoch = g->epoch;
+    /*
+     * Anything else over this memory goes away: its drawn pixels move
+     * into the new image on the GPU, or back to VRAM first.
+     */
     for (i = 0; i < R5G_NSURF; i++) {
         R5GSurf *o = &g->surf[i];
 
-        if (o->live && o != sf && off < o->off + (uint64_t)o->pitch * o->h &&
-            o->off < off + (uint64_t)pitch * h) {
-            r5g_surf_free(g, o);
+        if (!o->live || off >= o->off + (uint64_t)o->pitch * o->h ||
+            o->off >= off + (uint64_t)pitch * h) {
+            continue;
         }
+        if (r5g_surf_adopt(g, &n, o)) {
+            o->dx0 = o->dy0 = o->dx1 = o->dy1 = 0;
+            n.traps = MAX(n.traps, o->traps);
+            if (o->guard && !n.guard) {
+                /* its window watches the same pages */
+                n.guard = o->guard;
+                o->guard = 0;
+            }
+        } else {
+            /* written back after the upload: the next check takes it */
+            n.epoch = 0;
+        }
+        r5g_surf_free(g, o);
     }
-    sf->img = ati_r580_gl_r5_image(g->ctx, w, h, 1, bpp);
-    if (!sf->img) {
-        return NULL;
-    }
+    sf = r5g_surf_slot(g);
+    *sf = n;
     sf->live = true;
-    sf->off = off;
-    sf->pitch = pitch;
-    sf->bpp = bpp;
-    sf->w = w;
-    sf->h = h;
-    sf->shadow = g_malloc((size_t)pitch * h);
-    r5g_surf_put(g, sf, 0, w, 0, h);
-    sf->epoch = g->epoch;
+    sf->lru = ++g->tick;
+    if (sf->guard) {
+        g->gsurf[sf->guard - 1] = sf - g->surf + 1;
+    }
     g->surf_new++;
     qatomic_set(&g->s->r5g_any, true);
     return sf;
@@ -446,11 +645,10 @@ static R5GSurf *r5g_target(ATIR580R5Gpu *g, uint32_t off, uint32_t pitch,
         return sf;
     }
     if (sf) {
-        /* grown from its own start: the old rows come with it */
+        /* grown from its own start: the old one is adopted */
         off = sf->off;
         rows += *oy;
         h = MAX(rows, sf->h);
-        r5g_surf_free(g, sf);
     } else {
         *ox = *oy = 0;
         h = rows;
@@ -1497,6 +1695,8 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     sf->dy0 = sf->dy1 > sf->dy0 ? MIN(sf->dy0, by0) : by0;
     sf->dx1 = MAX(sf->dx1, bx1);
     sf->dy1 = MAX(sf->dy1, by1);
+    /* laid now, so that it is in force by the next release */
+    r5g_guard_arm(g, sf);
     /* what was decoded from these bytes is stale now */
     r5g_invalidate(g, sf->off + (uint64_t)by0 * sf->pitch,
                    sf->off + (uint64_t)by1 * sf->pitch, sf);
@@ -1729,7 +1929,7 @@ void ati_r580_r5gpu_cpu_begin(ATIR580State *s, const R5xxRaster *r)
         return;
     }
     if (!g->verify) {
-        ati_r580_r5gpu_release(s);
+        ati_r580_r5gpu_release(s, R5G_RB_CPU);
     }
     for (n = 0; n < R5XX_MAX_COLOR_BUFS; n++) {
         uint32_t off;
@@ -1756,20 +1956,154 @@ void ati_r580_r5gpu_cpu_end(ATIR580State *s)
     qatomic_set(&s->r5g_quiet, false);
 }
 
-void ati_r580_r5gpu_release(ATIR580State *s)
+/* a release after which the guest CPU may run */
+static bool r5g_rel_guest(int why)
+{
+    return why == R580_GLR_SCANOUT || why == R580_GLR_RING ||
+           why == R580_GLR_IB || why == R580_GLR_FIFO ||
+           why == R580_GLR_FENCE;
+}
+
+/* the drawn bytes, as a VRAM range */
+static void r5g_drawn_span(const R5GSurf *sf, uint64_t *a, uint64_t *b)
+{
+    *a = sf->off + (uint64_t)sf->dy0 * sf->pitch + (uint64_t)sf->dx0 * sf->bpp;
+    *b = sf->off + (uint64_t)(sf->dy1 - 1) * sf->pitch +
+         (uint64_t)sf->dx1 * sf->bpp;
+}
+
+/* the drawn bytes meet the scanned out framebuffer, now or at the last refresh */
+static bool r5g_scanned(ATIR580R5Gpu *g, const R5GSurf *sf)
+{
+    uint64_t fb = qatomic_read(&g->s->scan_fb), a, b;
+    ATIR580Mode m;
+
+    r5g_drawn_span(sf, &a, &b);
+    if ((uint32_t)fb && a < (fb >> 32) + (uint32_t)fb && (fb >> 32) < b) {
+        return true;
+    }
+    return ati_r580_avivo_scanout(g->s, &m) &&
+           a < m.fb_offset + (uint64_t)m.pitch * m.height && m.fb_offset < b;
+}
+
+/* a guard over the surface's pages, grown to them if it has a smaller one */
+static void r5g_guard_arm(ATIR580R5Gpu *g, R5GSurf *sf)
+{
+    ATIR580State *s = g->s;
+    uint64_t pg = qemu_target_page_size();
+    uint64_t lo = sf->off & ~(pg - 1);
+    uint64_t hi = MIN(ROUND_UP(sf->off + (uint64_t)sf->pitch * sf->h, pg),
+                      (uint64_t)ATI_R580_VRAM_SIZE);
+    int k, stale = -1;
+
+    if (!s->cg_ready || g->verify || sf->traps >= R5G_GUARD_TRAPS) {
+        return;
+    }
+    if (sf->guard) {
+        k = sf->guard - 1;
+        if (s->cg_lo[k] <= lo && hi <= s->cg_hi[k]) {
+            return;
+        }
+        if (s->cg_hi[k] > s->cg_lo[k]) {
+            lo = MIN(lo, s->cg_lo[k]);
+            hi = MAX(hi, s->cg_hi[k]);
+        }
+    } else {
+        for (k = 0; k < ATI_R580_CGUARDS; k++) {
+            if (g->gsurf[k]) {
+                continue;
+            }
+            if (s->cg_hi[k] <= s->cg_lo[k]) {
+                break;
+            }
+            if (stale < 0) {
+                stale = k;
+            }
+        }
+        if (k == ATI_R580_CGUARDS) {
+            k = stale;
+        }
+        if (k < 0) {
+            g->g_noslot++;
+            return;
+        }
+    }
+    if (!ati_r580_cguard_set(s, k, lo, hi)) {
+        return;
+    }
+    g->gsurf[k] = sf - g->surf + 1;
+    sf->guard = k + 1;
+    g->g_arms++;
+}
+
+void ati_r580_r5gpu_release(ATIR580State *s, int why)
 {
     ATIR580R5Gpu *g = s->r5g;
+    bool keep;
     int i;
 
     if (!g || !qatomic_read(&s->r5g_res)) {
         return;
     }
+    g->rb_why = why;
+    keep = !g->verify && s->cg_ready && r5g_rel_guest(why);
     for (i = 0; i < R5G_NSURF; i++) {
-        if (g->surf[i].live) {
-            r5g_surf_flush(g, &g->surf[i]);
+        R5GSurf *sf = &g->surf[i];
+        uint64_t a, b;
+
+        if (!sf->live || sf->dx1 <= sf->dx0 || sf->dy1 <= sf->dy0) {
+            continue;
+        }
+        r5g_drawn_span(sf, &a, &b);
+        if (!keep || r5g_scanned(g, sf)) {
+            r5g_surf_flush(g, sf);
+            continue;
+        }
+        if (sf->guard && ati_r580_cguard_live(s, sf->guard - 1) &&
+            a >= s->cg_lo[sf->guard - 1] && b <= s->cg_hi[sf->guard - 1]) {
+            g->g_kept++;
+            continue;
+        }
+        r5g_surf_flush(g, sf);
+        r5g_guard_arm(g, sf);
+    }
+    r5g_res_update(g);
+}
+
+/*
+ * The guest CPU is about to access [off, off+len) through a colour
+ * guard, with the engine held: the surfaces under every window there go
+ * back to VRAM and give their windows up. Returns the windows to lift.
+ */
+unsigned ati_r580_r5gpu_guard(ATIR580State *s, uint32_t off, unsigned len)
+{
+    ATIR580R5Gpu *g = s->r5g;
+    unsigned lift = 0;
+    int k;
+
+    for (k = 0; k < ATI_R580_CGUARDS; k++) {
+        if (s->cg_hi[k] <= s->cg_lo[k] || off >= s->cg_hi[k] ||
+            off + len <= s->cg_lo[k]) {
+            continue;
+        }
+        lift |= 1u << k;
+        if (g && g->gsurf[k]) {
+            R5GSurf *sf = &g->surf[g->gsurf[k] - 1];
+
+            g->rb_why = R5G_RB_GUARD;
+            g->g_traps++;
+            if (++sf->traps == R5G_GUARD_TRAPS) {
+                g->g_off++;
+            }
+            r5g_surf_flush(g, sf);
+            sf->guard = 0;
+            g->gsurf[k] = 0;
         }
     }
-    qatomic_set(&s->r5g_res, false);
+    if (g) {
+        r5g_res_update(g);
+    }
+    return lift;
 }
 
 void ati_r580_r5gpu_sync(ATIR580State *s, uint32_t off, uint32_t len)
@@ -1779,6 +2113,7 @@ void ati_r580_r5gpu_sync(ATIR580State *s, uint32_t off, uint32_t len)
     if (!g || !qatomic_read(&s->r5g_res)) {
         return;
     }
+    g->rb_why = R580_GLR_READ;
     r5g_flush_range(g, off, (uint64_t)off + len, NULL);
     r5g_res_update(g);
 }
@@ -1790,6 +2125,7 @@ void ati_r580_r5gpu_wrote(ATIR580State *s, uint32_t off, uint32_t len)
     if (!g || qatomic_read(&s->r5g_quiet)) {
         return;
     }
+    g->rb_why = R5G_RB_WROTE;
     r5g_flush_range(g, off, (uint64_t)off + len, NULL);
     r5g_invalidate(g, off, off + len, NULL);
     r5g_res_update(g);
@@ -1903,6 +2239,35 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         g->tex_hits, g->aliased, g->feedback,
         g->up_calls, g->up_bytes / 1e6, g->rd_calls, g->rd_bytes / 1e6,
         g->flushes, g->checks, g->epoch);
+    g_string_append_printf(o, "readback backend ms %.1f, by:",
+                           g->rb_read_ns / 1e6);
+    {
+        uint64_t tot = 0;
+
+        for (i = 0; i < R5G_RB_MAX; i++) {
+            tot += g->rb_ns[i];
+            if (g->rb_n[i]) {
+                g_string_append_printf(o, " %s %" PRIu64 " %.1f MB %.1f ms;",
+                                       r5g_rb_names[i], g->rb_n[i],
+                                       g->rb_bytes[i] / 1e6,
+                                       g->rb_ns[i] / 1e6);
+            }
+        }
+        g_string_append_printf(o, " total %.1f ms\nreadback surfaces:",
+                               tot / 1e6);
+    }
+    for (i = 0; i < R5G_RBSURF && g->rbs[i].n; i++) {
+        g_string_append_printf(o, " %08x/%u %" PRIu64 " %.1f MB;",
+                               g->rbs[i].off, g->rbs[i].pitch, g->rbs[i].n,
+                               g->rbs[i].bytes / 1e6);
+    }
+    g_string_append_printf(o, "\ncolour guards: laid %" PRIu64 ", kept %"
+                           PRIu64 ", traps %" PRIu64 " (bytes newer than "
+                           "VRAM %" PRIu64 "), no window %" PRIu64
+                           ", given up %" PRIu64 "; surfaces adopted on "
+                           "the GPU %" PRIu64 "\n", g->g_arms,
+                           g->g_kept, g->g_traps, g->g_diff, g->g_noslot,
+                           g->g_off, g->adopted);
     g_string_append(o, "cpu fallbacks:");
     for (i = 0; i < R5G_FB_MAX; i++) {
         if (g->fb[i]) {

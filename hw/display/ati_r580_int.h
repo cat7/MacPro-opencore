@@ -38,6 +38,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIR580State, ATI_R580)
  */
 #define ATI_R580_APER_SIZE   (256 * 1024 * 1024)
 #define ATI_R580_VRAM_SIZE   (256 * 1024 * 1024)
+#define ATI_R580_CGUARDS     32
 #define ATI_R580_MMIO_SIZE   (64 * 1024)
 #define ATI_R580_IO_SIZE     256
 #define ATI_R580_NUM_REGS    (ATI_R580_MMIO_SIZE / 4)
@@ -329,6 +330,7 @@ struct ATIR580State {
     uint64_t engine_claim_wait_max_us;
     uint32_t engine_claim_wanted;
     uint64_t engine_yields, engine_ib_yields;
+    uint64_t engine_runs, engine_run_ns;
     bool ib_yield;              /* property: yield inside indirect buffers */
     uint64_t engine_claim_waits_50ms;
     uint32_t engine_claim_wait_max_reg, engine_claim_reg;
@@ -679,6 +681,24 @@ struct ATIR580State {
     MemoryRegion zg_io, zg_win;
     uint32_t zg_lo, zg_hi, zg_zlo, zg_zhi;
     uint64_t gl_zlazy_rel, gl_zg_arms, gl_zg_traps, gl_zg_back;
+    /*
+     * "gl-colour-resident": COLOUR GUARDS, windows over the aperture
+     * laid over the pages of colour buffers the host GPU keeps newer
+     * than VRAM across releases (see "RESIDENCY" in ati_r580_r5gpu.c).
+     * Window k covers [cg_lo[k], cg_hi[k]), empty when lifted. Changed
+     * with the BQL and the engine both held.
+     */
+    bool gl_cres;
+    bool cg_ready;
+    MemoryRegion cg_io, cg_win[ATI_R580_CGUARDS];
+    uint32_t cg_lo[ATI_R580_CGUARDS], cg_hi[ATI_R580_CGUARDS];
+    /*
+     * A window traps every vCPU once each has run, after it was laid,
+     * the work its own TLB flush was queued before: generation cg_gen
+     * is in force when cg_acks reaches cg_need, and cg_live says so.
+     */
+    uint32_t cg_gen[ATI_R580_CGUARDS], cg_live[ATI_R580_CGUARDS];
+    unsigned cg_acks[ATI_R580_CGUARDS], cg_need[ATI_R580_CGUARDS];
     uint64_t gl_zclr_px;        /* cleared on the GPU only */
     /* gl=verify over the depth buffer, classed as the colour is */
     uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
@@ -1035,6 +1055,19 @@ bool ati_r580_gl_admit(ATIR580State *s, uint32_t off, uint32_t len);
 bool ati_r580_zguard_arm(ATIR580State *s, uint32_t lo, uint32_t hi,
                          uint32_t zlo, uint32_t zhi);
 bool ati_r580_gl_zguard(ATIR580State *s, uint32_t off, unsigned len);
+
+/*
+ * Colour guard window k over [lo, hi), page aligned; lo == hi lifts it.
+ * Takes the BQL if the caller does not hold it; the engine must be this
+ * thread's. False when no window can be laid.
+ */
+bool ati_r580_cguard_set(ATIR580State *s, int k, uint32_t lo, uint32_t hi);
+/* window k traps every guest CPU access to [cg_lo[k], cg_hi[k]) */
+static inline bool ati_r580_cguard_live(ATIR580State *s, int k)
+{
+    return s->cg_hi[k] > s->cg_lo[k] &&
+           qatomic_read(&s->cg_live[k]) == s->cg_gen[k];
+}
 
 bool ati_r580_on_engine(void);
 void ati_r580_engine_wait(ATIR580State *s);
