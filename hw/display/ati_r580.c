@@ -2278,6 +2278,19 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
             trace_ati_r580_gl_open(ati_r580_gl_describe(s->gl_ctx));
         }
     }
+#elif defined(CONFIG_WIN32)
+    /* unset, the R500 pipeline draws through OpenGL where a context opens */
+    if ((!s->gl_path || !s->gl_path[0]) && (!s->gl_api || !s->gl_api[0]) &&
+        s->r500 && !qtest_enabled() &&
+        s->gl_workers >= 1 && s->gl_workers <= R580_GL_MAXWORKERS) {
+        const char *why = NULL;
+
+        s->gl_ctx = ati_r580_gl_open(&why, s->gl_async ? s->gl_workers : 0);
+        if (s->gl_ctx) {
+            s->gl_mode = R580_GL_ON;
+            trace_ati_r580_gl_open(ati_r580_gl_describe(s->gl_ctx));
+        }
+    }
 #endif
     if (s->gl_path && s->gl_path[0] && strcmp(s->gl_path, "off")) {
         const char *why = NULL;
