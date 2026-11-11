@@ -6808,6 +6808,7 @@ static const char *const r300_gl_rel_names[R580_GLR_MAX] = {
     [R580_GLR_BACKEND]  = "backend declined",
     [R580_GLR_RESET]    = "reset",
     [R580_GLR_FENCE]    = "fence",
+    [R580_GLR_YIELD]    = "claim yield",
 };
 
 const char *ati_r580_gl_rel_name(ATIR580GlRel why)
@@ -7015,12 +7016,14 @@ void ati_r580_gl_release(ATIR580State *s, ATIR580GlRel why)
     bool claimed;
 
     if (s->lockless && !qatomic_read(&s->gl_res) &&
+        !qatomic_read(&s->r5g_res) &&
         s->gl_texlife != R580_TEXLIFE_BURST) {
         return;         /* nothing to give back; only an owner sets it */
     }
     if (!ati_r580_gl_enter(s, &claimed)) {
         return;         /* the command processor's until it finishes */
     }
+    ati_r580_r5gpu_release(s);
     if (s->gl_texlife == R580_TEXLIFE_BURST) {
         r300_gl_texdrop(s);
     }
@@ -7068,6 +7071,7 @@ void ati_r580_gl_sync(ATIR580State *s, uint32_t off, uint32_t len)
     if (!ati_r580_gl_enter(s, &claimed)) {
         return;
     }
+    ati_r580_r5gpu_sync(s, off, len);
     if ((r300_gl_span(s, &lo, &hi) && off + len > lo && off < hi) ||
         (!s->gl_zlazy && s->gl_res && r300_gl_zspan(s, &lo, &hi) &&
          off + len > lo && off < hi)) {
@@ -7085,6 +7089,14 @@ void ati_r580_gl_wrote(ATIR580State *s, uint32_t off, uint32_t len)
 {
     unsigned k;
 
+    if (s->r5g && !qatomic_read(&s->r5g_quiet)) {
+        bool claimed;
+
+        if (ati_r580_gl_enter(s, &claimed)) {
+            ati_r580_r5gpu_wrote(s, off, len);
+            ati_r580_gl_leave(s, claimed);
+        }
+    }
     qemu_rec_mutex_lock(&s->gl_tex_lock);
     for (k = 0; s->gl_texlife != R580_TEXLIFE_NEVER &&
                 k < s->gl_tex_n; k++) {

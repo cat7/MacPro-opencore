@@ -47,6 +47,15 @@
 #define ati_r580_gl_queue_stats     R580_GPU_P(queue_stats)
 #define ati_r580_gl_hold            R580_GPU_P(hold)
 #define ati_r580_gl_unbind          R580_GPU_P(unbind)
+#define ati_r580_gl_r5_image        R580_GPU_P(r5_image)
+#define ati_r580_gl_r5_image_free   R580_GPU_P(r5_image_free)
+#define ati_r580_gl_r5_upload       R580_GPU_P(r5_upload)
+#define ati_r580_gl_r5_read         R580_GPU_P(r5_read)
+#define ati_r580_gl_r5_copy         R580_GPU_P(r5_copy)
+#define ati_r580_gl_r5_draw         R580_GPU_P(r5_draw)
+#define ati_r580_gl_r5_prog_ready   R580_GPU_P(r5_prog_ready)
+#define ati_r580_gl_r5_dst_fetch    R580_GPU_P(r5_dst_fetch)
+#define ati_r580_gl_r5_stats        R580_GPU_P(r5_stats)
 #endif
 
 #include "ati_r580_gl.h"
@@ -84,7 +93,23 @@
     void P##_queue_stats(T *g, uint64_t *units, uint64_t *flushes,          \
                          uint64_t *waves);                                  \
     void P##_hold(bool hold);                                               \
-    void P##_unbind(T *g);
+    void P##_unbind(T *g);                                                  \
+    struct R5GpuImage *P##_r5_image(T *g, int w, int h, int levels,         \
+                                    int bpp);                               \
+    void P##_r5_image_free(T *g, struct R5GpuImage *im);                    \
+    bool P##_r5_upload(T *g, struct R5GpuImage *im, int level, int x,       \
+                       int y, int w, int h, const void *data,               \
+                       unsigned stride);                                    \
+    bool P##_r5_read(T *g, struct R5GpuImage *im, int x, int y, int w,      \
+                     int h, void *data, unsigned stride);                   \
+    bool P##_r5_copy(T *g, struct R5GpuImage *dst, int dx, int dy,          \
+                     struct R5GpuImage *src, int sx, int sy, int w, int h); \
+    bool P##_r5_draw(T *g, const struct R5GpuDraw *d);                      \
+    int P##_r5_prog_ready(T *g, const struct R5GpuDraw *d, int bpp);        \
+    bool P##_r5_dst_fetch(T *g);                                            \
+    void P##_r5_stats(T *g, uint64_t *progs, uint64_t *fails,               \
+                      uint64_t *draws, uint64_t *link_us,                  \
+                      uint64_t *link_max);
 
 R580_GPU_DECLARE(R580OglCtx, r580_ogl)
 R580_GPU_DECLARE(R580MtlCtx, r580_mtl)

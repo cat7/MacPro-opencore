@@ -150,6 +150,7 @@ typedef enum ATIR580GlRel {
     R580_GLR_BACKEND,       /* the backend declined, mid-draw */
     R580_GLR_RESET,         /* reset, unrealize */
     R580_GLR_FENCE,         /* a scratch or read pointer write, threaded CP */
+    R580_GLR_YIELD,         /* the CP let a claimant in mid-buffer */
     R580_GLR_MAX
 } ATIR580GlRel;
 
@@ -327,7 +328,9 @@ struct ATIR580State {
     uint64_t engine_claims, engine_claim_waits, engine_claim_wait_us;
     uint64_t engine_claim_wait_max_us;
     uint32_t engine_claim_wanted;
-    uint64_t engine_yields;
+    uint64_t engine_yields, engine_ib_yields;
+    bool ib_yield;              /* property: yield inside indirect buffers */
+    uint64_t engine_claim_waits_50ms;
     uint32_t engine_claim_wait_max_reg, engine_claim_reg;
     uint64_t engine_claim_busy;
     /* the decoded-texture cache, held by the draw path */
@@ -918,6 +921,13 @@ struct ATIR580State {
 
     /* R500 pipeline (ati_r580_r5xx.c); NULL runs the R300 one */
     ATIR580R5 *r5;
+    /* its host-GPU path (ati_r580_r5gpu.c); NULL without a backend */
+    struct ATIR580R5Gpu *r5g;
+    bool r5g_res;               /* a host copy is newer than VRAM */
+    bool r5g_any;               /* host copies exist */
+    bool r5g_quiet;             /* the CPU rasteriser runs; it invalidated */
+    uint32_t r5g_wptr;
+    char *r5g_dump;             /* gl=verify writes differing draws here */
     bool r500;
     uint32_t r500_threads;
 };
@@ -1044,7 +1054,7 @@ void ati_r580_gl_leave(ATIR580State *s, bool claimed);
 static inline void ati_r580_gl_touch(ATIR580State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res || s->gl_zres)) {
+    if (unlikely(s->gl_res || s->gl_zres || s->r5g_res)) {
         ati_r580_gl_sync(s, off, len);
     }
 }
@@ -1053,7 +1063,8 @@ static inline void ati_r580_gl_touch(ATIR580State *s, uint32_t off,
 static inline void ati_r580_gl_dirty(ATIR580State *s, uint32_t off,
                                      uint32_t len)
 {
-    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres ||
+                 (s->r5g_any && !s->r5g_quiet))) {
         ati_r580_gl_wrote(s, off, len);
     }
 }

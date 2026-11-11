@@ -26,6 +26,7 @@
 #include "ati_r580_r5us.h"
 #include "ati_r580_r5tex.h"
 #include "ati_r580_r5raster.h"
+#include "ati_r580_r5gpu.h"
 #include "ati_r580_r5xx.h"
 #include "trace.h"
 
@@ -217,16 +218,10 @@ typedef struct VtxSource {
     uint32_t vtx_size;
 } VtxSource;
 
-enum { PRIM_TRI, PRIM_POINT, PRIM_POINT_SIZED, PRIM_LINE };
-
-/* a window-space primitive queued for the band workers */
-typedef struct R5Prim {
-    uint8_t kind;
-    bool cull_front, cull_back;
-    uint32_t flat_inputs;
-    float size;
-    R5xxVertex v[3];
-} R5Prim;
+#define PRIM_TRI            R5_PRIM_TRI
+#define PRIM_POINT          R5_PRIM_POINT
+#define PRIM_POINT_SIZED    R5_PRIM_POINT_SIZED
+#define PRIM_LINE           R5_PRIM_LINE
 
 /* per-thread memory interface: dirty extent of the stores it made */
 typedef struct R5Mem {
@@ -284,7 +279,7 @@ struct ATIR580R5 {
     uint64_t draws, prims_n, verts, skipped;
     uint64_t us_decodes, us_fail, us_fc, pvs_decodes, pvs_fail;
     uint64_t setup_fail, px_in, px_out, quads, zclears, draw_ns;
-    uint64_t max_draw_ns;
+    uint64_t max_draw_ns, gpu_draws;
     uint64_t tiled_cb, tiled_tx, wide_cb;
     uint64_t tex_bad, tex_unbound;
     /* the last draws, for diagnosis */
@@ -402,7 +397,8 @@ static void r5_mem_write(void *opaque, uint32_t addr, const void *buf,
     }
 }
 
-static void r5_mem_log(void *opaque, int level, const char *fmt, va_list ap)
+static void R5XX_PRINTF(3, 0)
+r5_mem_log(void *opaque, int level, const char *fmt, va_list ap)
 {
     if (level <= 1) {
         char buf[256];
@@ -1622,24 +1618,31 @@ static void *r5_worker(void *arg)
     return NULL;
 }
 
-static void r5_draw_cpu(DrawCtx *dc, uint32_t prim, const VtxSource *src,
-                        const uint32_t *idx, uint32_t n)
+/* the vertex stage: window-space primitives into g->prims */
+static void r5_collect(DrawCtx *dc, uint32_t prim, const VtxSource *src,
+                       const uint32_t *idx, uint32_t n)
 {
     ATIR580R5 *g = dc->g;
-    int y0 = g->raster.d.sc_y0, y1 = g->raster.d.sc_y1, h = y1 - y0 + 1;
-    int t, nt, band;
 
-    if (g->nthreads < 2 || h < 64) {
-        g->raster.mem = &g->m[0].mem;
-        g->raster.us.tex_opaque = &g->m[0];
-        r5_run_prims(dc, prim, src, idx, n);
-        return;
-    }
     g->nprims = 0;
     g->collect = true;
     r5_run_prims(dc, prim, src, idx, n);
     g->collect = false;
+}
+
+/* the collected primitives through the CPU rasteriser */
+static void r5_draw_cpu(ATIR580R5 *g)
+{
+    int y0 = g->raster.d.sc_y0, y1 = g->raster.d.sc_y1, h = y1 - y0 + 1;
+    int t, nt, band;
+
     if (!g->nprims) {
+        return;
+    }
+    if (g->nthreads < 2 || h < 64) {
+        g->raster.mem = &g->m[0].mem;
+        g->raster.us.tex_opaque = &g->m[0];
+        r5_replay(g, &g->raster);
         return;
     }
     nt = MIN(g->nthreads, h / 32);
@@ -1681,7 +1684,7 @@ static void r5_draw(ATIR580State *s, uint32_t vf, const VtxSource *src,
     int64_t t0 = get_clock();
     char err[160];
     DrawCtx dc;
-    int i;
+    int i, mode;
 
     g->draws++;
     g->last_vf = vf;
@@ -1729,7 +1732,38 @@ static void r5_draw(ATIR580State *s, uint32_t vf, const VtxSource *src,
     g->last_dst = REG(s, RB3D_COLOROFFSET0);
     g->last_tex0 = REG(s, TX_OFFSET_0);
     g->raster.pixels_in = g->raster.pixels_out = g->raster.quads = 0;
-    r5_draw_cpu(&dc, prim, src, idx, n);
+    r5_collect(&dc, prim, src, idx, n);
+    mode = R5G_CPU;
+    if (s->r5g) {
+        R5GpuIn gi = {
+            .raster = &g->raster,
+            .us = g->us_dec,
+            .consts = g->us_const.f,
+            .samp = g->samplers,
+            .used = r500_us_tex_units_used(g->us_dec),
+            .prims = g->prims,
+            .nprims = g->nprims,
+        };
+
+        for (i = 0; i < R5XX_NUM_TEX_UNITS; i++) {
+            if ((gi.used & REG(s, TX_ENABLE) & (1u << i)) &&
+                g->samplers[i].valid) {
+                gi.bound |= 1u << i;
+            }
+        }
+        mode = ati_r580_r5gpu_draw(s, &gi);
+        if (mode == R5G_DONE) {
+            g->gpu_draws++;
+        }
+    }
+    if (mode != R5G_DONE) {
+        ati_r580_r5gpu_cpu_begin(s, &g->raster);
+        r5_draw_cpu(g);
+        ati_r580_r5gpu_cpu_end(s);
+        if (mode == R5G_VERIFY) {
+            ati_r580_r5gpu_verify_end(s);
+        }
+    }
     {
         unsigned h = g->hist_pos++ % ARRAY_SIZE(g->hist);
         uint32_t a0 = (REG(s, US_CODE_ADDR) & 0x1ff) +
@@ -1940,7 +1974,10 @@ void ati_r580_r5xx_clear_zmask(ATIR580State *s, uint32_t first, uint32_t n,
 
     r5_raster_regs(s, &r->regs);
     r->mem = &g->m[0].mem;
+    ati_r580_r5gpu_wrote(s, 0, ATI_R580_VRAM_SIZE);
+    qatomic_set(&s->r5g_quiet, true);
     r5xx_raster_zmask_clear(r, n, REG(s, ZB_DEPTHCLEARVALUE));
+    qatomic_set(&s->r5g_quiet, false);
     r5_mem_flush(g, &g->m[0]);
     g->zclears++;
 }
@@ -1959,6 +1996,11 @@ char *ati_r580_r5xx_stats(ATIR580State *s)
     }
     m = r5_stats_main(g);
     o = g_string_new(m);
+    {
+        g_autofree char *gs = ati_r580_r5gpu_stats(s);
+
+        g_string_append(o, gs);
+    }
     g_string_append(o, "last draws (vf n dst cpitch blend ablend outfmt "
                        "txen tx0:f0/f1/f2/off/filt0 us_addr us[0] us[3] "
                        "scissor pixels):\n");
@@ -1991,7 +2033,7 @@ static char *r5_stats_main(ATIR580R5 *g)
         "pvs decodes %" PRIu64 " fail %" PRIu64 "\n"
         "pixels in %" PRIu64 " out %" PRIu64 " quads %" PRIu64
         " zclears %" PRIu64 "\n"
-        "draw ms total %.1f max %.2f threads %d\n"
+        "draw ms total %.1f max %.2f threads %d, on the gpu %" PRIu64 "\n"
         "tiled colour buffers %" PRIu64 " tiled textures %" PRIu64
         " wide (64/128-bit) colour buffers %" PRIu64 "\n"
         "last vf 0x%08x dst 0x%08x tex0 0x%08x\n"
@@ -2003,6 +2045,7 @@ static char *r5_stats_main(ATIR580R5 *g)
         g->us_decodes, g->us_fail, g->us_fc, g->last_us_n,
         g->pvs_decodes, g->pvs_fail, g->px_in, g->px_out, g->quads,
         g->zclears, g->draw_ns / 1e6, g->max_draw_ns / 1e6, g->nthreads,
+        g->gpu_draws,
         g->tiled_cb, g->tiled_tx, g->wide_cb,
         g->last_vf, g->last_dst, g->last_tex0,
         g->tex_bad, g->last_tex_regs[5], g->last_tex_regs[0],

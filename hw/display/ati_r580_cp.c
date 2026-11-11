@@ -29,6 +29,7 @@
 #include "qemu/rcu.h"
 #include "qemu/lockable.h"
 #include "ati_r580_int.h"
+#include "ati_r580_r5xx.h"
 #include "ati_r580_regs.h"
 #include "ati_r580_gl.h"
 #include "trace.h"
@@ -454,6 +455,36 @@ void ati_r580_pm4_run(ATIR580State *s)
 }
 
 /*
+ * On the engine thread, between two packets of an indirect buffer: a
+ * claimant waiting for the engine takes it now instead of at the end of
+ * the buffer, and the buffer resumes once no claimant is left. What the
+ * GPU holds goes back to VRAM first, as at the end of a ring run; the
+ * read pointer does not move.
+ */
+static void ati_r580_engine_yield(ATIR580State *s)
+{
+    ati_r580_gl_release(s, R580_GLR_YIELD);
+    ati_r580_zpass_settle(s);
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_yields++;
+    s->engine_ib_yields++;
+    while ((qatomic_read(&s->engine_claim_wanted) || s->engine_claimed) &&
+           !s->engine_quit) {
+        if (!s->engine_claimed && s->engine_busy) {
+            ati_r580_gl_unbind(s->gl_ctx);
+            qatomic_store_release(&s->engine_busy, false);
+            qemu_event_set(&s->engine_idle);
+        }
+        qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+    }
+    if (!s->engine_busy) {
+        qemu_event_reset(&s->engine_idle);
+        qatomic_store_release(&s->engine_busy, true);
+    }
+    qemu_mutex_unlock(&s->engine_lock);
+}
+
+/*
  * Every ring dword goes through the same packet state machine as the
  * PIO FIFO and the indirect buffers, so a packet behaves identically
  * no matter how it was submitted. The parser state persists in
@@ -472,7 +503,14 @@ void ati_r580_pm4_run_ring(ATIR580State *s)
                     s->pm4_rptr != qatomic_load_acquire(&s->pm4_wptr);
          guard++) {
         uint32_t pos = s->pm4_rptr;
-        uint32_t val = ati_r580_pm4_read_ring(s);
+        uint32_t val;
+
+        if (s->pm4_wptr != s->r5g_wptr) {
+            /* commands the guest wrote after its data: a new epoch */
+            s->r5g_wptr = s->pm4_wptr;
+            ati_r580_r5gpu_epoch(s);
+        }
+        val = ati_r580_pm4_read_ring(s);
 
         trace_ati_r580_pm4_ring_dword(pos, val);
         ati_r580_pm4_parse(s, &s->pm4_ring, val);
@@ -487,7 +525,8 @@ void ati_r580_pm4_run_ring(ATIR580State *s)
          * left on the GPU.
          */
         if (ati_r580_on_engine() && ++s->engine_rptr_wb >= 256 &&
-            !s->pm4_ring.remaining && !s->gl_res) {
+            !s->pm4_ring.remaining && !s->gl_res &&
+            !qatomic_read(&s->r5g_res)) {
             s->engine_rptr_wb = 0;
             ati_r580_cp_rptr_writeback(s);
         }
@@ -508,6 +547,9 @@ void ati_r580_pm4_parse(ATIR580State *s,
     if (p->remaining == 0) {
         /* val is a new packet header */
         p->type = R580_PM4_PACKET_TYPE(val);
+        if (!ati_r580_on_engine()) {
+            ati_r580_r5gpu_epoch(s);
+        }
 
         switch (p->type) {
         case 0:
@@ -1069,6 +1111,10 @@ void ati_r580_pm4_indirect(ATIR580State *s, uint32_t offset,
         }
         trace_ati_r580_pm4_ib_dword(i, val);
         ati_r580_pm4_parse(s, &parser, val);
+        if (ati_r580_on_engine() && !parser.remaining && s->ib_yield &&
+            qatomic_read(&s->engine_claim_wanted)) {
+            ati_r580_engine_yield(s);
+        }
     }
     /*
      * Inside the guest store that issued it this is the guest's next
@@ -1293,6 +1339,9 @@ void ati_r580_engine_claim(ATIR580State *s)
         s->engine_claim_waits++;
         t0 = (get_clock() - t0) / 1000;
         s->engine_claim_wait_us += t0;
+        if (t0 >= 50000) {
+            s->engine_claim_waits_50ms++;
+        }
         if ((uint64_t)t0 > s->engine_claim_wait_max_us) {
             s->engine_claim_wait_max_us = t0;
             s->engine_claim_wait_max_reg = qatomic_read(&s->engine_claim_reg);

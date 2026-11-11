@@ -162,7 +162,11 @@ struct R580MtlCtx {
 
     uint64_t draws, commits, passes;
     char desc[160];
+    /* the R500 pipeline's objects; see ati_r580_r5mtl.m.inc */
+    struct R5Mtl *r5;
 };
+
+static void mtl_r5_close(R580MtlCtx *g);
 
 /* ------------------------------------------------------------------ */
 /* the shaders */
@@ -1508,6 +1512,7 @@ void ati_r580_gl_close(R580MtlCtx *g)
         while (qatomic_read(&g->compiling) || qatomic_read(&g->handlers)) {
             g_usleep(1000);
         }
+        mtl_r5_close(g);
         [g->last release];
         for (k = 0; k < MTL_PROGSLOTS; k++) {
             [g->prog[k].pso release];
@@ -2222,3 +2227,5 @@ bool ati_r580_gl_draw(R580MtlCtx *g, const R580GlReq *r)
     }
     return ok && !g->gpu_failed;
 }
+
+#include "ati_r580_r5mtl.m.inc"

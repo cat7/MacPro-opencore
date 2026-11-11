@@ -2105,6 +2105,7 @@ static void ati_r580_reset_hold(Object *obj, ResetType type)
     }
     memset(s->regs, 0, sizeof(s->regs));
     ati_r580_r5xx_reset(s);
+    ati_r580_r5gpu_reset(s);
     memset(s->plls, 0, sizeof(s->plls));
     /*
      * Posted clocks, as the VBIOS ASIC_Init leaves them: SPLL and MPLL
@@ -2261,6 +2262,23 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
      * `verify` runs both paths and diffs them, with the software result
      * still the one that lands in VRAM.
      */
+#ifdef CONFIG_DARWIN
+    /*
+     * Unset, the R500 pipeline draws through Metal where there is an
+     * Apple GPU; without one it stays on the CPU.
+     */
+    if ((!s->gl_path || !s->gl_path[0]) && (!s->gl_api || !s->gl_api[0]) &&
+        s->r500 && !qtest_enabled()) {
+        const char *why = NULL;
+
+        s->gl_ctx = ati_r580_gl_open_metal(&why, s->gl_async
+                                           ? s->gl_workers : 0);
+        if (s->gl_ctx) {
+            s->gl_mode = R580_GL_ON;
+            trace_ati_r580_gl_open(ati_r580_gl_describe(s->gl_ctx));
+        }
+    }
+#endif
     if (s->gl_path && s->gl_path[0] && strcmp(s->gl_path, "off")) {
         const char *why = NULL;
 
@@ -2401,6 +2419,7 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
     ati_r580_raster_init(s);
     if (s->r500) {
         ati_r580_r5xx_init(s, s->r500_threads);
+        ati_r580_r5gpu_init(s);
     }
     ati_r580_engine_init(s);
     ati_r580_disp_init(s);
@@ -2419,6 +2438,7 @@ static void ati_r580_exit(PCIDevice *dev)
     ati_r580_disp_fini(s);
     ati_r580_engine_fini(s);
     ati_r580_raster_fini(s);
+    ati_r580_r5gpu_fini(s);
     ati_r580_r5xx_fini(s);
     ati_r580_avivo_fini(s);
     timer_free(s->cursor_timer);
@@ -2514,6 +2534,7 @@ static const Property ati_r580_properties[] = {
      */
     DEFINE_PROP_STRING("gl", ATIR580State, gl_path),
     DEFINE_PROP_STRING("gl-api", ATIR580State, gl_api),
+    DEFINE_PROP_STRING("gl-verify-dump", ATIR580State, r5g_dump),
     /*
      * Diagnostic only (milestone M4): translate each vertex program the
      * guest uploads to GLSL and count whether the translator could
@@ -2530,6 +2551,7 @@ static const Property ati_r580_properties[] = {
                             ON_OFF_AUTO_AUTO),
     /* register BAR without the BQL; needs the command processor thread */
     DEFINE_PROP_BOOL("lockless-mmio", ATIR580State, lockless_mmio, true),
+    DEFINE_PROP_BOOL("x-ib-yield", ATIR580State, ib_yield, true),
     /* refresh conversion on its own thread; auto is on except under qtest */
     DEFINE_PROP_ON_OFF_AUTO("async-display", ATIR580State, async_display,
                             ON_OFF_AUTO_AUTO),
@@ -2807,7 +2829,9 @@ static char *ati_r580_get_engine(Object *obj, Error **errp)
                            ", waited %" PRIu64 ", %" PRIu64 " us"
                            ", found busy %" PRIu64
                            "\nlongest claim wait %" PRIu64 " us, register "
-                           "0x%04x%s\nyields to claimants %" PRIu64,
+                           "0x%04x%s\nclaim waits of 50 ms or more %" PRIu64
+                           "\nyields to claimants %" PRIu64
+                           ", inside indirect buffers %" PRIu64,
                            qatomic_read(&s->engine_busy) ? "busy" : "idle",
                            s->engine_kicks, s->engine_waits,
                            s->engine_wait_us, s->engine_bql_writes,
@@ -2818,7 +2842,26 @@ static char *ati_r580_get_engine(Object *obj, Error **errp)
                            s->engine_claim_wait_max_us,
                            s->engine_claim_wait_max_reg & 0xffff,
                            s->engine_claim_wait_max_reg & 0x10000 ?
-                           " (write)" : "", s->engine_yields);
+                           " (write)" : "", s->engine_claim_waits_50ms,
+                           s->engine_yields, s->engine_ib_yields);
+}
+
+/* any write zeroes the claim and yield counters */
+static void ati_r580_set_engine(Object *obj, const char *v, Error **errp)
+{
+    ATIR580State *s = ATI_R580(obj);
+
+    if (!s->engine_on) {
+        return;
+    }
+    qemu_mutex_lock(&s->engine_lock);
+    s->engine_claims = s->engine_claim_waits = s->engine_claim_wait_us = 0;
+    s->engine_claim_wait_max_us = 0;
+    s->engine_claim_wait_max_reg = 0;
+    s->engine_claim_waits_50ms = 0;
+    s->engine_claim_busy = 0;
+    s->engine_yields = s->engine_ib_yields = 0;
+    qemu_mutex_unlock(&s->engine_lock);
 }
 
 /* the occlusion counter's line of `gl-stats` */
@@ -3207,7 +3250,7 @@ static void ati_r580_class_init(ObjectClass *klass, const void *data)
                                   NULL);
     object_class_property_add_str(klass, "gl-stats", ati_r580_get_gl, NULL);
     object_class_property_add_str(klass, "engine-stats",
-                                  ati_r580_get_engine, NULL);
+                                  ati_r580_get_engine, ati_r580_set_engine);
     object_class_property_add_str(klass, "pvs-stats", ati_r580_get_pvs, NULL);
     object_class_property_add_str(klass, "us-stats", ati_r580_get_us, NULL);
     object_class_property_add_str(klass, "r500-stats", ati_r580_get_r500,

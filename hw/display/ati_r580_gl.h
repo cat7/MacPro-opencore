@@ -400,4 +400,35 @@ void ati_r580_gl_queue_stats(R580GlCtx *g, uint64_t *units, uint64_t *flushes,
 void ati_r580_gl_hold(bool hold);
 void ati_r580_gl_unbind(R580GlCtx *g);
 
+/*
+ * The R500 pipeline's backend (ati_r580_r5gpu.h). An image is a w x h
+ * texture of `levels` levels holding one unsigned integer of `bpp` bytes
+ * per pixel. upload() and read() move a rectangle of one level between
+ * the image and host memory of `stride` bytes per row; copy() moves a
+ * level-0 rectangle between images. r5_draw() returns false when the
+ * backend could not run the request, the target then unchanged.
+ * r5_dst_fetch() is true when a draw reads its destination in one pass
+ * whatever its primitives overlap.
+ */
+struct R5GpuImage;
+struct R5GpuDraw;
+struct R5GpuImage *ati_r580_gl_r5_image(R580GlCtx *g, int w, int h,
+                                        int levels, int bpp);
+void ati_r580_gl_r5_image_free(R580GlCtx *g, struct R5GpuImage *im);
+bool ati_r580_gl_r5_upload(R580GlCtx *g, struct R5GpuImage *im, int level,
+                           int x, int y, int w, int h, const void *data,
+                           unsigned stride);
+bool ati_r580_gl_r5_read(R580GlCtx *g, struct R5GpuImage *im, int x, int y,
+                         int w, int h, void *data, unsigned stride);
+bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
+                         struct R5GpuImage *src, int sx, int sy, int w, int h);
+bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d);
+/* the request's program: 1 built, 0 building (draw on the CPU), -1 never */
+int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,
+                              int bpp);
+bool ati_r580_gl_r5_dst_fetch(R580GlCtx *g);
+void ati_r580_gl_r5_stats(R580GlCtx *g, uint64_t *progs, uint64_t *fails,
+                          uint64_t *draws, uint64_t *link_us,
+                          uint64_t *link_max);
+
 #endif /* ATI_R580_GL_H */

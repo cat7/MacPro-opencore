@@ -85,7 +85,7 @@ elif host_os == 'windows'
   r580_gl_deps += [cc.find_library('opengl32'), cc.find_library('gdi32'),
                    cc.find_library('user32')]
 endif
-system_ss.add(when: 'CONFIG_ATI_R580', if_true: [files('ati_r580.c', 'ati_r580_avivo.c', 'ati_r580_atom.c', 'ati_r580_edid.c', 'ati_r580_cp.c', 'ati_r580_2d.c', 'ati_r580_3d.c', 'ati_r580_dbg.c', 'ati_r580_pvs.c', 'ati_r580_pvs_glsl.c', 'ati_r580_us.c', 'ati_r580_us_glsl.c', 'ati_r580_gl.c', 'ati_r580_r5xx.c', 'ati_r580_r5core.c', 'ati_r580_r5us.c', 'ati_r580_r5tex.c', 'ati_r580_r5pvs.c', 'ati_r580_r5raster.c'), r580_gl_files, r580_gl_deps])
+system_ss.add(when: 'CONFIG_ATI_R580', if_true: [files('ati_r580.c', 'ati_r580_avivo.c', 'ati_r580_atom.c', 'ati_r580_edid.c', 'ati_r580_cp.c', 'ati_r580_2d.c', 'ati_r580_3d.c', 'ati_r580_dbg.c', 'ati_r580_pvs.c', 'ati_r580_pvs_glsl.c', 'ati_r580_us.c', 'ati_r580_us_glsl.c', 'ati_r580_gl.c', 'ati_r580_r5xx.c', 'ati_r580_r5core.c', 'ati_r580_r5us.c', 'ati_r580_r5tex.c', 'ati_r580_r5pvs.c', 'ati_r580_r5raster.c', 'ati_r580_r5gpu.c'), r580_gl_files, r580_gl_deps])
 
 # the synthetic AtomBIOS option ROM, generated and installed with the blobs
 if have_system and config_all_devices.has_key('CONFIG_ATI_R580')

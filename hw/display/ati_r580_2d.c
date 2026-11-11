@@ -862,7 +862,8 @@ static void ati_r580_2d_scale_run(ATIR580State *s,
      * `src_bpp`, which is why this sits after the datatype switch rather
      * than at the top; nothing above reads VRAM.
      */
-    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres ||
+                 s->r5g_any)) {
         bool was_res = s->gl_res;
         uint64_t px0 = s->gl_flush_px;
         uint32_t rows = (((uint32_t)op->h * op->y_inc) >> 12) + 1;
@@ -1042,7 +1043,8 @@ void ati_r580_2d_blt(ATIR580State *s)
      * the last row the blit can reach -- because too wide only costs a
      * flush, while too narrow is the silent kind of wrong.
      */
-    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres ||
+                 s->r5g_any)) {
         int bpp = ati_r580_bpp_from_dp_datatype(s);
         uint32_t ds = s->dst_pitch_bytes ? s->dst_pitch : s->dst_pitch * bpp;
         uint32_t ss = s->src_pitch_bytes ? s->src_pitch : s->src_pitch * bpp;
@@ -1201,7 +1203,8 @@ bool ati_r580_host_data_flush(ATIR580State *s)
      * transfer, not this chunk, because `dst_y`/`dst_height` are the
      * transfer's and the chunk position is only where it has got to.
      */
-    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres)) {
+    if (unlikely(s->gl_res || s->gl_tex_any || s->gl_zres ||
+                 s->r5g_any)) {
         bool was_res = s->gl_res;
         uint64_t px0 = s->gl_flush_px;
 

@@ -180,3 +180,62 @@ void ati_r580_gl_unbind(R580GlCtx *g)
         FWD(g, unbind);
     }
 }
+
+struct R5GpuImage *ati_r580_gl_r5_image(R580GlCtx *g, int w, int h,
+                                        int levels, int bpp)
+{
+    return g ? FWD(g, r5_image, w, h, levels, bpp) : NULL;
+}
+
+void ati_r580_gl_r5_image_free(R580GlCtx *g, struct R5GpuImage *im)
+{
+    if (g) {
+        FWD(g, r5_image_free, im);
+    }
+}
+
+bool ati_r580_gl_r5_upload(R580GlCtx *g, struct R5GpuImage *im, int level,
+                           int x, int y, int w, int h, const void *data,
+                           unsigned stride)
+{
+    return g && FWD(g, r5_upload, im, level, x, y, w, h, data, stride);
+}
+
+bool ati_r580_gl_r5_read(R580GlCtx *g, struct R5GpuImage *im, int x, int y,
+                         int w, int h, void *data, unsigned stride)
+{
+    return g && FWD(g, r5_read, im, x, y, w, h, data, stride);
+}
+
+bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
+                         struct R5GpuImage *src, int sx, int sy, int w, int h)
+{
+    return g && FWD(g, r5_copy, dst, dx, dy, src, sx, sy, w, h);
+}
+
+bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
+{
+    return g && FWD(g, r5_draw, d);
+}
+
+int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,
+                              int bpp)
+{
+    return g ? FWD(g, r5_prog_ready, d, bpp) : -1;
+}
+
+bool ati_r580_gl_r5_dst_fetch(R580GlCtx *g)
+{
+    return g && FWD(g, r5_dst_fetch);
+}
+
+void ati_r580_gl_r5_stats(R580GlCtx *g, uint64_t *progs, uint64_t *fails,
+                          uint64_t *draws, uint64_t *link_us,
+                          uint64_t *link_max)
+{
+    if (g) {
+        FWD(g, r5_stats, progs, fails, draws, link_us, link_max);
+    } else {
+        *progs = *fails = *draws = *link_us = *link_max = 0;
+    }
+}

@@ -263,6 +263,7 @@ typedef unsigned char GLubyte;
 typedef float GLfloat;
 typedef char GLchar;
 typedef ptrdiff_t GLsizeiptr;
+typedef ptrdiff_t GLintptr;
 
 #define GL_FALSE                        0
 #define GL_ZERO                         0
@@ -335,6 +336,22 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_QUERY_RESULT                 0x8866
 #define GL_QUERY_RESULT_AVAILABLE       0x8867
 #define GL_MAX_TEXTURE_BUFFER_SIZE      0x8C2B
+#define GL_UNSIGNED_SHORT               0x1403
+#define GL_UNSIGNED_INT                 0x1405
+#define GL_RED                          0x1903
+#define GL_UNPACK_ROW_LENGTH            0x0CF2
+#define GL_PACK_ROW_LENGTH              0x0D02
+#define GL_R32F                         0x822E
+#define GL_R8UI                         0x8232
+#define GL_R16UI                        0x8234
+#define GL_R32UI                        0x8236
+#define GL_RED_INTEGER                  0x8D94
+#define GL_UNIFORM_BUFFER               0x8A11
+#define GL_INFO_LOG_LENGTH              0x8B84
+#define GL_INVALID_INDEX                0xFFFFFFFFu
+#define GL_READ_FRAMEBUFFER             0x8CA8
+#define GL_DRAW_FRAMEBUFFER             0x8CA9
+#define GL_DYNAMIC_DRAW                 0x88E8
 
 /* GL 1.1: opengl32.dll's own exports */
 static void (APIENTRY *glBindTexture)(GLenum, GLuint);
@@ -425,6 +442,17 @@ static void (APIENTRY *glDeleteQueries)(GLsizei, const GLuint *);
 static void (APIENTRY *glBeginQuery)(GLenum, GLuint);
 static void (APIENTRY *glEndQuery)(GLenum);
 static void (APIENTRY *glGetQueryObjectuiv)(GLuint, GLenum, GLuint *);
+static void (APIENTRY *glUniform4iv)(GLint, GLsizei, const GLint *);
+static void (APIENTRY *glDisableVertexAttribArray)(GLuint);
+static void (APIENTRY *glBufferSubData)(GLenum, GLintptr, GLsizeiptr,
+                                        const void *);
+static void (APIENTRY *glGetShaderInfoLog)(GLuint, GLsizei, GLsizei *,
+                                           GLchar *);
+static void (APIENTRY *glGetProgramInfoLog)(GLuint, GLsizei, GLsizei *,
+                                            GLchar *);
+static GLuint (APIENTRY *glGetUniformBlockIndex)(GLuint, const GLchar *);
+static void (APIENTRY *glUniformBlockBinding)(GLuint, GLuint, GLuint);
+static void (APIENTRY *glBindBufferBase)(GLenum, GLuint, GLuint);
 
 typedef void (APIENTRY *R580GlProc)(void);
 
@@ -506,6 +534,14 @@ static const struct {
     R580_GL_PROC(glBeginQuery),
     R580_GL_PROC(glEndQuery),
     R580_GL_PROC(glGetQueryObjectuiv),
+    R580_GL_PROC(glUniform4iv),
+    R580_GL_PROC(glDisableVertexAttribArray),
+    R580_GL_PROC(glBufferSubData),
+    R580_GL_PROC(glGetShaderInfoLog),
+    R580_GL_PROC(glGetProgramInfoLog),
+    R580_GL_PROC(glGetUniformBlockIndex),
+    R580_GL_PROC(glUniformBlockBinding),
+    R580_GL_PROC(glBindBufferBase),
 };
 
 /*
@@ -986,9 +1022,12 @@ struct R580GlCtx {
     GLuint zq_one;
     unsigned q_zq;
     char desc[128];
+    /* the R500 pipeline's objects; see ati_r580_r5gl.c.inc */
+    struct R5Gl *r5;
 };
 
 static void gl_flush_queue(R580GlCtx *g);
+static void gl_r5_close(R580GlCtx *g);
 
 /* begin an occlusion query that adds to the running count */
 static void gl_zq_begin(R580GlCtx *g)
@@ -2700,6 +2739,7 @@ void ati_r580_gl_close(R580GlCtx *g)
         r580_gl_makecurrent(&g->plat);
         gl_worker_stop(g);
         gl_flush_queue(g);
+        gl_r5_close(g);
         glDeleteTextures(1, &g->dst);
         glDeleteTextures(1, &g->acc);
         glDeleteTextures(1, &g->zbuf);
@@ -3998,6 +4038,8 @@ bool ati_r580_gl_draw(R580GlCtx *g, const R580GlReq *r)
     return ok;
 }
 
+#include "ati_r580_r5gl.c.inc"
+
 #else /* no host GL backend */
 
 R580GlCtx *ati_r580_gl_open(const char **err, unsigned workers)
@@ -4113,6 +4155,58 @@ void ati_r580_gl_hold(bool hold)
 
 void ati_r580_gl_unbind(R580GlCtx *g)
 {
+}
+
+struct R5GpuImage *ati_r580_gl_r5_image(R580GlCtx *g, int w, int h,
+                                        int levels, int bpp)
+{
+    return NULL;
+}
+
+void ati_r580_gl_r5_image_free(R580GlCtx *g, struct R5GpuImage *im)
+{
+}
+
+bool ati_r580_gl_r5_upload(R580GlCtx *g, struct R5GpuImage *im, int level,
+                           int x, int y, int w, int h, const void *data,
+                           unsigned stride)
+{
+    return false;
+}
+
+bool ati_r580_gl_r5_read(R580GlCtx *g, struct R5GpuImage *im, int x, int y,
+                         int w, int h, void *data, unsigned stride)
+{
+    return false;
+}
+
+bool ati_r580_gl_r5_copy(R580GlCtx *g, struct R5GpuImage *dst, int dx, int dy,
+                         struct R5GpuImage *src, int sx, int sy, int w, int h)
+{
+    return false;
+}
+
+bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
+{
+    return false;
+}
+
+bool ati_r580_gl_r5_dst_fetch(R580GlCtx *g)
+{
+    return false;
+}
+
+int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,
+                              int bpp)
+{
+    return -1;
+}
+
+void ati_r580_gl_r5_stats(R580GlCtx *g, uint64_t *progs, uint64_t *fails,
+                          uint64_t *draws, uint64_t *link_us,
+                          uint64_t *link_max)
+{
+    *progs = *fails = *draws = *link_us = *link_max = 0;
 }
 
 #endif /* CONFIG_DARWIN || _WIN32 */
