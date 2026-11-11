@@ -124,14 +124,23 @@ static int64_t crtc_period_ns(ATIR580State *s)
     return period;
 }
 
+/*
+ * A frame starts at its deadline, not when the callback runs, so a late
+ * callback does not delay the frames after it. After a stall of a whole
+ * frame or more the timing restarts.
+ */
 static void ati_r580_avivo_vblank(void *opaque)
 {
     ATIR580State *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t start = s->frame_start_ns + s->frame_period_ns;
     int i;
 
+    if (now - start >= s->frame_period_ns) {
+        start = now;
+    }
     s->frame_count++;
-    s->frame_start_ns = now;
+    s->frame_start_ns = start;
     s->frame_period_ns = crtc_period_ns(s);
     for (i = 0; i < ATI_R580_NUM_CRTC; i++) {
         if (CREG(s, i, R5XX_D1CRTC_CONTROL) & R5XX_CRTC_EN) {
@@ -139,7 +148,7 @@ static void ati_r580_avivo_vblank(void *opaque)
         }
     }
     ati_r580_update_irq(s);
-    timer_mod(s->vblank_timer, now + s->frame_period_ns);
+    timer_mod(s->vblank_timer, start + s->frame_period_ns);
 }
 
 /* ---------------------------------------------------------------- */
