@@ -86,6 +86,40 @@ bool ati_r580_mc_to_vram(ATIR580State *s, uint32_t addr,
  * through a table in host memory whose bus address the Mac driver
  * programs at 0xab0.
  */
+/*
+ * The R5xx PCIe GART: PCIE_TX_GART_START_LO..END_LO maps page by page
+ * through a table of 32-bit entries at card address PCIE_TX_GART_BASE.
+ * An entry holds bus address bits 39:8 (low nibble = flags).
+ */
+static bool ati_r580_mc_to_pcie_gart(ATIR580State *s, uint32_t addr,
+                                     dma_addr_t *bus)
+{
+    uint32_t start = s->pcie_ind[R5XX_PCIE_TX_GART_START_LO] & ~0xfffu;
+    uint32_t end = s->pcie_ind[R5XX_PCIE_TX_GART_END_LO];
+    uint32_t base = s->pcie_ind[R5XX_PCIE_TX_GART_BASE];
+    uint32_t off, entry;
+
+    if (!(s->pcie_ind[R5XX_PCIE_TX_GART_CNTL] & R5XX_PCIE_TX_GART_EN) ||
+        addr < start || addr > end) {
+        return false;
+    }
+    base += ((addr - start) >> 12) * 4;
+    if (ati_r580_mc_to_vram(s, base, &off)) {
+        if (off + 4 > ATI_R580_VRAM_SIZE) {
+            return false;
+        }
+        entry = ldl_le_p((uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                         off);
+    } else if (pci_dma_read(PCI_DEVICE(s), base, &entry,
+                            sizeof(entry)) != MEMTX_OK) {
+        return false;
+    } else {
+        entry = le32_to_cpu(entry);
+    }
+    *bus = (((dma_addr_t)entry & ~0xfull) << 8) | (addr & 0xfff);
+    return true;
+}
+
 static bool ati_r580_mc_to_aic(ATIR580State *s, uint32_t addr,
                                dma_addr_t *bus)
 {
@@ -93,6 +127,9 @@ static bool ati_r580_mc_to_aic(ATIR580State *s, uint32_t addr,
     uint32_t hi = s->regs[R580_AIC_HI_ADDR >> 2];
     uint32_t entry;
 
+    if (ati_r580_mc_to_pcie_gart(s, addr, bus)) {
+        return true;
+    }
     if (!(s->regs[R580_AIC_CNTL >> 2] & R580_PCIGART_TRANSLATE_EN) ||
         addr < lo || addr > hi) {
         return false;
@@ -172,17 +209,33 @@ uint32_t ati_r580_mc_read32(ATIR580State *s, uint32_t addr)
 }
 
 /* the registers ati_r580_mc_route() depends on */
-static const uint16_t ati_r580_mc_map_regs[R580_MC_MAP_REGS] = {
+static const uint16_t ati_r580_mc_map_regs[] = {
     R580_MC_FB_LOCATION, R580_MC_AGP_LOCATION, R580_AGP_BASE,
     R580_AIC_CNTL, R580_AIC_LO_ADDR, R580_AIC_HI_ADDR, R580_AIC_PT_BASE_R300,
 };
+
+/* and the PCIe GART registers it depends on */
+static const uint8_t ati_r580_mc_map_pcie[] = {
+    R5XX_PCIE_TX_GART_CNTL, R5XX_PCIE_TX_GART_BASE,
+    R5XX_PCIE_TX_GART_START_LO, R5XX_PCIE_TX_GART_END_LO,
+};
+
+#define R580_MC_MAP_FRONT ARRAY_SIZE(ati_r580_mc_map_regs)
+QEMU_BUILD_BUG_ON(ARRAY_SIZE(ati_r580_mc_map_regs) +
+                  ARRAY_SIZE(ati_r580_mc_map_pcie) != R580_MC_MAP_REGS);
+
+static uint32_t ati_r580_mc_map_val(ATIR580State *s, unsigned k)
+{
+    return k < R580_MC_MAP_FRONT ? s->regs[ati_r580_mc_map_regs[k] >> 2]
+           : s->pcie_ind[ati_r580_mc_map_pcie[k - R580_MC_MAP_FRONT]];
+}
 
 void ati_r580_mc_map_save(ATIR580State *s, uint32_t *map)
 {
     unsigned k;
 
     for (k = 0; k < R580_MC_MAP_REGS; k++) {
-        map[k] = s->regs[ati_r580_mc_map_regs[k] >> 2];
+        map[k] = ati_r580_mc_map_val(s, k);
     }
 }
 
@@ -191,7 +244,7 @@ bool ati_r580_mc_map_same(ATIR580State *s, const uint32_t *map)
     unsigned k;
 
     for (k = 0; k < R580_MC_MAP_REGS; k++) {
-        if (map[k] != s->regs[ati_r580_mc_map_regs[k] >> 2]) {
+        if (map[k] != ati_r580_mc_map_val(s, k)) {
             return false;
         }
     }

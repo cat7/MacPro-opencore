@@ -1064,7 +1064,7 @@ uint32_t ati_r580_mc_read32(ATIR580State *s, uint32_t addr);
 void ati_r580_mc_write32(ATIR580State *s, uint32_t addr, uint32_t val);
 void ati_r580_mc_read_block(ATIR580State *s, uint32_t addr, uint32_t *dst,
                             unsigned n);
-#define R580_MC_MAP_REGS 7
+#define R580_MC_MAP_REGS 11
 void ati_r580_mc_map_save(ATIR580State *s, uint32_t *map);
 bool ati_r580_mc_map_same(ATIR580State *s, const uint32_t *map);
 /*

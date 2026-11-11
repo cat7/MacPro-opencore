@@ -57,6 +57,10 @@
 #define R5XX_PCIE_TX_GART_CNTL          0x10
 #define R5XX_PCIE_TX_GART_INVALIDATE    (1u << 8)
 #define R5XX_PCIE_TX_GART_ERROR         0x18
+#define R5XX_PCIE_TX_GART_EN            (1u << 0)
+#define R5XX_PCIE_TX_GART_BASE          0x13
+#define R5XX_PCIE_TX_GART_START_LO      0x14
+#define R5XX_PCIE_TX_GART_END_LO        0x16
 
 /* GEN_INT_STATUS: display interrupt summary */
 #define R5XX_GEN_INT_DISPLAY_STAT       (1u << 0)

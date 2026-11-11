@@ -755,6 +755,10 @@ static bool ati_r580_front_read(ATIR580State *s, uint32_t base, uint32_t *val)
     case R5XX_MC_STATUS_LEGACY:
         *val = 1u << 2;             /* MC idle */
         return true;
+    case R580_WAIT_UNTIL:
+        /* reads report 2D and 3D clean in bits 16 and 17 */
+        *val = s->regs[base >> 2] | (3u << 16);
+        return true;
     case R5XX_P1PLL_CNTL:
     case R5XX_P2PLL_CNTL:
         /* the pixel PLLs lock at once */
