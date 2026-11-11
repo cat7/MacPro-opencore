@@ -32,6 +32,8 @@ typedef struct R5GlProg {
     GLuint prog;
     GLint vp, tu[R5G_UNITS];
     bool failed;
+    bool pending;               /* a worker is compiling it */
+    bool warm;                  /* a worker compiled it; link here next */
     uint64_t lru;
 } R5GlProg;
 
@@ -338,12 +340,11 @@ static GLuint r5gl_shader(R5Gl *r, GLenum type, const char *src)
     return sh;
 }
 
-static GLuint r5gl_link(R5Gl *r, const R5GpuDraw *d)
+/* the program's two shaders */
+static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
 {
     GString *vs = g_string_new(r5gl_vs_head);
     GString *fs = g_string_new("#version 410 core\n");
-    GLuint v, f, p = 0;
-    GLint ok = 0;
     unsigned n, u;
 
     for (n = 0; n < d->ninputs; n++) {
@@ -403,9 +404,17 @@ static GLuint r5gl_link(R5Gl *r, const R5GpuDraw *d)
         "    if (!us_keep) discard;\n"
         "    o_c = p;\n"
         "}\n");
+    *vsp = vs;
+    *fsp = fs;
+}
 
-    v = r5gl_shader(r, GL_VERTEX_SHADER, vs->str);
-    f = v ? r5gl_shader(r, GL_FRAGMENT_SHADER, fs->str) : 0;
+static GLuint r5gl_link(R5Gl *r, const char *vs, const char *fs)
+{
+    GLuint v, f, p = 0;
+    GLint ok = 0;
+
+    v = r5gl_shader(r, GL_VERTEX_SHADER, vs);
+    f = v ? r5gl_shader(r, GL_FRAGMENT_SHADER, fs) : 0;
     if (v && f) {
         p = glCreateProgram();
         glAttachShader(p, v);
@@ -430,8 +439,6 @@ static GLuint r5gl_link(R5Gl *r, const R5GpuDraw *d)
     if (f) {
         glDeleteShader(f);
     }
-    g_string_free(vs, true);
-    g_string_free(fs, true);
     if (p) {
         GLuint bi = glGetUniformBlockIndex(p, "R5K");
         char nm[16];
@@ -448,18 +455,26 @@ static GLuint r5gl_link(R5Gl *r, const R5GpuDraw *d)
     return p;
 }
 
-static R5GlProg *r5gl_prog(R5Gl *r, const R5GpuDraw *d)
+/*
+ * A program's slot: the one with its key, or the least recently used
+ * one emptied for it. A slot whose program a worker is still compiling
+ * is not taken while there is another.
+ */
+static R5GlProg *r5gl_slot(R5Gl *r, uint64_t key, bool *found)
 {
-    R5GlProg *pr, *victim = &r->prog[0];
+    R5GlProg *pr, *victim = NULL;
     unsigned k;
 
     for (k = 0; k < R5GL_PROGS; k++) {
         pr = &r->prog[k];
-        if ((pr->prog || pr->failed) && pr->key == d->key) {
+        if ((pr->prog || pr->failed || pr->pending || pr->warm) &&
+            pr->key == key) {
             pr->lru = ++r->tick;
-            return pr->failed ? NULL : pr;
+            *found = true;
+            return pr;
         }
-        if (pr->lru < victim->lru) {
+        if (!victim || (victim->pending && !pr->pending) ||
+            (victim->pending == pr->pending && pr->lru < victim->lru)) {
             victim = pr;
         }
     }
@@ -468,20 +483,101 @@ static R5GlProg *r5gl_prog(R5Gl *r, const R5GpuDraw *d)
         glDeleteProgram(pr->prog);
     }
     memset(pr, 0, sizeof(*pr));
-    pr->key = d->key;
+    pr->key = key;
     pr->lru = ++r->tick;
+    *found = false;
+    return pr;
+}
+
+/* a worker finished compiling the program with this key */
+static void r5gl_warm_done(R580GlCtx *g, uint64_t key, bool failed)
+{
+    R5Gl *r = g->r5;
+    unsigned k;
+
+    for (k = 0; r && k < R5GL_PROGS; k++) {
+        R5GlProg *pr = &r->prog[k];
+
+        if (pr->pending && pr->key == key) {
+            pr->pending = false;
+            if (failed) {
+                pr->failed = true;
+                r->fails++;
+            } else {
+                pr->warm = true;
+            }
+            return;
+        }
+    }
+}
+
+/*
+ * The program for a draw: 1 linked (*out), 0 a worker is compiling it,
+ * -1 it will not link. With `async` and program workers a program not
+ * yet seen is handed to a worker, which compiles it in its own context;
+ * the driver's program cache then makes this context's link of the same
+ * source cheap (NVIDIA: up to 6 s cold, 15-25 ms after a worker has
+ * linked it). Until then the draw falls back to the CPU.
+ */
+static int r5gl_prog(R580GlCtx *g, R5Gl *r, const R5GpuDraw *d, bool async,
+                     R5GlProg **out)
+{
+    GString *vs, *fs;
+    R5GlProg *pr;
+    bool found;
+    unsigned k;
+
+    *out = NULL;
+    if (async && g->async) {
+        gl_worker_drain(g);
+    }
+    pr = r5gl_slot(r, d->key, &found);
+    if (found && pr->prog) {
+        *out = pr;
+        return 1;
+    }
+    if (found && pr->failed) {
+        return -1;
+    }
+    if (found && pr->pending) {
+        if (async) {
+            return 0;
+        }
+        /* a synchronous caller links over it; the worker's result is moot */
+        pr->pending = false;
+    }
+    r5gl_src(d, &vs, &fs);
+    if (async && g->async && !pr->warm) {
+        R580GlJob *j = g_new0(R580GlJob, 1);
+
+        j->slot = R580_GL_PROGSLOTS;
+        j->kind = R580_GL_WARM_R5;
+        j->mask = 1;
+        j->key = d->key;
+        j->vs = g_string_free(vs, false);
+        j->glsl = g_string_free(fs, false);
+        pr->pending = true;
+        qemu_mutex_lock(&g->wlock);
+        QSIMPLEQ_INSERT_TAIL(&g->wpending, j, next);
+        qemu_cond_signal(&g->wcond);
+        qemu_mutex_unlock(&g->wlock);
+        return 0;
+    }
     {
         int64_t t0 = g_get_monotonic_time();
 
-        pr->prog = r5gl_link(r, d);
+        pr->prog = r5gl_link(r, vs->str, fs->str);
         t0 = g_get_monotonic_time() - t0;
         r->link_us += t0;
         r->link_max = MAX(r->link_max, (uint64_t)t0);
     }
+    g_string_free(vs, true);
+    g_string_free(fs, true);
+    pr->warm = false;
     if (!pr->prog) {
         pr->failed = true;
         r->fails++;
-        return NULL;
+        return -1;
     }
     r->links++;
     pr->vp = glGetUniformLocation(pr->prog, "u_vp");
@@ -491,22 +587,24 @@ static R5GlProg *r5gl_prog(R5Gl *r, const R5GpuDraw *d)
         snprintf(nm, sizeof(nm), "r5_t%u", k);
         pr->tu[k] = glGetUniformLocation(pr->prog, nm);
     }
-    return pr;
+    *out = pr;
+    return 1;
 }
 
 int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,
                               int bpp)
 {
     R5GlProg *pr;
+    int ready;
 
     if (!g) {
         return -1;
     }
     r580_gl_makecurrent(&g->plat);
-    pr = r5gl_prog(r5gl_get(g), d);
+    ready = r5gl_prog(g, r5gl_get(g), d, true, &pr);
     glUseProgram(0);
     r580_gl_done(&g->plat);
-    return pr ? 1 : -1;
+    return ready;
 }
 
 /* the scratch the destination is copied to, at least w x h */
@@ -538,7 +636,7 @@ bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
     r580_gl_makecurrent(&g->plat);
     gl_flush_queue(g);
     r = r5gl_get(g);
-    pr = r5gl_prog(r, d);
+    r5gl_prog(g, r, d, false, &pr);
     if (!pr || !r5gl_fbo(t)) {
         goto out;
     }

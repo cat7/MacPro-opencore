@@ -612,8 +612,13 @@ static __thread bool r580_gl_keep;
 static void r580_gl_plat_close(R580GlPlat *pl)
 {
     if (pl->ctx) {
-        wglMakeCurrent(NULL, NULL);
-        r580_gl_cur = NULL;
+        /* only this context: closing a worker's leaves the caller's bound */
+        if (wglGetCurrentContext() == pl->ctx) {
+            wglMakeCurrent(NULL, NULL);
+        }
+        if (r580_gl_cur == pl) {
+            r580_gl_cur = NULL;
+        }
         wglDeleteContext(pl->ctx);
         pl->ctx = NULL;
     }
@@ -666,6 +671,9 @@ static bool r580_gl_plat_open_any(R580GlPlat *pl, bool second,
     } arb = { NULL };
     PIXELFORMATDESCRIPTOR pfd;
     HGLRC boot;
+    /* the bootstrap below unbinds the caller's context; it is put back */
+    HGLRC prev_ctx = wglGetCurrentContext();
+    HDC prev_dc = wglGetCurrentDC();
     int fmt;
     unsigned k;
 
@@ -715,7 +723,7 @@ static bool r580_gl_plat_open_any(R580GlPlat *pl, bool second,
     }
     if (wglMakeCurrent(pl->dc, boot)) {
         arb.any = wglGetProcAddress("wglCreateContextAttribsARB");
-        wglMakeCurrent(NULL, NULL);
+        wglMakeCurrent(prev_dc, prev_ctx);
     }
     wglDeleteContext(boot);
     if (!arb.mk) {
@@ -925,6 +933,8 @@ typedef struct R580GlJob {
     unsigned kind;              /* R580_GL_WARM_* */
     uint16_t mask;              /* the colour-mask variant to draw once */
     char *glsl;                 /* the guest fragment program, or NULL */
+    char *vs;                   /* R580_GL_WARM_R5: its vertex shader */
+    uint64_t key;               /* R580_GL_WARM_R5: the program's key */
     bool failed;                /* it would not link */
 } R580GlJob;
 
@@ -933,6 +943,7 @@ enum {
     R580_GL_WARM_ADD,           /* its add variant, blending into the twin */
     R580_GL_WARM_UI2N,          /* the twin's two conversions */
     R580_GL_WARM_N2UI,
+    R580_GL_WARM_R5,            /* an R500 program (glsl, vs): link only */
 };
 
 /* one program worker: its thread, its context and its draw state */
@@ -2293,6 +2304,18 @@ static void gl_worker_run(R580GlWorker *w, R580GlJob *j)
     const char *err = NULL;
     GLuint prog;
 
+    if (j->kind == R580_GL_WARM_R5) {
+        prog = gl_link(j->vs, NULL, NULL, j->glsl, &err);
+        g_free(j->vs);
+        g_free(j->glsl);
+        j->vs = j->glsl = NULL;
+        if (prog) {
+            glDeleteProgram(prog);
+        } else {
+            j->failed = true;
+        }
+        return;
+    }
     switch (j->kind) {
     case R580_GL_WARM_UI2N:
         prog = gl_link(vs_blit_src, NULL, NULL, fs_ui2n_src, &err);
@@ -2393,6 +2416,8 @@ static void gl_worker_submit(R580GlCtx *g, unsigned slot, unsigned kind,
     qemu_mutex_unlock(&g->wlock);
 }
 
+static void r5gl_warm_done(R580GlCtx *g, uint64_t key, bool failed);
+
 /* take in what the worker finished */
 static void gl_worker_drain(R580GlCtx *g)
 {
@@ -2403,7 +2428,9 @@ static void gl_worker_drain(R580GlCtx *g)
     QSIMPLEQ_CONCAT(&done, &g->wdone);
     qemu_mutex_unlock(&g->wlock);
     QSIMPLEQ_FOREACH_SAFE(j, &done, next, n) {
-        if (j->slot < R580_GL_PROGSLOTS) {
+        if (j->kind == R580_GL_WARM_R5) {
+            r5gl_warm_done(g, j->key, j->failed);
+        } else if (j->slot < R580_GL_PROGSLOTS) {
             R580GlProgSlot *sl = &g->prog[j->slot];
 
             sl->pending--;
@@ -2476,6 +2503,7 @@ static void gl_worker_stop(R580GlCtx *g)
     QSIMPLEQ_CONCAT(&g->wdone, &g->wpending);
     QSIMPLEQ_FOREACH_SAFE(j, &g->wdone, next, n) {
         g_free(j->glsl);
+        g_free(j->vs);
         g_free(j);
     }
     QSIMPLEQ_INIT(&g->wdone);
