@@ -33,6 +33,7 @@
 #include "ati_r580_gl.h"
 #include "ati_r580_avivo.h"
 #include "ati_r580_edid.h"
+#include "ati_r580_r5xx.h"
 #include "trace.h"
 
 
@@ -842,6 +843,11 @@ static uint32_t ati_r580_reg_read32(ATIR580State *s, uint32_t base)
     case R300_ZB_ZPASS_DATA:
         val = ati_r580_zpass_read(s);
         break;
+    case R580_GPIOPAD_Y:
+        /* driven pads read back GPIOPAD_A; pad 16 = auxiliary power present */
+        val = (s->regs[R580_GPIOPAD_A >> 2] & s->regs[R580_GPIOPAD_EN >> 2]) |
+              (R580_GPIOPAD_AUX_POWER & ~s->regs[R580_GPIOPAD_EN >> 2]);
+        break;
     case R580_MM_DATA:
         val = 0;
         if (s->regs[R580_MM_INDEX >> 2] & R580_MM_APER) {
@@ -1133,6 +1139,10 @@ void ati_r580_reg_write32(ATIR580State *s, uint32_t base,
     ati_r580_audit_reg_write(s, base);
     if (ati_r580_front_write(s, base, val)) {
         return;
+    }
+    if (s->r5 && ((base >= 0x2000 && base < 0x5000) ||
+                  (base >= 0x9800 && base < 0xa040))) {
+        ati_r580_r5xx_reg_write(s, base, val);
     }
 
     /*
@@ -1733,10 +1743,13 @@ static uint32_t ati_r580_read_lockless(ATIR580State *s, uint32_t base)
     bool bql;
     uint32_t val;
 
-    if (ati_r580_engine_status_reg(base) || base == R580_RBBM_STATUS) {
+    if (ati_r580_engine_status_reg(base) || base == R580_RBBM_STATUS ||
+        base == R580_WAIT_UNTIL) {
+        /* answered at once; a claim would wait out the whole batch */
         return ati_r580_reg_read32(s, base);
     }
     if (engine) {
+        qatomic_set(&s->engine_claim_reg, base);
         ati_r580_engine_claim(s);
         bql = ati_r580_engine_bql_reg(base) && !bql_locked();
     } else {
@@ -1836,6 +1849,7 @@ static void ati_r580_write_lockless(ATIR580State *s, hwaddr addr,
         return;
     }
     if (engine) {
+        qatomic_set(&s->engine_claim_reg, base | 0x10000);
         ati_r580_engine_claim(s);
         bql = ati_r580_engine_bql_reg(base) && !bql_locked();
     } else {
@@ -2090,6 +2104,7 @@ static void ati_r580_reset_hold(Object *obj, ResetType type)
         ati_r580_zguard_set(s, 0, 0, 0, 0);
     }
     memset(s->regs, 0, sizeof(s->regs));
+    ati_r580_r5xx_reset(s);
     memset(s->plls, 0, sizeof(s->plls));
     /*
      * Posted clocks, as the VBIOS ASIC_Init leaves them: SPLL and MPLL
@@ -2384,6 +2399,9 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
                                    ati_r580_cursor_timer, s);
     ati_r580_avivo_init(s);
     ati_r580_raster_init(s);
+    if (s->r500) {
+        ati_r580_r5xx_init(s, s->r500_threads);
+    }
     ati_r580_engine_init(s);
     ati_r580_disp_init(s);
     /* see "LOCKLESS REGISTER ACCESS"; BAR1 reaches only BQL registers */
@@ -2401,6 +2419,7 @@ static void ati_r580_exit(PCIDevice *dev)
     ati_r580_disp_fini(s);
     ati_r580_engine_fini(s);
     ati_r580_raster_fini(s);
+    ati_r580_r5xx_fini(s);
     ati_r580_avivo_fini(s);
     timer_free(s->cursor_timer);
     s->cursor_timer = NULL;
@@ -2503,6 +2522,9 @@ static const Property ati_r580_properties[] = {
      * anything at all.
      */
     DEFINE_PROP_BOOL("pvs-glsl", ATIR580State, pvs_glsl, false),
+    /* R500 3D pipeline; off runs the R300 one */
+    DEFINE_PROP_BOOL("r500", ATIR580State, r500, true),
+    DEFINE_PROP_UINT32("r500-threads", ATIR580State, r500_threads, 4),
     /* command processor on its own thread; auto is on except under qtest */
     DEFINE_PROP_ON_OFF_AUTO("async-engine", ATIR580State, engine_async,
                             ON_OFF_AUTO_AUTO),
@@ -2765,6 +2787,11 @@ static char *ati_r580_get_us(Object *obj, Error **errp)
  * often the guest woke it, and how often and how long a CPU register
  * access waited for it.
  */
+static char *ati_r580_get_r500(Object *obj, Error **errp)
+{
+    return ati_r580_r5xx_stats(ATI_R580(obj));
+}
+
 static char *ati_r580_get_engine(Object *obj, Error **errp)
 {
     ATIR580State *s = ATI_R580(obj);
@@ -2778,14 +2805,20 @@ static char *ati_r580_get_engine(Object *obj, Error **errp)
                            "\nscratch writes %" PRIu64
                            "\nlockless mmio %s\nclaims %" PRIu64
                            ", waited %" PRIu64 ", %" PRIu64 " us"
-                           ", found busy %" PRIu64,
+                           ", found busy %" PRIu64
+                           "\nlongest claim wait %" PRIu64 " us, register "
+                           "0x%04x%s\nyields to claimants %" PRIu64,
                            qatomic_read(&s->engine_busy) ? "busy" : "idle",
                            s->engine_kicks, s->engine_waits,
                            s->engine_wait_us, s->engine_bql_writes,
                            s->engine_ibs, s->engine_scratch,
                            s->lockless ? "on" : "off", s->engine_claims,
                            s->engine_claim_waits, s->engine_claim_wait_us,
-                           s->engine_claim_busy);
+                           s->engine_claim_busy,
+                           s->engine_claim_wait_max_us,
+                           s->engine_claim_wait_max_reg & 0xffff,
+                           s->engine_claim_wait_max_reg & 0x10000 ?
+                           " (write)" : "", s->engine_yields);
 }
 
 /* the occlusion counter's line of `gl-stats` */
@@ -3177,6 +3210,8 @@ static void ati_r580_class_init(ObjectClass *klass, const void *data)
                                   ati_r580_get_engine, NULL);
     object_class_property_add_str(klass, "pvs-stats", ati_r580_get_pvs, NULL);
     object_class_property_add_str(klass, "us-stats", ati_r580_get_us, NULL);
+    object_class_property_add_str(klass, "r500-stats", ati_r580_get_r500,
+                                  NULL);
     object_class_property_add_str(klass, "palette", ati_r580_get_palette,
                                   NULL);
     object_class_property_add_str(klass, "edid", ati_r580_get_edid, NULL);

@@ -46,6 +46,11 @@
  * pads on real silicon.
  */
 #define R580_GPIO_MONIDB             0x006c
+#define R580_GPIOPAD_MASK            0x0198
+#define R580_GPIOPAD_A               0x019c
+#define R580_GPIOPAD_EN              0x01a0
+#define R580_GPIOPAD_Y               0x01a4
+#define R580_GPIOPAD_AUX_POWER       (1u << 16)
 /*
  * The hardware I2C engine (0x0090/0x0094/0x0098) is NOT documented in
  * RRG-G04500-C at all, but the OEM Mac FCode ROM's constant table

@@ -284,6 +284,8 @@ enum {
     ATI_R580_DISP_DONE,         /* ... until the hand-over takes it back */
 };
 
+typedef struct ATIR580R5 ATIR580R5;
+
 struct ATIR580State {
     PCIDevice parent_obj;
 
@@ -323,6 +325,10 @@ struct ATIR580State {
     bool engine_claimed;
     QemuCond engine_claim_cond;
     uint64_t engine_claims, engine_claim_waits, engine_claim_wait_us;
+    uint64_t engine_claim_wait_max_us;
+    uint32_t engine_claim_wanted;
+    uint64_t engine_yields;
+    uint32_t engine_claim_wait_max_reg, engine_claim_reg;
     uint64_t engine_claim_busy;
     /* the decoded-texture cache, held by the draw path */
     QemuRecMutex gl_tex_lock;
@@ -909,6 +915,11 @@ struct ATIR580State {
     uint32_t r300_immd[16384];
     /* VAP_VF_CNTL of a 3D_DRAW_INDX_2 waiting for its INDX_BUFFER */
     uint32_t r300_indx_vf;
+
+    /* R500 pipeline (ati_r580_r5xx.c); NULL runs the R300 one */
+    ATIR580R5 *r5;
+    bool r500;
+    uint32_t r500_threads;
 };
 
 

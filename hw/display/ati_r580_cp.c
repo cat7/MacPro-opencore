@@ -476,6 +476,11 @@ void ati_r580_pm4_run_ring(ATIR580State *s)
 
         trace_ati_r580_pm4_ring_dword(pos, val);
         ati_r580_pm4_parse(s, &s->pm4_ring, val);
+        if (ati_r580_on_engine() && !s->pm4_ring.remaining &&
+            qatomic_read(&s->engine_claim_wanted)) {
+            s->engine_yields++;
+            break;
+        }
         /*
          * On the thread the guest refills the ring while it runs: tell
          * it what has been consumed, between packets and with nothing
@@ -1167,9 +1172,13 @@ bool ati_r580_engine_reg(uint32_t base)
     if (ati_r580_display_reg(base)) {
         return false;
     }
+    /*
+     * The PCIe index space (GART setup, invalidates) takes the BQL only:
+     * the driver writes it while the engine runs, and a claim would hold
+     * the vCPU for the length of the batch.
+     */
     return base < R580_CLOCK_CNTL_INDEX ||           /* MM_INDEX/DATA */
            base == R5XX_MC_IND_INDEX || base == R5XX_MC_IND_DATA ||
-           base == R5XX_PCIE_INDEX || base == R5XX_PCIE_DATA ||
            (base >= R580_MC_FB_LOCATION && base <= R580_MC_AGP_LOCATION) ||
            (base >= R580_AGP_BASE && base <= R580_PCI_GART_PAGE) ||
            (base >= R580_AIC_CNTL && base <= R580_AIC_HI_ADDR) ||
@@ -1268,6 +1277,7 @@ void ati_r580_engine_claim(ATIR580State *s)
     qemu_mutex_lock(&s->engine_lock);
     if (s->engine_busy) {
         t0 = get_clock();
+        qatomic_inc(&s->engine_claim_wanted);
         do {
             qemu_mutex_unlock(&s->engine_lock);
             if (bql) {
@@ -1279,8 +1289,14 @@ void ati_r580_engine_claim(ATIR580State *s)
             }
             qemu_mutex_lock(&s->engine_lock);
         } while (s->engine_busy);
+        qatomic_dec(&s->engine_claim_wanted);
         s->engine_claim_waits++;
-        s->engine_claim_wait_us += (get_clock() - t0) / 1000;
+        t0 = (get_clock() - t0) / 1000;
+        s->engine_claim_wait_us += t0;
+        if ((uint64_t)t0 > s->engine_claim_wait_max_us) {
+            s->engine_claim_wait_max_us = t0;
+            s->engine_claim_wait_max_reg = qatomic_read(&s->engine_claim_reg);
+        }
     }
     ati_r580_engine_take(s);
     qemu_mutex_unlock(&s->engine_lock);
@@ -1321,11 +1337,11 @@ void ati_r580_engine_unclaim(ATIR580State *s, bool kick)
     if (kick) {
         s->engine_kick = true;
         s->engine_kicks++;
-        qemu_cond_signal(&s->engine_cond);
     } else {
         qatomic_store_release(&s->engine_busy, false);
         qemu_event_set(&s->engine_idle);
     }
+    qemu_cond_signal(&s->engine_cond);
     qemu_cond_broadcast(&s->engine_claim_cond);
     qemu_mutex_unlock(&s->engine_lock);
 }
@@ -1420,8 +1436,22 @@ static void *ati_r580_engine_thread(void *opaque)
         while (!s->engine_kick && !s->engine_quit) {
             qemu_cond_wait(&s->engine_cond, &s->engine_lock);
         }
+        /* a waiting claimant goes first; the kick stays pending */
+        while ((qatomic_read(&s->engine_claim_wanted) || s->engine_claimed) &&
+               !s->engine_quit) {
+            if (!s->engine_claimed && s->engine_busy) {
+                ati_r580_gl_unbind(s->gl_ctx);
+                qatomic_store_release(&s->engine_busy, false);
+                qemu_event_set(&s->engine_idle);
+            }
+            qemu_cond_wait(&s->engine_cond, &s->engine_lock);
+        }
         if (s->engine_quit) {
             break;
+        }
+        if (!s->engine_busy) {
+            qemu_event_reset(&s->engine_idle);
+            qatomic_store_release(&s->engine_busy, true);
         }
         s->engine_kick = false;
         qemu_mutex_unlock(&s->engine_lock);
@@ -1429,7 +1459,11 @@ static void *ati_r580_engine_thread(void *opaque)
         ati_r580_pm4_run(s);
 
         qemu_mutex_lock(&s->engine_lock);
-        if (!s->engine_kick) {
+        if (s->pm4_rptr != qatomic_load_acquire(&s->pm4_wptr)) {
+            /* yielded to a claimant with ring work left */
+            s->engine_kick = true;
+        }
+        if (!s->engine_kick || qatomic_read(&s->engine_claim_wanted)) {
             /* the GL context is free before another thread may take it */
             ati_r580_gl_unbind(s->gl_ctx);
             qatomic_store_release(&s->engine_busy, false);

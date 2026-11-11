@@ -28,6 +28,7 @@
 #include "qemu/units.h"
 #include "exec/target_page.h"
 #include "ati_r580_int.h"
+#include "ati_r580_r5xx.h"
 #include "ati_r580_regs.h"
 #include "ati_r580_gl.h"
 #include "trace.h"
@@ -1616,6 +1617,10 @@ void ati_r580_r300_clear_zmask(ATIR580State *s, uint32_t first, uint32_t n,
 {
     R300ZClear c;
 
+    if (s->r5) {
+        ati_r580_r5xx_clear_zmask(s, first, n, val);
+        return;
+    }
     if (val) {
         return;
     }
@@ -9901,6 +9906,10 @@ void ati_r580_r300_draw_immd(ATIR580State *s, const uint32_t *dw, unsigned n)
     R300VtxFmt fmt = { 0 };
     unsigned i;
 
+    if (s->r5) {
+        ati_r580_r5xx_draw_immd(s, dw, n);
+        return;
+    }
     if (walk != 3 || !nvtx) {
         trace_ati_r580_3d_skip(vf, vsize, 0);
         if (nvtx) {
@@ -10245,6 +10254,10 @@ static void r300_draw_aos(ATIR580State *s, uint32_t vf, const uint16_t *idx)
 
 void ati_r580_r300_draw_vbuf(ATIR580State *s, uint32_t vf)
 {
+    if (s->r5) {
+        ati_r580_r5xx_draw_vbuf(s, vf);
+        return;
+    }
     r300_draw_aos(s, vf, NULL);
 }
 
@@ -10263,6 +10276,10 @@ void ati_r580_r300_draw_indx(ATIR580State *s, const uint32_t *dw, unsigned n)
     g_autofree uint16_t *idx = NULL;
     unsigned i;
 
+    if (s->r5) {
+        ati_r580_r5xx_draw_indx(s, dw, n);
+        return;
+    }
     if (walk != 1 || !nidx) {
         if (nidx) {
             ati_r580_note_gap(s, R580_GAP_VTX_WALK, walk);
@@ -10299,6 +10316,10 @@ void ati_r580_r300_indx_buffer(ATIR580State *s, uint32_t port, uint32_t addr,
     uint32_t vf = s->r300_indx_vf;
     g_autofree uint32_t *dw = NULL;
 
+    if (s->r5) {
+        ati_r580_r5xx_indx_buffer(s, port, addr, n);
+        return;
+    }
     if (trace_event_get_state_backends(TRACE_ATI_R580_3D_INDX_BUF)) {
         uint64_t target;
         const char *win = ati_r580_mc_describe(s, addr, &target);
