@@ -124,6 +124,13 @@ config DPCD
     bool
     select AUX
 
+config ATI_R580
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+    select BITBANG_I2C
+
 config ATI_VGA
     bool
     default y if PCI_DEVICES

@@ -62,6 +62,42 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
+# ati_r580_gl.c is the host-GPU rendering backend (phase 2): desktop GL
+# 3.3 core, offscreen -- no window, no QEMU display backend, and
+# deliberately NOT CONFIG_OPENGL, which cannot be enabled on darwin at all
+# (libepoxy there ships no epoxy/egl.h). Two hosts have a real backend:
+# darwin through CGL, and windows through WGL on an invisible window, where
+# opengl32 also supplies the GL 1.1 exports and wglGetProcAddress, gdi32
+# the pixel format and user32 the window. Deliberately NOT sdl: it is an
+# optional dependency and QEMU's own SDL display owns the video subsystem
+# (see the win32 leg's comment in ati_r580_gl.c). Elsewhere the file
+# compiles to a stub that reports there is no backend.
+r580_gl_deps = []
+r580_gl_files = []
+if host_os == 'darwin'
+  r580_gl_deps += dependency('appleframeworks', modules: 'OpenGL')
+  # ati_r580_mtl.m is the same interface drawn through Metal ("gl-api"),
+  # ati_r580_gpu.c dispatches between the two.
+  r580_gl_deps += dependency('appleframeworks',
+                             modules: ['Metal', 'Foundation'])
+  r580_gl_files += files('ati_r580_gpu.c', 'ati_r580_mtl.m')
+elif host_os == 'windows'
+  r580_gl_deps += [cc.find_library('opengl32'), cc.find_library('gdi32'),
+                   cc.find_library('user32')]
+endif
+system_ss.add(when: 'CONFIG_ATI_R580', if_true: [files('ati_r580.c', 'ati_r580_avivo.c', 'ati_r580_atom.c', 'ati_r580_edid.c', 'ati_r580_cp.c', 'ati_r580_2d.c', 'ati_r580_3d.c', 'ati_r580_dbg.c', 'ati_r580_pvs.c', 'ati_r580_pvs_glsl.c', 'ati_r580_us.c', 'ati_r580_us_glsl.c', 'ati_r580_gl.c'), r580_gl_files, r580_gl_deps])
+
+# the synthetic AtomBIOS option ROM, generated and installed with the blobs
+if have_system and config_all_devices.has_key('CONFIG_ATI_R580')
+  custom_target('ati-r580-atombios.rom',
+                output: 'ati-r580-atombios.rom',
+                input: files('ati_r580_atombios.py'),
+                command: [python, '@INPUT0@', '@OUTPUT@'],
+                build_by_default: true,
+                install: get_option('install_blobs'),
+                install_dir: qemu_datadir)
+endif
+
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 

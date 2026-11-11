@@ -1,0 +1,38 @@
+## @file
+#  Graphics Output Protocol for the emulated ATI Radeon X1900 XT (R580).
+#  The card resets with AVIVO D1 scanning out a linear ARGB8888 surface;
+#  the driver publishes that surface as a single-mode GOP.
+#
+#  Adapted from Rv530GopDxe of rv530-qemu 0b06c9f.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = AtiR580GopDxe
+  FILE_GUID      = 3f1c0a52-7d49-4b8e-a2c1-58072491a900
+  MODULE_TYPE    = UEFI_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = AtiR580GopEntry
+
+[Sources]
+  AtiR580GopDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  DevicePathLib
+  DebugLib
+  FrameBufferBltLib
+
+[Protocols]
+  gEfiPciIoProtocolGuid
+  gEfiGraphicsOutputProtocolGuid
+  gEfiDevicePathProtocolGuid
