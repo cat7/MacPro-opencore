@@ -62,6 +62,11 @@ virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
 
+# intel-hda.c
+intel_hda_reg_write(const char *reg, uint32_t val, uint32_t mask) "%s 0x%x mask 0x%x"
+intel_hda_reg_read(const char *reg, uint32_t val) "%s 0x%x"
+intel_hda_stream(int sd, uint32_t stnr, int run, uint32_t cbl, uint32_t lvi, uint32_t fmt) "sd %d stream %u run %d cbl %u lvi %u fmt 0x%x"
+
 # hda-alc885.c
 hda_alc885_verb(uint32_t nid, uint32_t verb, uint32_t payload, uint32_t resp) "nid 0x%02x verb 0x%03x payload 0x%04x -> 0x%08x"
 hda_alc885_unhandled(uint32_t nid, uint32_t verb, uint32_t payload) "nid 0x%02x verb 0x%03x payload 0x%04x"

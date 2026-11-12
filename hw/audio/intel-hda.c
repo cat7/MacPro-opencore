@@ -33,6 +33,7 @@
 #include "qobject/qdict.h"
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "trace.h"
 
 /* --------------------------------------------------------------------- */
 /* hda bus                                                               */
@@ -131,6 +132,7 @@ struct IntelHDAStream {
     uint32_t cbl;
     uint32_t lvi;
     uint32_t fmt;
+    uint32_t fifos;
     uint32_t bdlp_lbase;
     uint32_t bdlp_ubase;
 
@@ -185,6 +187,7 @@ struct IntelHDAState {
     MemoryRegion alias;
     uint32_t rirb_count;
     int64_t wall_base_ns;
+    bool fifos_rw;           /* output stream FIFOS is writable */
 
     /* debug logging */
     const IntelHDAReg *last_reg;
@@ -588,6 +591,8 @@ static void intel_hda_set_st_ctl(IntelHDAState *d, const IntelHDAReg *reg, uint3
     }
     if ((st->ctl & 0x02) != (old & 0x02)) {
         uint32_t stnr = (st->ctl >> 20) & 0x0f;
+        trace_intel_hda_stream(reg->stream, stnr, !!(st->ctl & 0x02), st->cbl, st->lvi,
+                               st->fmt);
         /* run bit flipped */
         if (st->ctl & 0x02) {
             /* start */
@@ -602,6 +607,13 @@ static void intel_hda_set_st_ctl(IntelHDAState *d, const IntelHDAReg *reg, uint3
         }
     }
     intel_hda_update_irq(d);
+}
+
+static void intel_hda_set_st_fifos(IntelHDAState *d, const IntelHDAReg *reg, uint32_t old)
+{
+    if (!d->fifos_rw) {
+        d->st[reg->stream].fifos = old;
+    }
 }
 
 /* --------------------------------------------------------------------- */
@@ -859,6 +871,9 @@ static const struct IntelHDAReg regtab[] = {
         .stream   = _i,                                               \
         .name     = _t stringify(_i) " FIFOS",                        \
         .size     = 2,                                                \
+        .wmask    = (_i) >= 4 ? 0xffff : 0,                           \
+        .offset   = offsetof(IntelHDAState, st[_i].fifos),            \
+        .whandler = intel_hda_set_st_fifos,                           \
         .reset    = HDA_BUFFER_SIZE,                                  \
     },                                                                \
     [ ST_REG(_i, ICH6_REG_SD_FORMAT) ] = {                            \
@@ -930,6 +945,7 @@ static void intel_hda_reg_write(IntelHDAState *d, const IntelHDAReg *reg, uint32
     if (!reg) {
         return;
     }
+    trace_intel_hda_reg_write(reg->name, val, wmask);
     if (!reg->wmask) {
         qemu_log_mask(LOG_GUEST_ERROR, "intel-hda: write to r/o reg %s\n",
                       reg->name);
@@ -1000,6 +1016,7 @@ static uint32_t intel_hda_reg_read(IntelHDAState *d, const IntelHDAReg *reg,
         }
         ret &= rmask;
     }
+    trace_intel_hda_reg_read(reg->name, ret);
     if (d->debug) {
         time_t now = time(NULL);
         if (!d->last_write && d->last_reg == reg && d->last_val == ret) {
@@ -1172,6 +1189,27 @@ static const VMStateDescription vmstate_intel_hda_stream = {
     }
 };
 
+static bool intel_hda_fifos_needed(void *opaque)
+{
+    IntelHDAState *d = opaque;
+
+    return d->fifos_rw;
+}
+
+static const VMStateDescription vmstate_intel_hda_fifos = {
+    .name = "intel-hda/fifos",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = intel_hda_fifos_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(st[4].fifos, IntelHDAState),
+        VMSTATE_UINT32(st[5].fifos, IntelHDAState),
+        VMSTATE_UINT32(st[6].fifos, IntelHDAState),
+        VMSTATE_UINT32(st[7].fifos, IntelHDAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_intel_hda = {
     .name = "intel-hda",
     .version_id = 1,
@@ -1214,6 +1252,10 @@ static const VMStateDescription vmstate_intel_hda = {
         VMSTATE_INT64(wall_base_ns, IntelHDAState),
 
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_intel_hda_fifos,
+        NULL
     }
 };
 
@@ -1270,6 +1312,11 @@ static void intel_hda_class_init_esb2(ObjectClass *klass, const void *data)
     dc->desc = "Intel HD Audio Controller (631xESB/632xESB)";
 }
 
+static void intel_hda_init_esb2(Object *obj)
+{
+    INTEL_HDA(obj)->fifos_rw = true;
+}
+
 static const TypeInfo intel_hda_info = {
     .name          = TYPE_INTEL_HDA_GENERIC,
     .parent        = TYPE_PCI_DEVICE,
@@ -1298,6 +1345,7 @@ static const TypeInfo intel_hda_info_esb2 = {
     .name          = "esb2-intel-hda",
     .parent        = TYPE_INTEL_HDA_GENERIC,
     .class_init    = intel_hda_class_init_esb2,
+    .instance_init = intel_hda_init_esb2,
 };
 
 static void hda_codec_device_class_init(ObjectClass *klass, const void *data)
