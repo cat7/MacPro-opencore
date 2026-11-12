@@ -127,6 +127,9 @@ static const AlcNode alc885_nodes[ALC_NODES] = {
 #define ALC_PIN_LAST    0x1b
 #define ALC_SPDIF_DAC   0x06
 #define ALC_SPDIF_PIN   0x1e
+#define ALC_LINE_IN     0x19
+/* AppleHDA mutes the line-in mixer input while the jack senses empty */
+#define ALC_JACKS_DEFAULT   (1u << (ALC_LINE_IN - 0x14))
 
 #define TYPE_HDA_ALC885 "hda-alc885"
 OBJECT_DECLARE_SIMPLE_TYPE(ALC885State, HDA_ALC885)
@@ -1087,10 +1090,12 @@ static const Property alc_properties[] = {
 
 static void alc_instance_init(Object *obj)
 {
+    HDA_ALC885(obj)->jacks = ALC_JACKS_DEFAULT;
     object_property_add(obj, "jacks", "uint32", alc_get_jacks, alc_set_jacks,
                         NULL, NULL);
     object_property_set_description(obj, "jacks",
-                                    "Plugged jacks, bit n = pin node 0x14 + n");
+                                    "Plugged jacks, bit n = pin node 0x14 + n"
+                                    " (default 0x20: line in)");
 }
 
 static void alc_class_init(ObjectClass *klass, const void *data)
