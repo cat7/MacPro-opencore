@@ -250,7 +250,11 @@ struct ATIR580R5Gpu {
     uint64_t offered, drawn, empty, verified, vdiff_draws, vdiff_px;
     uint64_t vdiff_px1, vmax;
     uint64_t zdrawn, ldrawn, pdrawn, zverified, zdiff_draws, zdiff_px;
-    uint64_t zcleared, zown;
+    uint64_t zcleared, zown, rdrawn, aa_why[6], csplit;
+    struct {
+        uint32_t off, pitch, in;
+        int w, h, ox, oy;
+    } nhs;
     struct {
         int x, y;
         uint32_t gpu, cpu;
@@ -1488,10 +1492,264 @@ static bool r5g_unit_ok(const R5xxTexSampler *smp)
     return nb && nb <= smp->bpp * 8;
 }
 
+/* the last colour buffer without a host image, for the statistics */
+static void r5g_nhs(ATIR580R5Gpu *g, uint32_t off, uint32_t pitch, int w,
+                    int h, int ox, int oy, uint32_t in)
+{
+    g->nhs.off = off;
+    g->nhs.pitch = pitch;
+    g->nhs.w = w;
+    g->nhs.h = h;
+    g->nhs.ox = ox;
+    g->nhs.oy = oy;
+    g->nhs.in = in;
+}
+
 static int r5g_fail(ATIR580R5Gpu *g, R5GFallback why)
 {
     g->fb[why]++;
     return R5G_CPU;
+}
+
+/* covered pixels per row, as sorted disjoint [x0, x1) intervals */
+typedef struct R5GSpans {
+    int y0, rows;
+    GArray **row;
+} R5GSpans;
+
+static void r5g_spans_free(R5GSpans *sp)
+{
+    int y;
+
+    for (y = 0; sp->row && y < sp->rows; y++) {
+        if (sp->row[y]) {
+            g_array_free(sp->row[y], true);
+        }
+    }
+    g_free(sp->row);
+    sp->row = NULL;
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(R5GSpans, r5g_spans_free)
+
+static void r5g_span(void *opaque, int y, int x0, int x1)
+{
+    R5GSpans *sp = opaque;
+    GArray *a;
+    int *v, i, n;
+
+    if (y < sp->y0 || y >= sp->y0 + sp->rows || x1 <= x0) {
+        return;
+    }
+    if (!sp->row) {
+        sp->row = g_new0(GArray *, sp->rows);
+    }
+    a = sp->row[y - sp->y0];
+    if (!a) {
+        a = sp->row[y - sp->y0] = g_array_new(false, false, sizeof(int));
+    }
+    /* merge [x0, x1) into the sorted list */
+    v = (int *)a->data;
+    n = a->len / 2;
+    for (i = 0; i < n && v[2 * i + 1] < x0; i++) {
+    }
+    while (i < n && v[2 * i] <= x1) {
+        x0 = MIN(x0, v[2 * i]);
+        x1 = MAX(x1, v[2 * i + 1]);
+        g_array_remove_range(a, 2 * i, 2);
+        v = (int *)a->data;
+        n--;
+    }
+    g_array_insert_val(a, 2 * i, x0);
+    g_array_insert_val(a, 2 * i + 1, x1);
+}
+
+/* the spans as rectangles, rows with the same spans merged; their count */
+static unsigned r5g_span_rects(R5GSpans *sp, int **out)
+{
+    GArray *r = g_array_new(false, false, sizeof(int));
+    unsigned n;
+    int y = 0;
+
+    while (sp->row && y < sp->rows) {
+        GArray *a = sp->row[y];
+        int y1 = y + 1, i;
+
+        if (!a || !a->len) {
+            y++;
+            continue;
+        }
+        while (y1 < sp->rows && sp->row[y1] && sp->row[y1]->len == a->len &&
+               !memcmp(sp->row[y1]->data, a->data, a->len * sizeof(int))) {
+            y1++;
+        }
+        for (i = 0; i < (int)a->len; i += 2) {
+            int b[4] = { g_array_index(a, int, i), sp->y0 + y,
+                         g_array_index(a, int, i + 1), sp->y0 + y1 };
+
+            g_array_append_vals(r, b, 4);
+        }
+        y = y1;
+    }
+    n = r->len / 4;
+    g_free(*out);
+    *out = (int *)g_array_free(r, false);
+    return n;
+}
+
+/*
+ * An AA resolve: the pixels its primitives cover, as the CPU rasteriser
+ * decides, go from colour buffer 0 to the resolve buffer unchanged (the
+ * AA buffer holds one sample per pixel): a copy between the two images.
+ * Not with a program that can kill a pixel, nor clip rectangles that can
+ * drop one.
+ */
+static int r5g_resolve(ATIR580R5Gpu *g, const R5GpuIn *in)
+{
+    ATIR580State *s = g->s;
+    const R5xxRaster *r = in->raster;
+    const struct R5xxRasterDerived *d = &r->d;
+    const R5xxSurfaceLayout *cl = &r->rt.cbuf[0], *rl = &d->resolve;
+    uint32_t coff, roff, bpp = cl->bpp;
+    int ox, oy, rox, roy, bx0 = INT_MAX, by0 = INT_MAX, bx1 = 0, by1 = 0;
+    R5GSurf *sf, *rsf;
+    R5GpuImage *cimg;
+    int64_t t0 = get_clock();
+    unsigned i, n = 0;
+    int k;
+    g_autofree int *box = g_new(int, 4);
+    g_autoptr(GArray) runs = NULL;
+    g_auto(R5GSpans) sp = { .y0 = d->sc_y0,
+                            .rows = d->sc_y1 - d->sc_y0 + 1 };
+
+    if ((bpp != 1 && bpp != 2 && bpp != 4) || rl->bpp != bpp) {
+        g->aa_why[0]++;
+        return r5g_fail(g, R5G_FB_AA);
+    }
+    if ((d->clip_rule & 0xffff) != 0xffff) {
+        g->aa_why[1]++;
+        return r5g_fail(g, R5G_FB_AA);
+    }
+    if (in->us && r500_us_uses_kill(in->us)) {
+        g->aa_why[2]++;
+        return r5g_fail(g, R5G_FB_AA);
+    }
+    if (rl->endian || !ati_r580_mc_to_vram(s, cl->gpu_addr, &coff) ||
+        !ati_r580_mc_to_vram(s, rl->gpu_addr, &roff) ||
+        cl->pitch_bytes % bpp || rl->pitch_bytes % bpp ||
+        (uint32_t)d->sc_x1 >= cl->pitch_bytes / bpp ||
+        (uint32_t)d->sc_x1 >= rl->pitch_bytes / bpp ||
+        (uint64_t)coff + (uint64_t)cl->pitch_bytes * (d->sc_y1 + 1) >
+        ATI_R580_VRAM_SIZE ||
+        (uint64_t)roff + (uint64_t)rl->pitch_bytes * (d->sc_y1 + 1) >
+        ATI_R580_VRAM_SIZE) {
+        g->aa_why[3]++;
+        return r5g_fail(g, R5G_FB_AA);
+    }
+    for (i = 0; i < in->nprims; i++) {
+        const R5Prim *p = &in->prims[i];
+        float z;
+
+        if (p->kind == R5_PRIM_TRI) {
+            if (!r5xx_raster_tri_spans(r, &p->v[0], &p->v[1], &p->v[2],
+                                       p->cull_front, p->cull_back,
+                                       r5g_span, &sp)) {
+                g->aa_why[4]++;
+                return r5g_fail(g, R5G_FB_AA);
+            }
+            continue;
+        }
+        if (p->kind != R5_PRIM_POINT && p->kind != R5_PRIM_POINT_SIZED) {
+            g->aa_why[4]++;
+            return r5g_fail(g, R5G_FB_AA);
+        }
+        if (r5xx_raster_point_box(r, &p->v[0], p->kind == R5_PRIM_POINT_SIZED,
+                                  p->size, box, &z)) {
+            for (k = box[1]; k < box[3]; k++) {
+                r5g_span(&sp, k, box[0], box[2]);
+            }
+        }
+    }
+    n = r5g_span_rects(&sp, &box);
+    for (i = 0; i < n; i++) {
+        bx0 = MIN(bx0, box[4 * i]);
+        by0 = MIN(by0, box[4 * i + 1]);
+        bx1 = MAX(bx1, box[4 * i + 2]);
+        by1 = MAX(by1, box[4 * i + 3]);
+    }
+    if (!n) {
+        g->empty++;
+        return R5G_DONE;
+    }
+    sf = r5g_target(g, coff, cl->pitch_bytes, bpp, d->sc_y1 + 1, &ox, &oy);
+    if (!sf) {
+        return r5g_fail(g, R5G_FB_SURF);
+    }
+    sf->lru = ++g->tick;
+    cimg = sf->img;
+    rsf = r5g_target(g, roff, rl->pitch_bytes, bpp, d->sc_y1 + 1, &rox, &roy);
+    if (!rsf || rsf == sf || !sf->live || sf->img != cimg ||
+        bx1 + ox > sf->w || bx1 + rox > rsf->w) {
+        g->aa_why[5]++;
+        return r5g_fail(g, R5G_FB_AA);
+    }
+    rsf->lru = ++g->tick;
+    r5g_flush_range(g, sf->off, sf->off + (uint64_t)sf->pitch * sf->h, sf);
+    r5g_surf_check(g, sf);
+    r5g_flush_range(g, rsf->off, rsf->off + (uint64_t)rsf->pitch * rsf->h, rsf);
+    r5g_surf_check(g, rsf);
+    runs = g_array_sized_new(false, false, sizeof(int), 6 * n);
+    for (i = 0; i < n; i++) {
+        const int *b = &box[4 * i];
+        int run[6] = { b[0] + ox, b[1] + oy, b[0] + rox, b[1] + roy,
+                       b[2] - b[0], b[3] - b[1] };
+
+        g_array_append_vals(runs, run, 6);
+    }
+    if (!ati_r580_gl_r5_copy_runs(g->ctx, rsf->img, sf->img,
+                                  (const int *)runs->data, n)) {
+        r5g_surf_free(g, rsf);
+        r5g_res_update(g);
+        return r5g_fail(g, R5G_FB_BACKEND);
+    }
+    g->drawn++;
+    g->rdrawn++;
+    t0 = get_clock() - t0;
+    g->draw_ns += t0;
+    g->max_draw_ns = MAX(g->max_draw_ns, (uint64_t)t0);
+    bx0 += rox;
+    bx1 += rox;
+    by0 += roy;
+    by1 += roy;
+    if (g->verify) {
+        size_t sz = (size_t)(bx1 - bx0) * (by1 - by0) * bpp;
+
+        if (sz > g->vbuf_cap) {
+            g->vbuf_cap = sz;
+            g->vbuf = g_realloc(g->vbuf, sz);
+        }
+        g->vsf = rsf;
+        g->vzsf = NULL;
+        g->vx0 = bx0;
+        g->vy0 = by0;
+        g->vx1 = bx1;
+        g->vy1 = by1;
+        if (!ati_r580_gl_r5_read(g->ctx, rsf->img, bx0, by0, bx1 - bx0,
+                                 by1 - by0, g->vbuf, (bx1 - bx0) * bpp)) {
+            g->vsf = NULL;
+        }
+        return R5G_VERIFY;
+    }
+    rsf->dx0 = rsf->dx1 > rsf->dx0 ? MIN(rsf->dx0, bx0) : bx0;
+    rsf->dy0 = rsf->dy1 > rsf->dy0 ? MIN(rsf->dy0, by0) : by0;
+    rsf->dx1 = MAX(rsf->dx1, bx1);
+    rsf->dy1 = MAX(rsf->dy1, by1);
+    r5g_guard_arm(g, rsf);
+    r5g_invalidate(g, rsf->off + (uint64_t)by0 * rsf->pitch,
+                   rsf->off + (uint64_t)by1 * rsf->pitch, rsf);
+    qatomic_set(&s->r5g_res, true);
+    qatomic_set(&s->r5g_any, true);
+    return R5G_DONE;
 }
 
 int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
@@ -1529,6 +1787,9 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     if (r->rt.num_cbufs != 1 || d->num_multiwrites != 1) {
         return r5g_fail(g, R5G_FB_CBUF);
     }
+    if (d->aa_resolve) {
+        return r5g_resolve(g, in);
+    }
     cf = r5g_cf(r->rt.cbuf_format[0], &cbpp);
     if (cf < 0 || d->cbuf_float[0] || r->rt.cbuf[0].bpp != cbpp) {
         return r5g_fail(g, R5G_FB_CFMT);
@@ -1552,9 +1813,6 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     }
     if (d->rop_enable) {
         return r5g_fail(g, R5G_FB_ROP);
-    }
-    if (d->aa_resolve) {
-        return r5g_fail(g, R5G_FB_AA);
     }
     if (d->poly_mode_dual &&
         (d->poly_front_type != 2 || d->poly_back_type != 2)) {
@@ -1611,8 +1869,20 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
 
     /* the triangles: snapped, culled, offset into the image */
     sf = r5g_target(g, coff, cpitch, cbpp, d->sc_y1 + 1, &ox, &oy);
+    if (sf && ox + d->sc_x1 + 1 > sf->w) {
+        /* it starts mid-row of a larger surface: give it one of its own */
+        int h = ROUND_UP(d->sc_y1 + 1, 64);
+
+        if ((uint64_t)coff + (uint64_t)cpitch * h > ATI_R580_VRAM_SIZE) {
+            h = (ATI_R580_VRAM_SIZE - coff) / cpitch;
+        }
+        sf = h > d->sc_y1 ? r5g_surf_new(g, coff, cpitch, cbpp, h) : NULL;
+        ox = oy = 0;
+        g->csplit++;
+    }
     if (!sf) {
         g_free(rq);
+        r5g_nhs(g, coff, cpitch, d->sc_x1 + 1, d->sc_y1 + 1, -1, -1, 0);
         return r5g_fail(g, R5G_FB_SURF);
     }
     sf->lru = ++g->tick;
@@ -1866,6 +2136,7 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     if (bx1 > sf->w) {
         /* pixels past the pitch land on the next row */
         g_free(rq);
+        r5g_nhs(g, coff, cpitch, d->sc_x1 + 1, d->sc_y1 + 1, ox, oy, sf->off);
         return r5g_fail(g, R5G_FB_SURF);
     }
     if (zsf && bx1 > zsf->w) {
@@ -2825,7 +3096,8 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         " cpu %" PRIu64 "\n"
         "gpu draws with depth/stencil %" PRIu64 ", of lines %" PRIu64
         ", of points %" PRIu64 "; drawn depth dropped by fast clears %"
-        PRIu64 ", depth surfaces split off %" PRIu64 "\n"
+        PRIu64 ", depth surfaces split off %" PRIu64 "; AA resolves %"
+        PRIu64 "; colour surfaces split off %" PRIu64 "\n"
         "gpu draw ms total %.1f max %.2f, passes %" PRIu64 ", verts %" PRIu64
         "\nprograms linked %" PRIu64 " failed %" PRIu64 ", link ms total %.1f"
         " max %.1f\n"
@@ -2837,7 +3109,8 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         g->verify ? "verify" : "on", ati_r580_gl_describe(g->ctx),
         g->dst_fetch ? "destination fetch" : "destination copies",
         g->offered, g->drawn, g->empty, fbt,
-        g->zdrawn, g->ldrawn, g->pdrawn, g->zcleared, g->zown,
+        g->zdrawn, g->ldrawn, g->pdrawn, g->zcleared, g->zown, g->rdrawn,
+        g->csplit,
         g->draw_ns / 1e6, g->max_draw_ns / 1e6, g->passes, g->verts_n,
         progs, pfail, lus / 1e3, lmax / 1e3, ns, g->surf_new, g->evicts, nt, g->tex_new,
         g->tex_hits, g->aliased, g->feedback,
@@ -2872,6 +3145,21 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
                            "the GPU %" PRIu64 "\n", g->g_arms,
                            g->g_kept, g->g_traps, g->g_diff, g->g_noslot,
                            g->g_off, g->adopted);
+    if (g->fb[R5G_FB_AA]) {
+        g_string_append_printf(o, "AA resolves left to the cpu: format %" PRIu64
+                               ", clip rectangles %" PRIu64 ", kill %" PRIu64
+                               ", memory %" PRIu64 ", not points %" PRIu64
+                               ", surfaces %" PRIu64 "\n", g->aa_why[0],
+                               g->aa_why[1], g->aa_why[2], g->aa_why[3],
+                               g->aa_why[4], g->aa_why[5]);
+    }
+    if (g->fb[R5G_FB_SURF]) {
+        g_string_append_printf(o, "last without a host surface: %08x pitch %u "
+                               "%dx%d, %s %08x at %d,%d\n", g->nhs.off,
+                               g->nhs.pitch, g->nhs.w, g->nhs.h,
+                               g->nhs.ox < 0 ? "no image" : "inside", g->nhs.in,
+                               g->nhs.ox, g->nhs.oy);
+    }
     g_string_append(o, "cpu fallbacks:");
     for (i = 0; i < R5G_FB_MAX; i++) {
         if (g->fb[i]) {

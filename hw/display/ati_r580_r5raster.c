@@ -1661,6 +1661,86 @@ bool r5xx_raster_line_runs(const R5xxRaster *r, const R5xxVertex *v0,
     return any;
 }
 
+bool r5xx_raster_tri_spans(const R5xxRaster *r, const R5xxVertex *v0,
+                           const R5xxVertex *v1, const R5xxVertex *v2,
+                           bool cull_front, bool cull_back, R5xxSpanFn *fn,
+                           void *opaque)
+{
+    const struct R5xxRasterDerived *d = &r->d;
+    const R5xxVertex *v[3] = { v0, v1, v2 };
+    int64_t X[3], Y[3], A[3], K0[3], B[3], area, s, sub = d->subpix;
+    int64_t minY, maxY;
+    double farea;
+    bool front;
+    int i, y, y0, y1;
+
+    if (d->poly_mode_dual) {
+        return false;
+    }
+    farea = ((double)v1->x - v0->x) * ((double)v2->y - v0->y) -
+            ((double)v2->x - v0->x) * ((double)v1->y - v0->y);
+    if (farea == 0) {
+        farea = 1;
+    }
+    front = ((farea < 0) == d->front_ccw);
+    if ((front && cull_front) || (!front && cull_back)) {
+        return true;
+    }
+    for (i = 0; i < 3; i++) {
+        if (!(fabsf(v[i]->x) < 1e7f) || !(fabsf(v[i]->y) < 1e7f)) {
+            return false;
+        }
+        X[i] = snap(r, v[i]->x);
+        Y[i] = snap(r, v[i]->y);
+    }
+    area = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+    if (area == 0) {
+        return true;
+    }
+    s = area < 0 ? -1 : 1;
+    for (i = 0; i < 3; i++) {
+        int a = (i + 1) % 3, b = (i + 2) % 3;
+        int64_t dx = (X[b] - X[a]) * s, dy = (Y[b] - Y[a]) * s;
+
+        A[i] = -dy;
+        B[i] = dx;
+        K0[i] = dy * X[a] - dx * Y[a] +
+                (((dy == 0 && dx > 0) || dy < 0) ? 0 : -1);
+    }
+    minY = Y[0] < Y[1] ? Y[0] : Y[1];
+    minY = minY < Y[2] ? minY : Y[2];
+    maxY = Y[0] > Y[1] ? Y[0] : Y[1];
+    maxY = maxY > Y[2] ? maxY : Y[2];
+    y0 = imax((int)floordiv64(minY - sub / 2, sub), d->sc_y0);
+    y1 = imin((int)floordiv64(maxY - sub / 2, sub) + 1, d->sc_y1);
+    for (y = y0; y <= y1; y++) {
+        int64_t cy = center(r, y), lo = d->sc_x0, hi = d->sc_x1;
+
+        for (i = 0; i < 3 && lo <= hi; i++) {
+            int64_t k = B[i] * cy + K0[i];
+
+            /* A * (px * sub + sub / 2) + k >= 0 */
+            if (A[i] > 0) {
+                int64_t c = -floordiv64(k, A[i]);      /* ceil(-k / A) */
+                int64_t m = -floordiv64(-(c - sub / 2), sub);
+
+                lo = m > lo ? m : lo;
+            } else if (A[i] < 0) {
+                int64_t c = floordiv64(k, -A[i]);
+                int64_t m = floordiv64(c - sub / 2, sub);
+
+                hi = m < hi ? m : hi;
+            } else if (k < 0) {
+                hi = lo - 1;
+            }
+        }
+        if (lo <= hi) {
+            fn(opaque, y, (int)lo, (int)hi + 1);
+        }
+    }
+    return true;
+}
+
 bool r5xx_raster_point_box(const R5xxRaster *r, const R5xxVertex *v,
                            bool sized, float size, int box[4], float *z)
 {

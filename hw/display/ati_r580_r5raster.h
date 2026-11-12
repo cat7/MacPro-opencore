@@ -249,6 +249,18 @@ bool r5xx_raster_line_runs(const R5xxRaster *r, const R5xxVertex *v0,
                            const R5xxVertex *v1, R5xxRunFn *fn, void *opaque);
 
 /*
+ * The pixels a triangle covers inside the scissor, exactly as
+ * r5xx_raster_triangle() draws them with these cull flags: per row y
+ * the pixels [x0, x1). False when it cannot tell (polygon mode, corners
+ * too far out).
+ */
+typedef void R5xxSpanFn(void *opaque, int y, int x0, int x1);
+bool r5xx_raster_tri_spans(const R5xxRaster *r, const R5xxVertex *v0,
+                           const R5xxVertex *v1, const R5xxVertex *v2,
+                           bool cull_front, bool cull_back, R5xxSpanFn *fn,
+                           void *opaque);
+
+/*
  * The pixels a point covers inside the scissor, as r5xx_raster_point()
  * (or, `sized`, r5xx_raster_point_sized()) draws them: box[0..3] = x0,
  * y0, x1, y1, end exclusive, and the z the depth test takes. False when
