@@ -483,6 +483,7 @@ struct USBBus {
     int busnr;
     int nfree;
     int nused;
+    bool irq_driven;    /* the guest enabled the controller interrupts */
     QTAILQ_HEAD(, USBPort) free;
     QTAILQ_HEAD(, USBPort) used;
     QTAILQ_ENTRY(USBBus) next;

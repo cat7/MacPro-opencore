@@ -858,6 +858,7 @@ void ehci_reset(void *opaque)
     USBDevice *devs[EHCI_PORTS];
 
     trace_usb_ehci_reset();
+    s->bus.irq_driven = false;
 
     /*
      * Do the detach before touching portsc, so that it correctly gets send to
@@ -1082,6 +1083,9 @@ static void ehci_opreg_write(void *ptr, hwaddr addr,
 
     case USBINTR:
         val &= USBINTR_MASK;
+        if (val) {
+            s->bus.irq_driven = true;
+        }
         if (ehci_enabled(s) && (USBSTS_FLR & val)) {
             qemu_bh_schedule(s->async_bh);
         }

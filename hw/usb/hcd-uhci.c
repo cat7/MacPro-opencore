@@ -320,6 +320,7 @@ static void uhci_reset(DeviceState *dev)
     s->status = UHCI_STS_HCHALTED;
     s->status2 = 0;
     s->intr = 0;
+    s->bus.irq_driven = false;
     s->fl_base_addr = 0;
     s->sof_timing = 64;
 
@@ -437,6 +438,9 @@ static void uhci_port_write(void *opaque, hwaddr addr,
         break;
     case UHCI_USBINTR:
         s->intr = val;
+        if (val) {
+            s->bus.irq_driven = true;
+        }
         uhci_update_irq(s);
         break;
     case UHCI_USBFRNUM:

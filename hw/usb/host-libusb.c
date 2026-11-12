@@ -57,6 +57,7 @@
 #include "qemu/module.h"
 #include "qemu/queue.h"
 #include "qemu/thread.h"
+#include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "trace.h"
@@ -103,6 +104,7 @@ struct USBHostDevice {
     bool                             needs_autoscan;
     bool                             allow_one_guest_reset;
     bool                             allow_all_guest_resets;
+    bool                             late_attach;
     bool                             suppress_remote_wake;
 
     /* state */
@@ -1092,6 +1094,23 @@ static void usb_host_ep_update(USBHostDevice *s)
     }
 }
 
+/* late-attach: firmware that polls the controller never sees the device */
+static bool usb_host_attach_held(USBHostDevice *s)
+{
+    return s->late_attach && s->needs_autoscan &&
+           !usb_bus_from_device(USB_DEVICE(s))->irq_driven;
+}
+
+static void usb_host_system_reset(void *opaque)
+{
+    USBHostDevice *s = opaque;
+    USBDevice *udev = USB_DEVICE(s);
+
+    if (udev->attached) {
+        usb_device_detach(udev);
+    }
+}
+
 static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
 {
     USBDevice *udev = USB_DEVICE(s);
@@ -1194,10 +1213,12 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
                  "host:%d.%d", bus_num, addr);
     }
 
-    usb_device_attach(udev, &local_err);
-    if (local_err) {
-        error_report_err(local_err);
-        goto fail;
+    if (!usb_host_attach_held(s)) {
+        usb_device_attach(udev, &local_err);
+        if (local_err) {
+            error_report_err(local_err);
+            goto fail;
+        }
     }
 
     trace_usb_host_open_success(bus_num, addr);
@@ -1395,6 +1416,9 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         }
     } else {
         s->needs_autoscan = true;
+        if (s->late_attach) {
+            qemu_register_reset(usb_host_system_reset, s);
+        }
         QTAILQ_INSERT_TAIL(&hostdevs, s, next);
         usb_host_auto_check(NULL);
     }
@@ -1420,6 +1444,9 @@ static void usb_host_unrealize(USBDevice *udev)
     qemu_remove_exit_notifier(&s->exit);
     if (s->needs_autoscan) {
         QTAILQ_REMOVE(&hostdevs, s, next);
+        if (s->late_attach) {
+            qemu_unregister_reset(usb_host_system_reset, s);
+        }
     }
     usb_host_close(s);
     /*
@@ -1960,6 +1987,7 @@ static const Property usb_host_dev_properties[] = {
                      allow_one_guest_reset, true),
     DEFINE_PROP_BOOL("guest-resets-all", USBHostDevice,
                      allow_all_guest_resets, false),
+    DEFINE_PROP_BOOL("late-attach", USBHostDevice, late_attach, false),
     DEFINE_PROP_UINT32("loglevel",  USBHostDevice, loglevel,
                        LIBUSB_LOG_LEVEL_WARNING),
     DEFINE_PROP_BIT("pipeline",    USBHostDevice, options,
@@ -2088,6 +2116,14 @@ static void usb_host_auto_check(void *unused)
                     usb_host_close(s);
                 }
                 s->errcount = 0;
+            } else if (s->dh && !USB_DEVICE(s)->attached &&
+                       !usb_host_attach_held(s)) {
+                Error *err = NULL;
+
+                usb_device_attach(USB_DEVICE(s), &err);
+                if (err) {
+                    error_report_err(err);
+                }
             }
             s->seen = 0;
         }
