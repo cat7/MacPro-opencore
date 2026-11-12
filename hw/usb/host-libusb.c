@@ -1095,9 +1095,12 @@ static void usb_host_ep_update(USBHostDevice *s)
     }
 }
 
-#define BOT_TIMEOUT 3000    /* ms */
+#define BOT_TIMEOUT 2000    /* ms */
 
-/* one bulk-only command with data in; the length read, or -1 */
+/*
+ * One bulk-only command with data in: the length read, -1 when the
+ * command failed, -2 when the transport did.
+ */
 static int usb_host_bot_in(USBHostDevice *s, uint8_t ep_out, uint8_t ep_in,
                            const uint8_t *cdb, int cdb_len,
                            uint8_t *data, int len)
@@ -1112,7 +1115,7 @@ static int usb_host_bot_in(USBHostDevice *s, uint8_t ep_out, uint8_t ep_in,
     memcpy(cbw + 15, cdb, cdb_len);
     if (libusb_bulk_transfer(s->dh, ep_out, cbw, sizeof(cbw), &n,
                              BOT_TIMEOUT) != 0 || n != sizeof(cbw)) {
-        return -1;
+        return -2;
     }
     if (libusb_bulk_transfer(s->dh, ep_in, data, len, &got,
                              BOT_TIMEOUT) == LIBUSB_ERROR_PIPE) {
@@ -1126,13 +1129,12 @@ static int usb_host_bot_in(USBHostDevice *s, uint8_t ep_out, uint8_t ep_in,
             libusb_clear_halt(s->dh, ep_in);
             continue;
         }
-        if (rc != 0 || n != sizeof(csw) || memcmp(csw, "USBS", 4) != 0 ||
-            csw[12] != 0) {
-            return -1;
+        if (rc != 0 || n != sizeof(csw) || memcmp(csw, "USBS", 4) != 0) {
+            return -2;
         }
-        return got;
+        return csw[12] ? -1 : got;
     }
-    return -1;
+    return -2;
 }
 
 /* a bulk-only drive holding a disc whose tracks are all audio */
@@ -1192,7 +1194,10 @@ static bool usb_host_audio_cd(USBHostDevice *s)
             audio = tracks && !data;
             break;
         }
-        usb_host_bot_in(s, ep_out, ep_in, sense, cdb_len, toc, 18);
+        if (n == -2 ||
+            usb_host_bot_in(s, ep_out, ep_in, sense, cdb_len, toc, 18) == -2) {
+            break;
+        }
     }
     libusb_release_interface(s->dh, intf->bInterfaceNumber);
     libusb_free_config_descriptor(conf);
