@@ -427,6 +427,7 @@ static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
         "#define R5_FRAG gl_FragCoord.xy\n"
         "#define R5_REC int(fr)\n"
         "#define R5_ZREC int(fz)\n"
+        "#define R5_IMUL64(a, b, h, l) imulExtended(a, b, h, l)\n"
         "uniform samplerBuffer r5_pl;\n"
         "#define R5_PLANE(i) texelFetch(r5_pl, i)\n"
         "#define R5_THIS\n"

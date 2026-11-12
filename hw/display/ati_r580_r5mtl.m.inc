@@ -89,6 +89,8 @@ static const char r5mtl_head[] =
 "#define R5_FRAG in.pos.xy\n"
 "#define R5_REC int(in.rec)\n"
 "#define R5_ZREC int(in.zrec)\n"
+"#define R5_IMUL64(a, b, h, l) { int ma_ = (a), mb_ = (b); "
+"h = mulhi(ma_, mb_); l = int(uint(ma_) * uint(mb_)); }\n"
 "#define R5_PLANE(i) pl[i]\n"
 "#define R5_THIS\n";
 

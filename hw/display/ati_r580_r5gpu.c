@@ -77,7 +77,7 @@
 #define R5G_MAX_TRIS    8192
 #define R5G_MAX_PASSES  256
 #define R5G_HIST        16
-#define R5G_FS_VERSION  5
+#define R5G_FS_VERSION  6
 /* vec4 of records a request may hold: R5_REC travels as a float */
 #define R5G_MAX_RECS    (1u << 24)
 
@@ -205,19 +205,20 @@ typedef struct ATIR580R5Gpu ATIR580R5Gpu;
 /*
  * A triangle of a depth-tested draw: its z plane, and the CPU
  * rasteriser's edge functions, edge i covering subpixel c when
- * e[i][0] * (c.x - e[i][2]) + e[i][1] * (c.y - e[i][3]) + bias[i] >= 0.
+ * a[i] * c.x + b[i] * c.y + c[i] >= 0 (the fill rule's bias in c).
  */
 typedef struct R5GTriZ {
     R5xxZPlane zp;
     bool front;
-    int32_t e[3][4], bias[3];
+    int32_t a[3], b[3];
+    int64_t c[3];
 } R5GTriZ;
 
 /* vec4 of a record's depth part */
-#define R5G_ZREC        6
+#define R5G_ZREC        8
 
 /* subpixel coordinates the exact edge test takes */
-#define R5G_EDGE_MAX    (1 << 17)
+#define R5G_EDGE_MAX    (1 << 29)
 
 struct ATIR580R5Gpu {
     ATIR580State *s;
@@ -249,7 +250,7 @@ struct ATIR580R5Gpu {
     uint64_t offered, drawn, empty, verified, vdiff_draws, vdiff_px;
     uint64_t vdiff_px1, vmax;
     uint64_t zdrawn, ldrawn, pdrawn, zverified, zdiff_draws, zdiff_px;
-    uint64_t zcleared;
+    uint64_t zcleared, zown;
     struct {
         int x, y;
         uint32_t gpu, cpu;
@@ -1173,13 +1174,19 @@ static void r5g_zrec(float *o, const R5xxZPlane *zp, bool front,
     o[4] = zp->x0;
     o[5] = zp->y0;
     o[6] = o[7] = 0.0f;
+    /* 32-bit halves of a, b and c as 16-bit floats, exact */
     for (i = 0; i < 3; i++) {
+        uint32_t w[4] = {
+            tz ? (uint32_t)tz->a[i] : 0, tz ? (uint32_t)tz->b[i] : 0,
+            tz ? (uint32_t)((uint64_t)tz->c[i] >> 32) : 0,
+            tz ? (uint32_t)tz->c[i] : 0,
+        };
+
         for (k = 0; k < 4; k++) {
-            o[8 + 4 * i + k] = tz ? tz->e[i][k] : 0;
+            o[8 + 8 * i + 2 * k] = (int16_t)(w[k] >> 16);
+            o[8 + 8 * i + 2 * k + 1] = w[k] & 0xffff;
         }
-        o[20 + i] = tz ? tz->bias[i] : 0;
     }
-    o[23] = 0.0f;
 }
 
 /*
@@ -1614,6 +1621,17 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         int zox, zoy;
 
         zsf = r5g_target(g, zoff, zpitch, zbpp, d->sc_y1 + 1, &zox, &zoy);
+        if (zsf && zsf != sf && (zox != ox || zoy != oy) && !ox && !oy) {
+            /* it lies inside a larger surface: give it one of its own */
+            int h = ROUND_UP(d->sc_y1 + 1, 64);
+
+            if ((uint64_t)zoff + (uint64_t)zpitch * h > ATI_R580_VRAM_SIZE) {
+                h = (ATI_R580_VRAM_SIZE - zoff) / zpitch;
+            }
+            zsf = r5g_surf_new(g, zoff, zpitch, zbpp, h);
+            zox = zoy = 0;
+            g->zown++;
+        }
         if (!zsf || zsf == sf || !sf->live || sf->img != cimg ||
             zox != ox || zoy != oy) {
             g_free(rq);
@@ -1716,11 +1734,10 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
                     g_free(rq);
                     return r5g_fail(g, R5G_FB_ZBIG);
                 }
-                tz->e[k][0] = -ey;
-                tz->e[k][1] = ex;
-                tz->e[k][2] = X[a];
-                tz->e[k][3] = Y[a];
-                tz->bias[k] = ((ey == 0 && ex > 0) || ey < 0) ? 0 : -1;
+                tz->a[k] = -ey;
+                tz->b[k] = ex;
+                tz->c[k] = ey * X[a] - ex * Y[a] +
+                           (((ey == 0 && ex > 0) || ey < 0) ? 0 : -1);
             }
             r5xx_raster_zplane(X, Y, pv, &tz->zp);
             tz->front = front;
@@ -2808,7 +2825,7 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         " cpu %" PRIu64 "\n"
         "gpu draws with depth/stencil %" PRIu64 ", of lines %" PRIu64
         ", of points %" PRIu64 "; drawn depth dropped by fast clears %"
-        PRIu64 "\n"
+        PRIu64 ", depth surfaces split off %" PRIu64 "\n"
         "gpu draw ms total %.1f max %.2f, passes %" PRIu64 ", verts %" PRIu64
         "\nprograms linked %" PRIu64 " failed %" PRIu64 ", link ms total %.1f"
         " max %.1f\n"
@@ -2820,7 +2837,7 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         g->verify ? "verify" : "on", ati_r580_gl_describe(g->ctx),
         g->dst_fetch ? "destination fetch" : "destination copies",
         g->offered, g->drawn, g->empty, fbt,
-        g->zdrawn, g->ldrawn, g->pdrawn, g->zcleared,
+        g->zdrawn, g->ldrawn, g->pdrawn, g->zcleared, g->zown,
         g->draw_ns / 1e6, g->max_draw_ns / 1e6, g->passes, g->verts_n,
         progs, pfail, lus / 1e3, lmax / 1e3, ns, g->surf_new, g->evicts, nt, g->tex_new,
         g->tex_hits, g->aliased, g->feedback,

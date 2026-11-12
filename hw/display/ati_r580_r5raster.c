@@ -1556,11 +1556,15 @@ void r5xx_raster_zplane(const int64_t X[3], const int64_t Y[3],
     double dz1 = (double)v[1]->z - v[0]->z, dz2 = (double)v[2]->z - v[0]->z;
     double det = dx1 * dy2 - dx2 * dy1;
 
-    zp->a = det ? (float)((dz1 * dy2 - dz2 * dy1) / det) : 0.0f;
-    zp->b = det ? (float)((dx1 * dz2 - dx2 * dz1) / det) : 0.0f;
-    zp->z0 = v[0]->z;
-    zp->x0 = X[0];
-    zp->y0 = Y[0];
+    double a = det ? (dz1 * dy2 - dz2 * dy1) / det : 0.0;
+    double b = det ? (dx1 * dz2 - dx2 * dz1) / det : 0.0;
+
+    /* referred to the buffer origin, near every pixel it can cover */
+    zp->a = a;
+    zp->b = b;
+    zp->z0 = v[0]->z - a * (double)X[0] - b * (double)Y[0];
+    zp->x0 = 0;
+    zp->y0 = 0;
 }
 
 bool r5xx_raster_line_runs(const R5xxRaster *r, const R5xxVertex *v0,

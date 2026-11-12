@@ -34,6 +34,8 @@
  *   R5_TI(u, i)     unit u integer parameter vector i (ivec4)
  *   R5_TF(u, i)     unit u float parameter vector i (vec4)
  *   R5_FETCHu(x, y, l)  raw texel of unit u's image (uint)
+ *   R5_IMUL64(a, b, hi, lo)  the 64-bit product of ints a, b into ints
+ *                   hi, lo
  *   R5_LUT(nb, v)   float(v) / float(2^nb - 1), correctly rounded
  *   R5_DFDX(e), R5_DFDY(e)
  *   R5_DST          the destination's raw pixel (uint)
@@ -161,9 +163,9 @@ typedef struct R5GpuDraw {
      * position (x, y); at 3 * ninputs the plane of 1/w, by which a
      * perspective draw's inputs are divided. A depth part, at R5_ZREC:
      * vec4 (a, b, z0, front) and vec4 (x0, y0), z at subpixel (x, y)
-     * being r5xx_zplane_at(); three vec4 (A, B, X, Y) and a vec4 of
-     * biases, edge i covering subpixel (x, y) where A * (x - X) +
-     * B * (y - Y) + bias >= 0.
+     * being r5xx_zplane_at(); then per edge two vec4 holding the 16-bit
+     * halves (high first) of int32 A, B and int64 C, edge i covering
+     * subpixel (x, y) where A * x + B * y + C >= 0.
      */
     const float *planes;
     unsigned nplanes;
