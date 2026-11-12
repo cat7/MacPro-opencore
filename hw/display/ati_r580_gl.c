@@ -326,6 +326,7 @@ typedef ptrdiff_t GLintptr;
 #define GL_SHADING_LANGUAGE_VERSION     0x8B8C
 #define GL_FRAMEBUFFER_COMPLETE         0x8CD5
 #define GL_COLOR_ATTACHMENT0            0x8CE0
+#define GL_COLOR_ATTACHMENT1            0x8CE1
 #define GL_FRAMEBUFFER                  0x8D40
 #define GL_RGBA8UI                      0x8D7C
 #define GL_RGBA_INTEGER                 0x8D99
@@ -402,6 +403,7 @@ static void (APIENTRY *glDeleteFramebuffers)(GLsizei, const GLuint *);
 static void (APIENTRY *glDeleteProgram)(GLuint);
 static void (APIENTRY *glDeleteShader)(GLuint);
 static void (APIENTRY *glDeleteVertexArrays)(GLsizei, const GLuint *);
+static void (APIENTRY *glDrawBuffers)(GLsizei, const GLenum *);
 static void (APIENTRY *glEnableVertexAttribArray)(GLuint);
 static void (APIENTRY *glFramebufferTexture2D)(GLenum, GLenum, GLenum,
                                                GLuint, GLint);
@@ -502,6 +504,7 @@ static const struct {
     R580_GL_PROC(glDeleteProgram),
     R580_GL_PROC(glDeleteShader),
     R580_GL_PROC(glDeleteVertexArrays),
+    R580_GL_PROC(glDrawBuffers),
     R580_GL_PROC(glEnableVertexAttribArray),
     R580_GL_PROC(glFramebufferTexture2D),
     R580_GL_PROC(glGenBuffers),
