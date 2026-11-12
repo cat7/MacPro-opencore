@@ -1738,6 +1738,32 @@ static bool ati_r580_mmio_engine(ATIR580State *s, uint32_t base)
     return ati_r580_engine_reg(base);
 }
 
+/*
+ * Engine registers whose read has a side effect, and so needs the engine:
+ * VRAM through the aperture, the occlusion counter, the microcode port,
+ * the config space mirror. Any other reads a stored or derived value,
+ * which a claim would only delay until the end of the current packet --
+ * a whole draw.
+ */
+static bool ati_r580_read_needs_claim(ATIR580State *s, uint32_t base)
+{
+    uint32_t idx;
+
+    switch (base) {
+    case R580_MM_DATA:
+        idx = qatomic_read(&s->regs[R580_MM_INDEX >> 2]);
+        return (idx & R580_MM_APER) || (idx & 0xfffc) <= R580_MM_DATA ||
+               ati_r580_read_needs_claim(s, idx & 0xfffc);
+    case R300_ZB_ZPASS_DATA:
+    case R580_PM4_MICROCODE_DATAH:
+    case R580_PM4_MICROCODE_DATAL:
+    case R580_CFG_MIRROR_BASE ... R580_CFG_MIRROR_END:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t ati_r580_read_lockless(ATIR580State *s, uint32_t base)
 {
     bool engine = ati_r580_mmio_engine(s, base);
@@ -1747,6 +1773,9 @@ static uint32_t ati_r580_read_lockless(ATIR580State *s, uint32_t base)
     if (ati_r580_engine_status_reg(base) || base == R580_RBBM_STATUS ||
         base == R580_WAIT_UNTIL) {
         /* answered at once; a claim would wait out the whole batch */
+        return ati_r580_reg_read32(s, base);
+    }
+    if (engine && !ati_r580_read_needs_claim(s, base)) {
         return ati_r580_reg_read32(s, base);
     }
     if (engine) {

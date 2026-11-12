@@ -277,8 +277,8 @@ static int ati_r580_mc_route(ATIR580State *s, uint32_t addr, dma_addr_t *bus)
  * `n` consecutive dwords of card address space, as ati_r580_mc_read32()
  * reads them one at a time. A run inside one 4 KiB page whose two ends
  * take the same route to contiguous bus addresses is read with one
- * translation; VRAM, whose reads have a coherency hook, and anything
- * else go dword by dword.
+ * translation, a run in VRAM with one coherency check; anything else
+ * goes dword by dword.
  */
 void ati_r580_mc_read_block(ATIR580State *s, uint32_t addr, uint32_t *dst,
                             unsigned n)
@@ -291,8 +291,18 @@ void ati_r580_mc_read_block(ATIR580State *s, uint32_t addr, uint32_t *dst,
         int k1 = ati_r580_mc_route(s, addr + (run - 1) * 4, &b1);
         unsigned i;
 
-        if (k0 == R580_MC_VRAM || k0 != k1 ||
-            b1 - b0 != (dma_addr_t)(run - 1) * 4) {
+        if (k0 == R580_MC_VRAM && k1 == R580_MC_VRAM &&
+            b1 - b0 == (dma_addr_t)(run - 1) * 4 &&
+            b0 + run * 4 <= ATI_R580_VRAM_SIZE) {
+            /* one coherency check for the run */
+            const uint8_t *v = memory_region_get_ram_ptr(&s->vram);
+
+            ati_r580_gl_touch(s, b0, run * 4);
+            for (i = 0; i < run; i++) {
+                dst[i] = ldl_le_p(v + b0 + i * 4);
+            }
+        } else if (k0 == R580_MC_VRAM || k0 != k1 ||
+                   b1 - b0 != (dma_addr_t)(run - 1) * 4) {
             for (i = 0; i < run; i++) {
                 dst[i] = ati_r580_mc_read32(s, addr + i * 4);
             }
@@ -1169,9 +1179,11 @@ static __thread bool ati_r580_engine_ctx;
  *
  * - The progress registers (ati_r580_engine_status_reg(), RBBM_STATUS)
  *   are read with no lock: they are atomics the command processor
- *   publishes as it goes.
- * - Any other engine register (ati_r580_engine_reg()) is accessed by a
- *   thread that has CLAIMED the engine: engine_busy set for it, just as
+ *   publishes as it goes. So is any other engine register whose read has
+ *   no side effect: a claim would hold the vCPU until the end of the
+ *   current packet, which may be a draw of a second or more.
+ * - Any other engine register access (ati_r580_engine_reg()) is made by
+ *   a thread that has CLAIMED the engine: engine_busy set for it, just as
  *   the command processor holds it while it runs, so the two and any
  *   other claimant exclude each other. A register the command processor
  *   itself writes without the BQL (ati_r580_engine_private_reg()) needs

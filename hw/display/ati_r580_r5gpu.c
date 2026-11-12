@@ -268,6 +268,7 @@ struct ATIR580R5Gpu {
     uint64_t rb_n[R5G_RB_MAX], rb_bytes[R5G_RB_MAX], rb_ns[R5G_RB_MAX];
     uint64_t rb_read_ns;
     int gsurf[ATI_R580_CGUARDS];    /* surface + 1 under window k; 0: none */
+    uint64_t dlo, dhi;              /* drawn bytes of all surfaces within */
     uint64_t g_arms, g_kept, g_traps, g_diff, g_noslot, g_off, adopted;
     struct {
         uint32_t off, pitch;
@@ -302,15 +303,38 @@ static void r5g_guard_arm(ATIR580R5Gpu *g, R5GSurf *sf);
 static void r5g_invalidate(ATIR580R5Gpu *g, uint32_t lo, uint32_t hi,
                            const R5GSurf *keep);
 
+/* the VRAM span of a surface's drawn rectangle; end exclusive */
+static void r5g_drawn_span(const R5GSurf *sf, uint64_t *a, uint64_t *b)
+{
+    *a = sf->off + (uint64_t)sf->dy0 * sf->pitch + (uint64_t)sf->dx0 * sf->bpp;
+    *b = sf->off + (uint64_t)(sf->dy1 - 1) * sf->pitch +
+         (uint64_t)sf->dx1 * sf->bpp;
+}
+
+/* the drawn bytes of all surfaces lie in [dlo, dhi): grown by a draw */
+static void r5g_bounds_grow(ATIR580R5Gpu *g, const R5GSurf *sf)
+{
+    uint64_t a, b;
+
+    if (sf->dx1 > sf->dx0 && sf->dy1 > sf->dy0) {
+        r5g_drawn_span(sf, &a, &b);
+        g->dlo = MIN(g->dlo, a);
+        g->dhi = MAX(g->dhi, b);
+    }
+}
+
 static void r5g_res_update(ATIR580R5Gpu *g)
 {
     bool res = false, any = false;
     int i;
 
+    g->dlo = UINT64_MAX;
+    g->dhi = 0;
     for (i = 0; i < R5G_NSURF; i++) {
         if (g->surf[i].live) {
             any = true;
             res |= g->surf[i].dx1 > g->surf[i].dx0;
+            r5g_bounds_grow(g, &g->surf[i]);
         }
     }
     for (i = 0; i < R5G_NTEX && !any; i++) {
@@ -593,6 +617,7 @@ static bool r5g_surf_adopt(ATIR580R5Gpu *g, R5GSurf *n, const R5GSurf *o)
     n->dx0 = x0;
     n->dy0 = y0;
     n->dx1 = x1;
+    r5g_bounds_grow(g, n);
     n->dy1 = y1;
     g->adopted++;
     return true;
@@ -1743,6 +1768,7 @@ static int r5g_resolve(ATIR580R5Gpu *g, const R5GpuIn *in)
     rsf->dx0 = rsf->dx1 > rsf->dx0 ? MIN(rsf->dx0, bx0) : bx0;
     rsf->dy0 = rsf->dy1 > rsf->dy0 ? MIN(rsf->dy0, by0) : by0;
     rsf->dx1 = MAX(rsf->dx1, bx1);
+    r5g_bounds_grow(g, rsf);
     rsf->dy1 = MAX(rsf->dy1, by1);
     r5g_guard_arm(g, rsf);
     r5g_invalidate(g, rsf->off + (uint64_t)by0 * rsf->pitch,
@@ -2479,6 +2505,7 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     sf->dx0 = sf->dx1 > sf->dx0 ? MIN(sf->dx0, bx0) : bx0;
     sf->dy0 = sf->dy1 > sf->dy0 ? MIN(sf->dy0, by0) : by0;
     sf->dx1 = MAX(sf->dx1, bx1);
+    r5g_bounds_grow(g, sf);
     sf->dy1 = MAX(sf->dy1, by1);
     /* laid now, so that it is in force by the next release */
     r5g_guard_arm(g, sf);
@@ -2489,6 +2516,7 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         zsf->dx0 = zsf->dx1 > zsf->dx0 ? MIN(zsf->dx0, bx0) : bx0;
         zsf->dy0 = zsf->dy1 > zsf->dy0 ? MIN(zsf->dy0, by0) : by0;
         zsf->dx1 = MAX(zsf->dx1, bx1);
+        r5g_bounds_grow(g, zsf);
         zsf->dy1 = MAX(zsf->dy1, by1);
         r5g_guard_arm(g, zsf);
         r5g_invalidate(g, zsf->off + (uint64_t)by0 * zsf->pitch,
@@ -2792,14 +2820,6 @@ static bool r5g_rel_guest(int why)
            why == R580_GLR_FENCE;
 }
 
-/* the drawn bytes, as a VRAM range */
-static void r5g_drawn_span(const R5GSurf *sf, uint64_t *a, uint64_t *b)
-{
-    *a = sf->off + (uint64_t)sf->dy0 * sf->pitch + (uint64_t)sf->dx0 * sf->bpp;
-    *b = sf->off + (uint64_t)(sf->dy1 - 1) * sf->pitch +
-         (uint64_t)sf->dx1 * sf->bpp;
-}
-
 /* the drawn bytes meet the scanned out framebuffer, now or at the last refresh */
 static bool r5g_scanned(ATIR580R5Gpu *g, const R5GSurf *sf)
 {
@@ -2938,7 +2958,8 @@ void ati_r580_r5gpu_sync(ATIR580State *s, uint32_t off, uint32_t len)
 {
     ATIR580R5Gpu *g = s->r5g;
 
-    if (!g || !qatomic_read(&s->r5g_res)) {
+    if (!g || !qatomic_read(&s->r5g_res) ||
+        (uint64_t)off + len <= g->dlo || off >= g->dhi) {
         return;
     }
     g->rb_why = R580_GLR_READ;
@@ -3032,6 +3053,7 @@ void ati_r580_r5gpu_init(ATIR580State *s)
     }
     g = g_new0(ATIR580R5Gpu, 1);
     g->s = s;
+    g->dlo = UINT64_MAX;
     g->ctx = s->gl_ctx;
     g->verify = s->gl_mode == R580_GL_VERIFY;
     g->dst_fetch = ati_r580_gl_r5_dst_fetch(g->ctx);

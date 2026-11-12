@@ -1073,13 +1073,15 @@ void r5xx_pvs_run(const R5xxPvsDecoded *d, const r5xx_vec4 *consts,
                   r5xx_vec4 out[R5XX_PVS_MAX_OUTPUTS])
 {
     /*
-     * The context lives on the stack, and only the registers that the
+     * The context is the thread's own, and only the registers that the
      * program can reach are cleared: [0, num_temps) and [0, num_alt_temps),
      * or all of them with relative addressing.  The other registers are
      * never read.  This runs once for each vertex, so clearing all 8 KB
      * (and a calloc) was a large part of the CPU vertex time.
      */
-    PvsExec exs, *ex = &exs;
+    /* per thread: an automatic one is zeroed whole on every call */
+    static __thread PvsExec exs;
+    PvsExec *ex = &exs;
     int pc, steps = 0, i, nt, na;
 
     if (!d || !out) {
