@@ -1716,6 +1716,15 @@ static void r5_draw(ATIR580State *s, uint32_t vf, const VtxSource *src,
         r5_err(g, "raster setup: %s", err);
         return;
     }
+    /* COLORENDIAN, like TXO_ENDIAN, swaps only what crosses the bus */
+    for (i = 0; i < R5XX_MAX_COLOR_BUFS; i++) {
+        uint32_t off;
+
+        if (g->raster.rt.cbuf_enabled[i] &&
+            ati_r580_mc_to_vram(s, g->raster.rt.cbuf[i].gpu_addr, &off)) {
+            g->raster.rt.cbuf[i].endian = 0;
+        }
+    }
     if (REG(s, RB3D_COLORPITCH0) & (7u << 16)) {
         g->tiled_cb++;
     }

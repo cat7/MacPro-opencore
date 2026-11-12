@@ -41,6 +41,8 @@ typedef struct R5xxSurfaceLayout {
     uint8_t  micro_mode;      /* 0 = auto (square for 16bpp, else 8x4/4x2/2x2),
                                * 1 = R300_TXO_MICRO_TILE_TILED,
                                * 2 = R300_TXO_MICRO_TILE_TILED_SQUARE */
+    uint8_t  endian;          /* R5XX_ENDIAN_* of a buffer the rasteriser
+                               * reaches over the bus */
 } R5xxSurfaceLayout;
 
 /* Optional device hook: true when gpu_addr lies in memory the CPU sees

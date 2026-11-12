@@ -82,6 +82,7 @@
 #define COLOR_TILE_ENABLE                   (1u << 16)
 #define COLOR_MICROTILE_SHIFT               17
 #define COLOR_MICROTILE_MASK                3u
+#define COLOR_ENDIAN_SHIFT                  19
 #define COLOR_FORMAT_SHIFT                  21
 #define COLOR_FORMAT_MASK                   15u
 
@@ -292,12 +293,29 @@ static uint8_t stencil_op(int op, uint8_t s, uint8_t ref)
 /* Memory access                                                       */
 /* ------------------------------------------------------------------ */
 
+/* the byte lane XOR of an R5XX_ENDIAN_* swap */
+static uint32_t endian_xor(uint8_t endian)
+{
+    static const uint8_t x[4] = { 0, 1, 3, 2 };
+    return x[endian & 3];
+}
+
 static void surf_read(const R5xxRaster *r, const R5xxSurfaceLayout *l,
                       uint32_t x, uint32_t y, void *buf)
 {
     const R5xxMem *m = r->mem;
     uint32_t addr = l->gpu_addr + r5xx_surface_pixel_offset(l, x, y);
-    uint8_t *p = m->map ? m->map(m->opaque, addr, l->bpp, false) : NULL;
+    uint8_t *p;
+
+    if (l->endian) {
+        uint32_t i, sx = endian_xor(l->endian);
+
+        for (i = 0; i < l->bpp; i++) {
+            m->read(m->opaque, (addr + i) ^ sx, (uint8_t *)buf + i, 1);
+        }
+        return;
+    }
+    p = m->map ? m->map(m->opaque, addr, l->bpp, false) : NULL;
     if (p) {
         memcpy(buf, p, l->bpp);
     } else {
@@ -310,7 +328,17 @@ static void surf_write(const R5xxRaster *r, const R5xxSurfaceLayout *l,
 {
     const R5xxMem *m = r->mem;
     uint32_t addr = l->gpu_addr + r5xx_surface_pixel_offset(l, x, y);
-    uint8_t *p = m->map ? m->map(m->opaque, addr, l->bpp, true) : NULL;
+    uint8_t *p;
+
+    if (l->endian) {
+        uint32_t i, sx = endian_xor(l->endian);
+
+        for (i = 0; i < l->bpp; i++) {
+            m->write(m->opaque, (addr + i) ^ sx, (const uint8_t *)buf + i, 1);
+        }
+        return;
+    }
+    p = m->map ? m->map(m->opaque, addr, l->bpp, true) : NULL;
     if (p) {
         memcpy(p, buf, l->bpp);
         if (m->written) {
@@ -492,6 +520,7 @@ static bool setup_cbuf(R5xxRaster *r, int n, char *err, size_t errlen)
     l->tiling = decode_tiling(pitchreg & COLOR_TILE_ENABLE, micro);
     l->micro_mode = (uint8_t)micro;
     l->is_r500 = g->is_r500;
+    l->endian = (pitchreg >> COLOR_ENDIAN_SHIFT) & 3;
     r->rt.cbuf_format[n] = fmt;
     d->cbuf_bgra[n] = format_is_bgra(fmt);
     d->cbuf_float[n] = format_is_float(fmt);
@@ -775,6 +804,7 @@ bool r5xx_raster_setup(R5xxRaster *r, char *err, size_t errlen)
         uint32_t px = g->rb3d_aaresolve_pitch & COLORPITCH_MASK;
 
         d->resolve = r->rt.cbuf[0];
+        d->resolve.endian = 0;
         d->resolve.gpu_addr = g->rb3d_aaresolve_offset & ~0x1fu;
         d->resolve.pitch_bytes = px * d->resolve.bpp;
         d->resolve.width = px;
