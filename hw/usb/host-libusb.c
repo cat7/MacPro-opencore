@@ -104,7 +104,8 @@ struct USBHostDevice {
     bool                             needs_autoscan;
     bool                             allow_one_guest_reset;
     bool                             allow_all_guest_resets;
-    bool                             late_attach;
+    OnOffAuto                        late_attach;
+    bool                             hold;
     bool                             suppress_remote_wake;
 
     /* state */
@@ -1094,11 +1095,114 @@ static void usb_host_ep_update(USBHostDevice *s)
     }
 }
 
+#define BOT_TIMEOUT 3000    /* ms */
+
+/* one bulk-only command with data in; the length read, or -1 */
+static int usb_host_bot_in(USBHostDevice *s, uint8_t ep_out, uint8_t ep_in,
+                           const uint8_t *cdb, int cdb_len,
+                           uint8_t *data, int len)
+{
+    uint8_t cbw[31] = { 'U', 'S', 'B', 'C', 1, 0, 0, 0 };
+    uint8_t csw[13];
+    int n, got = 0, tries;
+
+    stl_le_p(cbw + 8, len);
+    cbw[12] = 0x80;
+    cbw[14] = cdb_len;
+    memcpy(cbw + 15, cdb, cdb_len);
+    if (libusb_bulk_transfer(s->dh, ep_out, cbw, sizeof(cbw), &n,
+                             BOT_TIMEOUT) != 0 || n != sizeof(cbw)) {
+        return -1;
+    }
+    if (libusb_bulk_transfer(s->dh, ep_in, data, len, &got,
+                             BOT_TIMEOUT) == LIBUSB_ERROR_PIPE) {
+        libusb_clear_halt(s->dh, ep_in);
+        got = 0;
+    }
+    for (tries = 0; tries < 2; tries++) {
+        int rc = libusb_bulk_transfer(s->dh, ep_in, csw, sizeof(csw), &n,
+                                      BOT_TIMEOUT);
+        if (rc == LIBUSB_ERROR_PIPE) {
+            libusb_clear_halt(s->dh, ep_in);
+            continue;
+        }
+        if (rc != 0 || n != sizeof(csw) || memcmp(csw, "USBS", 4) != 0 ||
+            csw[12] != 0) {
+            return -1;
+        }
+        return got;
+    }
+    return -1;
+}
+
+/* a bulk-only drive holding a disc whose tracks are all audio */
+static bool usb_host_audio_cd(USBHostDevice *s)
+{
+    static const uint8_t read_toc[12] = { 0x43, 0, 0, 0, 0, 0, 0, 0x03, 0x24 };
+    static const uint8_t sense[12] = { 0x03, 0, 0, 0, 18 };
+    struct libusb_config_descriptor *conf;
+    const struct libusb_interface_descriptor *intf = NULL;
+    uint8_t ep_in = 0, ep_out = 0;
+    uint8_t toc[804];
+    bool audio = false;
+    int i, n, tries, cdb_len;
+
+    if (libusb_get_active_config_descriptor(s->dev, &conf) != 0) {
+        return false;
+    }
+    for (i = 0; i < conf->bNumInterfaces && !intf; i++) {
+        const struct libusb_interface_descriptor *d =
+            &conf->interface[i].altsetting[0];
+
+        if (d->bInterfaceClass == LIBUSB_CLASS_MASS_STORAGE &&
+            d->bInterfaceProtocol == 0x50) {
+            intf = d;
+        }
+    }
+    for (i = 0; intf && i < intf->bNumEndpoints; i++) {
+        const struct libusb_endpoint_descriptor *e = &intf->endpoint[i];
+
+        if ((e->bmAttributes & 3) != LIBUSB_TRANSFER_TYPE_BULK) {
+            continue;
+        }
+        if (e->bEndpointAddress & LIBUSB_ENDPOINT_IN) {
+            ep_in = e->bEndpointAddress;
+        } else {
+            ep_out = e->bEndpointAddress;
+        }
+    }
+    if (!ep_in || !ep_out ||
+        libusb_claim_interface(s->dh, intf->bInterfaceNumber) != 0) {
+        libusb_free_config_descriptor(conf);
+        return false;
+    }
+    cdb_len = intf->bInterfaceSubClass == 6 ? 10 : 12;
+    for (tries = 0; tries < 3; tries++) {
+        n = usb_host_bot_in(s, ep_out, ep_in, read_toc, cdb_len,
+                            toc, sizeof(toc));
+        if (n >= 4) {
+            int tracks = 0, data = 0;
+
+            for (i = 4; i + 8 <= n; i += 8) {
+                if (toc[i + 2] >= 1 && toc[i + 2] <= 99) {
+                    tracks++;
+                    data += !!(toc[i + 1] & 0x04);
+                }
+            }
+            audio = tracks && !data;
+            break;
+        }
+        usb_host_bot_in(s, ep_out, ep_in, sense, cdb_len, toc, 18);
+    }
+    libusb_release_interface(s->dh, intf->bInterfaceNumber);
+    libusb_free_config_descriptor(conf);
+    return audio;
+}
+
 /* late-attach: firmware that polls the controller never sees the device */
 static bool usb_host_attach_held(USBHostDevice *s)
 {
-    return s->late_attach && s->needs_autoscan &&
-           !usb_bus_from_device(USB_DEVICE(s))->irq_driven;
+    return s->hold && !usb_bus_from_device(USB_DEVICE(s))->irq_driven;
 }
 
 static void usb_host_system_reset(void *opaque)
@@ -1161,6 +1265,11 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
 
     libusb_get_device_descriptor(dev, &s->ddesc);
     usb_host_get_port(s->dev, s->port, sizeof(s->port));
+
+    s->hold = s->needs_autoscan &&
+              (s->late_attach == ON_OFF_AUTO_ON ||
+               (s->late_attach == ON_OFF_AUTO_AUTO && usb_host_audio_cd(s)));
+    trace_usb_host_late_attach(bus_num, addr, s->hold);
 
     usb_ep_init(udev);
     usb_host_ep_update(s);
@@ -1416,7 +1525,7 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
         }
     } else {
         s->needs_autoscan = true;
-        if (s->late_attach) {
+        if (s->late_attach != ON_OFF_AUTO_OFF) {
             qemu_register_reset(usb_host_system_reset, s);
         }
         QTAILQ_INSERT_TAIL(&hostdevs, s, next);
@@ -1444,7 +1553,7 @@ static void usb_host_unrealize(USBDevice *udev)
     qemu_remove_exit_notifier(&s->exit);
     if (s->needs_autoscan) {
         QTAILQ_REMOVE(&hostdevs, s, next);
-        if (s->late_attach) {
+        if (s->late_attach != ON_OFF_AUTO_OFF) {
             qemu_unregister_reset(usb_host_system_reset, s);
         }
     }
@@ -1987,7 +2096,8 @@ static const Property usb_host_dev_properties[] = {
                      allow_one_guest_reset, true),
     DEFINE_PROP_BOOL("guest-resets-all", USBHostDevice,
                      allow_all_guest_resets, false),
-    DEFINE_PROP_BOOL("late-attach", USBHostDevice, late_attach, false),
+    DEFINE_PROP_ON_OFF_AUTO("late-attach", USBHostDevice, late_attach,
+                            ON_OFF_AUTO_OFF),
     DEFINE_PROP_UINT32("loglevel",  USBHostDevice, loglevel,
                        LIBUSB_LOG_LEVEL_WARNING),
     DEFINE_PROP_BIT("pipeline",    USBHostDevice, options,

@@ -325,6 +325,7 @@ usb_mtp_file_monitor_event(int dev, const char *path, const char *s) "dev %d, pa
 usb_host_open_started(int bus, int addr) "dev %d:%d"
 usb_host_open_hostfd(int hostfd) "hostfd %d"
 usb_host_open_success(int bus, int addr) "dev %d:%d"
+usb_host_late_attach(int bus, int addr, int hold) "dev %d:%d, hold %d"
 usb_host_open_failure(int bus, int addr) "dev %d:%d"
 usb_host_close(int bus, int addr) "dev %d:%d"
 usb_host_attach_kernel(int bus, int addr, int interface) "dev %d:%d, if %d"
