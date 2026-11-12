@@ -1259,6 +1259,17 @@ static void intel_hda_class_init_ich9(ObjectClass *klass, const void *data)
     dc->desc = "Intel HD Audio Controller (ich9)";
 }
 
+static void intel_hda_class_init_esb2(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = 0x269a;
+    k->revision = 9;
+    set_bit(DEVICE_CATEGORY_SOUND, dc->categories);
+    dc->desc = "Intel HD Audio Controller (631xESB/632xESB)";
+}
+
 static const TypeInfo intel_hda_info = {
     .name          = TYPE_INTEL_HDA_GENERIC,
     .parent        = TYPE_PCI_DEVICE,
@@ -1281,6 +1292,12 @@ static const TypeInfo intel_hda_info_ich9 = {
     .name          = "ich9-intel-hda",
     .parent        = TYPE_INTEL_HDA_GENERIC,
     .class_init    = intel_hda_class_init_ich9,
+};
+
+static const TypeInfo intel_hda_info_esb2 = {
+    .name          = "esb2-intel-hda",
+    .parent        = TYPE_INTEL_HDA_GENERIC,
+    .class_init    = intel_hda_class_init_esb2,
 };
 
 static void hda_codec_device_class_init(ObjectClass *klass, const void *data)
@@ -1328,6 +1345,7 @@ static void intel_hda_register_types(void)
     type_register_static(&intel_hda_info);
     type_register_static(&intel_hda_info_ich6);
     type_register_static(&intel_hda_info_ich9);
+    type_register_static(&intel_hda_info_esb2);
     type_register_static(&hda_codec_device_type_info);
     audio_register_model_with_cb("hda", "Intel HD Audio", intel_hda_and_codec_init);
 }

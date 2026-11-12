@@ -61,3 +61,13 @@ virtio_snd_handle_event(void) "event queue callback called"
 virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
+
+# hda-alc885.c
+hda_alc885_verb(uint32_t nid, uint32_t verb, uint32_t payload, uint32_t resp) "nid 0x%02x verb 0x%03x payload 0x%04x -> 0x%08x"
+hda_alc885_unhandled(uint32_t nid, uint32_t verb, uint32_t payload) "nid 0x%02x verb 0x%03x payload 0x%04x"
+hda_alc885_gpio(uint32_t data, uint32_t mask, uint32_t dir) "data 0x%x mask 0x%x dir 0x%x"
+hda_alc885_unsol(uint32_t nid, uint32_t tag, int present) "nid 0x%02x tag %u present %d"
+hda_alc885_running(const char *stream, int running) "%s running %d"
+hda_alc885_format(const char *stream, int channels, int frame, int freq) "%s %d ch, %d bytes/frame, %d Hz"
+hda_alc885_gain(const char *stream, uint32_t nid, int left, int right) "%s conv 0x%02x volume %d/%d"
+hda_alc885_overrun(const char *stream) "%s"
