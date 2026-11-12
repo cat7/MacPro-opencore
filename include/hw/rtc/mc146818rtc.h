@@ -25,6 +25,11 @@ struct MC146818RtcState {
     MemoryRegion coalesced_io;
     uint8_t cmos_data[128];
     uint8_t cmos_index;
+    /* the second bank of 128 bytes, at io_base + 2 */
+    MemoryRegion ext_io;
+    uint8_t ext_data[128];
+    uint8_t ext_index;
+    bool ext_ram;
     uint8_t isairq;
     uint16_t io_base;
     int32_t base_year;

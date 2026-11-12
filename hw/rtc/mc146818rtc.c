@@ -807,6 +807,25 @@ static const VMStateDescription vmstate_rtc_irq_reinject_on_ack_count = {
     }
 };
 
+static bool rtc_ext_ram_needed(void *opaque)
+{
+    MC146818RtcState *s = opaque;
+
+    return s->ext_ram;
+}
+
+static const VMStateDescription vmstate_rtc_ext_ram = {
+    .name = "mc146818rtc/ext_ram",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = rtc_ext_ram_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER(ext_data, MC146818RtcState),
+        VMSTATE_UINT8(ext_index, MC146818RtcState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_rtc = {
     .name = "mc146818rtc",
     .version_id = 3,
@@ -831,6 +850,7 @@ static const VMStateDescription vmstate_rtc = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_rtc_irq_reinject_on_ack_count,
+        &vmstate_rtc_ext_ram,
         NULL
     }
 };
@@ -847,6 +867,35 @@ static void rtc_notify_suspend(Notifier *notifier, void *data)
 static const MemoryRegionOps cmos_ops = {
     .read = cmos_ioport_read,
     .write = cmos_ioport_write,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static uint64_t cmos_ext_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+
+    return (addr & 1) ? s->ext_data[s->ext_index] : s->ext_index;
+}
+
+static void cmos_ext_write(void *opaque, hwaddr addr, uint64_t data,
+                           unsigned size)
+{
+    MC146818RtcState *s = opaque;
+
+    if (addr & 1) {
+        s->ext_data[s->ext_index] = data;
+    } else {
+        s->ext_index = data & 0x7f;
+    }
+}
+
+static const MemoryRegionOps cmos_ext_ops = {
+    .read = cmos_ext_read,
+    .write = cmos_ext_write,
     .impl = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -913,6 +962,12 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->io, OBJECT(s), &cmos_ops, s, "rtc", 2);
     isa_register_ioport(isadev, &s->io, s->io_base);
 
+    if (s->ext_ram) {
+        memory_region_init_io(&s->ext_io, OBJECT(s), &cmos_ext_ops, s,
+                              "rtc-ext", 2);
+        isa_register_ioport(isadev, &s->ext_io, s->io_base + 2);
+    }
+
     /* register rtc 0x70 port for coalesced_pio */
     memory_region_set_flush_coalesced(&s->io);
     memory_region_init_io(&s->coalesced_io, OBJECT(s), &cmos_ops,
@@ -950,6 +1005,7 @@ MC146818RtcState *mc146818_rtc_init(ISABus *bus, int base_year,
 static const Property mc146818rtc_properties[] = {
     DEFINE_PROP_INT32("base_year", MC146818RtcState, base_year, 1980),
     DEFINE_PROP_UINT16("iobase", MC146818RtcState, io_base, RTC_ISA_BASE),
+    DEFINE_PROP_BOOL("ext-ram", MC146818RtcState, ext_ram, false),
     DEFINE_PROP_UINT8("irq", MC146818RtcState, isairq, RTC_ISA_IRQ),
     DEFINE_PROP_LOSTTICKPOLICY("lost_tick_policy", MC146818RtcState,
                                lost_tick_policy, LOST_TICK_POLICY_DISCARD),
