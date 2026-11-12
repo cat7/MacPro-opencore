@@ -1972,9 +1972,18 @@ void ati_r580_r5xx_clear_zmask(ATIR580State *s, uint32_t first, uint32_t n,
     ATIR580R5 *g = s->r5;
     g_autofree R5xxRaster *r = g_new0(R5xxRaster, 1);
 
+    R5xxSurfaceLayout l;
+    uint32_t off;
+    int x1, y1;
+
     r5_raster_regs(s, &r->regs);
     r->mem = &g->m[0].mem;
-    ati_r580_r5gpu_wrote(s, 0, ATI_R580_VRAM_SIZE);
+    if (r5xx_raster_zmask_area(r, n, &l, &x1, &y1) &&
+        ati_r580_mc_to_vram(s, l.gpu_addr, &off)) {
+        ati_r580_r5gpu_zclear(s, off, l.pitch_bytes, l.bpp, x1, y1);
+    } else {
+        ati_r580_r5gpu_wrote(s, 0, ATI_R580_VRAM_SIZE);
+    }
     qatomic_set(&s->r5g_quiet, true);
     r5xx_raster_zmask_clear(r, n, REG(s, ZB_DEPTHCLEARVALUE));
     qatomic_set(&s->r5g_quiet, false);

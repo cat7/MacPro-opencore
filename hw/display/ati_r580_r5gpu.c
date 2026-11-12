@@ -10,9 +10,14 @@
  * SURFACES are the host copies of colour buffers: an image of the
  * buffer's pitch, a SHADOW of the bytes the image was last known to
  * agree with VRAM on, and the DRAWN rectangle where the image is newer
- * than VRAM. TEXTURES are host copies of sampled ranges, with a shadow
- * of their source bytes. A texture lying inside a surface with the same
- * pitch and texel size samples the surface's image itself.
+ * than VRAM. A depth/stencil buffer is a surface too, its raw words
+ * tested and updated by the fragment stage; such a draw is exact only
+ * with the CPU rasteriser's own coverage, so its triangles are drawn as
+ * their bounding boxes and the shader applies the CPU's edge functions.
+ * Lines and points go to the backend as the rectangles of pixels the
+ * CPU rasteriser covers. TEXTURES are host copies of sampled ranges,
+ * with a shadow of their source bytes. A texture lying inside a surface
+ * with the same pitch and texel size samples the surface's image itself.
  *
  * COHERENCY. Every host copy is checked against VRAM before its first
  * use in each EPOCH: the rows that differ from the shadow are uploaded
@@ -72,7 +77,9 @@
 #define R5G_MAX_TRIS    8192
 #define R5G_MAX_PASSES  256
 #define R5G_HIST        16
-#define R5G_FS_VERSION  4
+#define R5G_FS_VERSION  5
+/* vec4 of records a request may hold: R5_REC travels as a float */
+#define R5G_MAX_RECS    (1u << 24)
 
 /* the shading the CPU path's compiler fused: v * m + 0.5, lerps */
 #if defined(__aarch64__)
@@ -82,11 +89,13 @@
 #endif
 
 typedef enum {
-    R5G_FB_PRIM,        /* lines or points */
+    R5G_FB_PRIM,        /* triangles, lines and points mixed */
     R5G_FB_CBUF,        /* several colour buffers, multiwrite */
     R5G_FB_CFMT,        /* colour buffer format */
     R5G_FB_CMEM,        /* colour buffer outside VRAM, or beyond its pitch */
-    R5G_FB_ZS,          /* depth or stencil test */
+    R5G_FB_ZS,          /* depth/stencil buffer memory or layout */
+    R5G_FB_ZOFF,        /* depth offset, polygon offset */
+    R5G_FB_ZBIG,        /* depth-tested triangle far outside the buffer */
     R5G_FB_FOG,
     R5G_FB_ROP,
     R5G_FB_AA,          /* AA resolve */
@@ -99,6 +108,7 @@ typedef enum {
     R5G_FB_W,           /* a vertex with w <= 0 */
     R5G_FB_FLAT,        /* triangles with differing flat inputs */
     R5G_FB_PASS,        /* too many overlapping primitives */
+    R5G_FB_RECS,        /* records past R5G_MAX_RECS */
     R5G_FB_SURF,        /* no host image for the colour buffer */
     R5G_FB_BACKEND,     /* the backend declined */
     R5G_FB_PENDING,     /* the program is still being compiled */
@@ -107,11 +117,13 @@ typedef enum {
 } R5GFallback;
 
 static const char *const r5g_fb_names[R5G_FB_MAX] = {
-    [R5G_FB_PRIM] = "lines/points",
+    [R5G_FB_PRIM] = "mixed primitives",
     [R5G_FB_CBUF] = "multiple colour buffers",
     [R5G_FB_CFMT] = "colour format",
     [R5G_FB_CMEM] = "colour buffer memory",
-    [R5G_FB_ZS] = "depth/stencil",
+    [R5G_FB_ZS] = "depth/stencil buffer",
+    [R5G_FB_ZOFF] = "depth/polygon offset",
+    [R5G_FB_ZBIG] = "depth-tested triangle out of range",
     [R5G_FB_FOG] = "fog",
     [R5G_FB_ROP] = "rop",
     [R5G_FB_AA] = "AA resolve",
@@ -124,6 +136,7 @@ static const char *const r5g_fb_names[R5G_FB_MAX] = {
     [R5G_FB_W] = "w <= 0",
     [R5G_FB_FLAT] = "mixed flat inputs",
     [R5G_FB_PASS] = "too many overlaps",
+    [R5G_FB_RECS] = "too many records",
     [R5G_FB_SURF] = "no host surface",
     [R5G_FB_BACKEND] = "backend declined",
     [R5G_FB_PENDING] = "program compiling",
@@ -189,6 +202,23 @@ typedef struct R5GScratch {
 
 typedef struct ATIR580R5Gpu ATIR580R5Gpu;
 
+/*
+ * A triangle of a depth-tested draw: its z plane, and the CPU
+ * rasteriser's edge functions, edge i covering subpixel c when
+ * e[i][0] * (c.x - e[i][2]) + e[i][1] * (c.y - e[i][3]) + bias[i] >= 0.
+ */
+typedef struct R5GTriZ {
+    R5xxZPlane zp;
+    bool front;
+    int32_t e[3][4], bias[3];
+} R5GTriZ;
+
+/* vec4 of a record's depth part */
+#define R5G_ZREC        6
+
+/* subpixel coordinates the exact edge test takes */
+#define R5G_EDGE_MAX    (1 << 17)
+
 struct ATIR580R5Gpu {
     ATIR580State *s;
     R580GlCtx *ctx;
@@ -204,17 +234,27 @@ struct ATIR580R5Gpu {
     size_t verts_cap, planes_cap;
     unsigned *order, *pass;
     int *pbox, *tbox;
+    struct R5GTriZ *tz;         /* per triangle, with a depth buffer */
+    float *verts2;
+    size_t verts2_cap;
     size_t tris_cap;
 
     /* verify: the GPU's pixels of the last draw */
-    R5GSurf *vsf;
+    R5GSurf *vsf, *vzsf;
     int vx0, vy0, vx1, vy1;
-    uint8_t *vbuf;
-    size_t vbuf_cap;
+    uint8_t *vbuf, *vzbuf;
+    size_t vbuf_cap, vzbuf_cap;
 
     /* statistics */
     uint64_t offered, drawn, empty, verified, vdiff_draws, vdiff_px;
     uint64_t vdiff_px1, vmax;
+    uint64_t zdrawn, ldrawn, pdrawn, zverified, zdiff_draws, zdiff_px;
+    uint64_t zcleared;
+    struct {
+        int x, y;
+        uint32_t gpu, cpu;
+    } zhist[R5G_HIST];
+    unsigned zhist_n;
     uint64_t fb[R5G_FB_MAX];
     uint64_t up_bytes, up_calls, rd_bytes, rd_calls, flushes, checks;
     uint64_t aliased, feedback, tex_hits, tex_new, surf_new, evicts;
@@ -928,8 +968,8 @@ static char *r5g_replace(char *src, const char *from, const char *to)
 /* NULL when the program cannot run here */
 static const char *r5g_fs(ATIR580R5Gpu *g, const R500UsDecoded *dec,
                           unsigned ninputs, uint32_t flat, uint32_t bound,
-                          int planes, const R5GpuDraw *rq, uint64_t *key,
-                          R5GFallback *why)
+                          int planes, int zbpp, const R5GpuDraw *rq,
+                          uint64_t *key, R5GFallback *why)
 {
     uint8_t kinds[16] = { 0 };
     uint32_t used = r500_us_tex_units_used(dec);
@@ -941,7 +981,7 @@ static const char *r5g_fs(ATIR580R5Gpu *g, const R500UsDecoded *dec,
     k = r5g_hash(k, r500_us_hash(dec));
     k = r5g_hash(k, ninputs | ((uint64_t)flat << 8) | ((uint64_t)planes << 32) |
                     ((uint64_t)R5G_FS_VERSION << 40));
-    k = r5g_hash(k, bound | ((uint64_t)used << 16));
+    k = r5g_hash(k, bound | ((uint64_t)used << 16) | ((uint64_t)zbpp << 40));
     for (i = 0; i < 4; i++) {
         k = r5g_hash(k, (uint32_t)rq->ki[i][0] | ((uint64_t)rq->ki[i][1] << 16));
         k = r5g_hash(k, (uint32_t)rq->ki[i][2] | ((uint64_t)rq->ki[i][3] << 16));
@@ -1007,8 +1047,8 @@ static const char *r5g_fs(ATIR580R5Gpu *g, const R500UsDecoded *dec,
     }
 
     o = g_string_new(R5G_FMA_DEF);
-    g_string_append_printf(o, "#define S_NIN %u\n#define S_PERSP %d\n",
-                           ninputs, planes == 2);
+    g_string_append_printf(o, "#define S_NIN %u\n#define S_PERSP %d\n"
+                           "#define S_ZS %d\n", ninputs, planes == 2, zbpp);
     g_string_append_printf(o, "#define S_CF %d\n#define S_CMASK %d\n"
         "#define S_FL %d\n#define S_CS ivec4(%d, %d, %d, %d)\n"
         "#define S_B0 ivec4(%d, %d, %d, %d)\n"
@@ -1031,7 +1071,7 @@ static const char *r5g_fs(ATIR580R5Gpu *g, const R500UsDecoded *dec,
     }
     g_string_append(o, "vec4 us_out[4];\nfloat us_depth;\n"
                        "bool us_depth_written;\nbool us_killed;\n"
-                       "bool us_keep;\n");
+                       "bool us_keep;\nuint om_zs;\n");
     g_string_append(o, r5g_fs_common);
     for (i = 0; i < R5G_UNITS; i++) {
         char num[8], *u;
@@ -1094,6 +1134,7 @@ static void r5g_grow(ATIR580R5Gpu *g, size_t tris, unsigned floats)
         g->pass = g_renew(unsigned, g->pass, g->tris_cap + 1);
         g->pbox = g_renew(int, g->pbox, 4 * (g->tris_cap + 1));
         g->tbox = g_renew(int, g->tbox, 4 * g->tris_cap);
+        g->tz = g_renew(R5GTriZ, g->tz, g->tris_cap);
     }
     if ((size_t)tris * 3 * floats > g->verts_cap) {
         g->verts_cap = MAX((size_t)tris * 3 * floats, g->verts_cap * 2);
@@ -1101,37 +1142,68 @@ static void r5g_grow(ATIR580R5Gpu *g, size_t tris, unsigned floats)
     }
 }
 
-/*
- * The inputs of an affine draw as plane equations through the triangles'
- * snapped corners, as the CPU rasteriser interpolates them; NULL when a
- * triangle's corners differ in w.
- */
-static const float *r5g_planes(ATIR580R5Gpu *g, unsigned ntri,
-                               unsigned ninputs, unsigned floats,
-                               bool *persp)
+/* room for n more vec4 of records; false past R5G_MAX_RECS */
+static bool r5g_recs_room(ATIR580R5Gpu *g, size_t have, size_t n)
 {
-    unsigned t, n, c, per = ninputs * 3 + 1;
-    size_t need = (size_t)ntri * per * 4;
+    size_t need = (have + n) * 4;
+
+    if (have + n > R5G_MAX_RECS) {
+        return false;
+    }
+    if (need > g->planes_cap) {
+        g->planes_cap = MAX(need, g->planes_cap * 2);
+        g->planes = g_renew(float, g->planes, g->planes_cap);
+    }
+    return true;
+}
+
+/*
+ * The depth part at the end of a record: the z plane, then the edges
+ * (all zero: every pixel drawn is covered)
+ */
+static void r5g_zrec(float *o, const R5xxZPlane *zp, bool front,
+                     const R5GTriZ *tz)
+{
+    int i, k;
+
+    o[0] = zp->a;
+    o[1] = zp->b;
+    o[2] = zp->z0;
+    o[3] = front ? 1.0f : 0.0f;
+    o[4] = zp->x0;
+    o[5] = zp->y0;
+    o[6] = o[7] = 0.0f;
+    for (i = 0; i < 3; i++) {
+        for (k = 0; k < 4; k++) {
+            o[8 + 4 * i + k] = tz ? tz->e[i][k] : 0;
+        }
+        o[20 + i] = tz ? tz->bias[i] : 0;
+    }
+    o[23] = 0.0f;
+}
+
+/*
+ * The records of a triangle draw, triangle t's at t * rl: its inputs as
+ * plane equations through its snapped corners, as the CPU rasteriser
+ * interpolates them, then its depth plane when `zs`.
+ */
+static void r5g_tri_recs(ATIR580R5Gpu *g, unsigned ntri, unsigned ninputs,
+                         unsigned floats, unsigned rl, bool zs, bool *persp)
+{
+    unsigned t, n, c;
 
     *persp = false;
-    if (!ninputs) {
-        return NULL;
-    }
-    for (t = 0; t < ntri; t++) {
+    for (t = 0; t < ntri && ninputs; t++) {
         const float *v = g->verts + (size_t)t * 3 * floats;
 
         if (v[3] != v[floats + 3] || v[3] != v[2 * floats + 3]) {
             *persp = true;
         }
     }
-    if (need > g->planes_cap) {
-        g->planes_cap = MAX(need, g->planes_cap * 2);
-        g->planes = g_renew(float, g->planes, g->planes_cap);
-    }
     for (t = 0; t < ntri; t++) {
         const float *v[3];
         double x0, y0, dx1, dy1, dx2, dy2, det, iw[3];
-        float *o = g->planes + (size_t)t * per * 4;
+        float *o = g->planes + (size_t)t * rl * 4;
         int k;
 
         v[0] = g->verts + (size_t)t * 3 * floats;
@@ -1173,8 +1245,202 @@ static const float *r5g_planes(ATIR580R5Gpu *g, unsigned ntri,
                 }
             }
         }
+        if (zs) {
+            r5g_zrec(o + 12 * ninputs + 4, &g->tz[t].zp, g->tz[t].front,
+                     &g->tz[t]);
+        }
     }
-    return g->planes;
+}
+
+/*
+ * Lines and points as rectangles of pixels, two triangles each, sharing
+ * their primitive's record.
+ */
+typedef struct R5GBuild {
+    ATIR580R5Gpu *g;
+    unsigned ninputs, floats, rl, ntri;
+    size_t nrec;
+    uint32_t flat;
+    bool zs, persp, fail;
+    int ox, oy, sub;
+    const R5xxVertex *pv;       /* provoking vertex */
+    size_t rec;                 /* the primitive's record */
+    bool run, xm;               /* a line's run waiting to merge */
+    int maj0, maj1, n0, n1;
+} R5GBuild;
+
+/*
+ * A rectangle of the primitive with record `rec`; with a depth buffer
+ * the vertex w carries the index of its depth part, `zrec`.
+ */
+static void r5g_rect(R5GBuild *b, int x0, int y0, int x1, int y1, size_t rec,
+                     size_t zrec)
+{
+    ATIR580R5Gpu *g = b->g;
+    static const int cx[6] = { 0, 1, 0, 1, 1, 0 }, cy[6] = { 0, 0, 1, 0, 1, 1 };
+    float *vo;
+    int k, *tb;
+    unsigned a;
+
+    r5g_grow(g, b->ntri + 2, b->floats);
+    vo = g->verts + (size_t)b->ntri * 3 * b->floats;
+    for (k = 0; k < 6; k++) {
+        float *o = vo + k * b->floats;
+
+        o[0] = (cx[k] ? x1 : x0) + b->ox;
+        o[1] = (cy[k] ? y1 : y0) + b->oy;
+        o[2] = rec;
+        o[3] = b->zs ? zrec : 1.0f;
+        for (a = 0; a < b->ninputs; a++) {
+            if ((b->flat >> a) & 1) {
+                memcpy(o + 4 + 4 * a, b->pv->attr[a].f, 16);
+            } else {
+                memset(o + 4 + 4 * a, 0, 16);
+            }
+        }
+    }
+    for (k = 0; k < 2; k++) {
+        tb = &g->tbox[4 * (b->ntri + k)];
+        tb[0] = x0 + b->ox;
+        tb[1] = y0 + b->oy;
+        tb[2] = x1 + b->ox;
+        tb[3] = y1 + b->oy;
+    }
+    b->ntri += 2;
+}
+
+/* a new record, a copy of `from` when there is one; its index */
+static size_t r5g_rec_new(R5GBuild *b, const size_t *from)
+{
+    size_t at = b->nrec;
+
+    if (!b->rl || !r5g_recs_room(b->g, b->nrec, b->rl)) {
+        b->fail |= b->rl != 0;
+        return 0;
+    }
+    if (from) {
+        memcpy(b->g->planes + at * 4, b->g->planes + *from * 4,
+               (size_t)b->rl * 16);
+    } else {
+        memset(b->g->planes + at * 4, 0, (size_t)b->rl * 16);
+    }
+    b->nrec += b->rl;
+    return at;
+}
+
+static void r5g_run_flush(R5GBuild *b)
+{
+    if (!b->run) {
+        return;
+    }
+    b->run = false;
+    if (b->xm) {
+        r5g_rect(b, b->maj0, b->n0, b->maj1, b->n1, b->rec, 0);
+    } else {
+        r5g_rect(b, b->n0, b->maj0, b->n1, b->maj1, b->rec, 0);
+    }
+}
+
+static void r5g_line_run(void *opaque, bool xmajor, int major, int minor0,
+                         int minor1, float z)
+{
+    R5GBuild *b = opaque;
+
+    if (b->zs) {
+        /* z changes along the line: a depth part per step */
+        size_t zrec = b->nrec;
+        R5xxZPlane zp = { .z0 = z };
+
+        if (!r5g_recs_room(b->g, b->nrec, R5G_ZREC)) {
+            b->fail = true;
+            return;
+        }
+        b->nrec += R5G_ZREC;
+        r5g_zrec(b->g->planes + zrec * 4, &zp, true, NULL);
+        if (xmajor) {
+            r5g_rect(b, major, minor0, major + 1, minor1, b->rec, zrec);
+        } else {
+            r5g_rect(b, minor0, major, minor1, major + 1, b->rec, zrec);
+        }
+        return;
+    }
+    if (b->run && b->xm == xmajor && b->maj1 == major && b->n0 == minor0 &&
+        b->n1 == minor1) {
+        b->maj1++;
+        return;
+    }
+    r5g_run_flush(b);
+    b->run = true;
+    b->xm = xmajor;
+    b->maj0 = major;
+    b->maj1 = major + 1;
+    b->n0 = minor0;
+    b->n1 = minor1;
+}
+
+/* the record of a line: its inputs along the major axis, as the CPU interpolates */
+static void r5g_line_rec(R5GBuild *b, const R5xxVertex *v0, const R5xxVertex *v1,
+                         float *o)
+{
+    float sub = b->sub;
+    float x0 = (float)llrintf(v0->x * sub) / sub;
+    float y0 = (float)llrintf(v0->y * sub) / sub;
+    float x1 = (float)llrintf(v1->x * sub) / sub;
+    float y1 = (float)llrintf(v1->y * sub) / sub;
+    float dx = x1 - x0, dy = y1 - y0;
+    bool xm = fabsf(dx) >= fabsf(dy);
+    double d = xm ? dx : dy, iw[2];
+    double m0 = xm ? (double)x0 + b->ox : (double)y0 + b->oy;
+    unsigned n, c, k;
+
+    for (k = 0; k < 2; k++) {
+        float w = (k ? v1 : v0)->w;
+
+        iw[k] = b->persp ? 1.0 / (w > 1e-30f ? w : 1e-30f) : 1.0;
+    }
+    for (n = 0; n <= b->ninputs; n++) {
+        for (c = 0; c < 4; c++) {
+            double a0, a1, A;
+
+            if (n < b->ninputs) {
+                a0 = iw[0] * v0->attr[n].f[c];
+                a1 = iw[1] * v1->attr[n].f[c];
+            } else if (!c) {
+                a0 = iw[0];
+                a1 = iw[1];
+            } else {
+                continue;
+            }
+            A = d ? (a1 - a0) / d : 0;
+            if (n < b->ninputs) {
+                o[12 * n + c] = xm ? A : 0;
+                o[12 * n + 4 + c] = xm ? 0 : A;
+                o[12 * n + 8 + c] = a0 - A * m0;
+            } else {
+                o[12 * n] = xm ? A : 0;
+                o[12 * n + 1] = xm ? 0 : A;
+                o[12 * n + 2] = a0 - A * m0;
+                o[12 * n + 3] = 0;
+            }
+        }
+    }
+}
+
+/* the record of a point: its inputs constant */
+static void r5g_point_rec(R5GBuild *b, const R5xxVertex *v, float z, float *o)
+{
+    unsigned n;
+
+    memset(o, 0, (size_t)b->rl * 16);
+    for (n = 0; n < b->ninputs; n++) {
+        memcpy(o + 12 * n + 8, v->attr[n].f, 16);
+    }
+    o[12 * b->ninputs + 2] = 1.0f;
+    if (b->zs) {
+        R5xxZPlane zp = { .z0 = z };
+
+        r5g_zrec(o + 12 * b->ninputs + 4, &zp, true, NULL);
+    }
 }
 
 /* ---- the draw ---- */
@@ -1227,22 +1493,29 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     const R5xxRaster *r = in->raster;
     const struct R5xxRasterDerived *d = &r->d;
     R5GpuDraw *rq;
-    R5GSurf *sf;
+    R5GSurf *sf, *zsf = NULL;
     R5GFallback why = R5G_FB_PROG;
     uint32_t coff, cpitch, cbpp, hw, cmask, flat = 0, bound = 0;
+    uint32_t zoff = 0, zpitch = 0, zbpp = 0;
     unsigned ninputs = MIN(r->num_fs_inputs, R5G_INPUTS), floats, ntri = 0;
-    unsigned i, k, c, npass = 1;
-    int ready, cf, ox, oy, sx0, sy0, sx1, sy1, bx0, by0, bx1, by1;
+    unsigned i, k, c, npass = 1, rl;
+    int ready, cf, ox, oy, sx0, sy0, sx1, sy1, bx0, by0, bx1, by1, kind;
     int64_t t0 = get_clock();
-    bool need_dst, have_flat = false, persp = false;
+    bool need_dst, have_flat = false, persp = false, zs;
     const float sub = d->subpix;
     static const uint8_t pos_bgra[4] = { 2, 1, 0, 3 };
+    size_t nrec = 0;
 
     if (!g) {
         return R5G_CPU;
     }
     g->offered++;
+    zs = r->rt.zbuf_enabled &&
+         (d->z_enable || (d->stencil_enable && r->rt.has_stencil));
     if (!r->rt.num_cbufs || !r->rt.cbuf_enabled[0]) {
+        if (zs) {
+            return r5g_fail(g, R5G_FB_CBUF);
+        }
         g->empty++;
         return R5G_DONE;
     }
@@ -1253,8 +1526,19 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     if (cf < 0 || d->cbuf_float[0] || r->rt.cbuf[0].bpp != cbpp) {
         return r5g_fail(g, R5G_FB_CFMT);
     }
-    if (r->rt.zbuf_enabled && (d->z_enable || d->stencil_enable)) {
-        return r5g_fail(g, R5G_FB_ZS);
+    if (zs) {
+        zpitch = r->rt.zbuf.pitch_bytes;
+        zbpp = r->rt.zbuf.bpp;
+        if (d->depth_offset != 0.0f) {
+            return r5g_fail(g, R5G_FB_ZOFF);
+        }
+        if (!ati_r580_mc_to_vram(s, r->rt.zbuf.gpu_addr, &zoff) ||
+            (zbpp != 2 && zbpp != 4) || zpitch % zbpp ||
+            (uint32_t)d->sc_x1 >= zpitch / zbpp ||
+            (uint64_t)zoff + (uint64_t)zpitch * (d->sc_y1 + 1) >
+            ATI_R580_VRAM_SIZE) {
+            return r5g_fail(g, R5G_FB_ZS);
+        }
     }
     if (d->fog_enable) {
         return r5g_fail(g, R5G_FB_FOG);
@@ -1276,20 +1560,21 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
             cmask |= 1u << pos_bgra[c];
         }
     }
-    if (!cmask || d->sc_x1 < d->sc_x0 || d->sc_y1 < d->sc_y0) {
+    if ((!cmask && !zs) || d->sc_x1 < d->sc_x0 || d->sc_y1 < d->sc_y0) {
         g->empty++;
         return R5G_DONE;
     }
+    kind = in->nprims ? in->prims[0].kind : R5_PRIM_TRI;
+    kind = kind == R5_PRIM_POINT_SIZED ? R5_PRIM_POINT : kind;
     for (i = 0; i < in->nprims; i++) {
-        if (in->prims[i].kind != R5_PRIM_TRI) {
+        int pk = in->prims[i].kind;
+
+        if ((pk == R5_PRIM_POINT_SIZED ? R5_PRIM_POINT : pk) != kind) {
             return r5g_fail(g, R5G_FB_PRIM);
         }
         if (i && in->prims[i].flat_inputs != in->prims[0].flat_inputs) {
             return r5g_fail(g, R5G_FB_FLAT);
         }
-    }
-    if (in->nprims) {
-        flat = in->prims[0].flat_inputs & ((1u << ninputs) - 1);
     }
 
     /* colour buffer */
@@ -1310,7 +1595,8 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
             bound |= 1u << i;
         }
     }
-    if (ctpop32(bound) > R5G_MAX_BOUND) {
+    /* the depth buffer's copy takes a unit in the OpenGL backend */
+    if (ctpop32(bound) > R5G_MAX_BOUND - (zs ? 1 : 0)) {
         return r5g_fail(g, R5G_FB_TEX);
     }
 
@@ -1323,7 +1609,20 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         return r5g_fail(g, R5G_FB_SURF);
     }
     sf->lru = ++g->tick;
+    if (zs) {
+        R5GpuImage *cimg = sf->img;
+        int zox, zoy;
+
+        zsf = r5g_target(g, zoff, zpitch, zbpp, d->sc_y1 + 1, &zox, &zoy);
+        if (!zsf || zsf == sf || !sf->live || sf->img != cimg ||
+            zox != ox || zoy != oy) {
+            g_free(rq);
+            return r5g_fail(g, R5G_FB_ZS);
+        }
+        zsf->lru = ++g->tick;
+    }
     floats = 4 + 4 * ninputs;
+    rl = ninputs || zs ? 3 * ninputs + 1 + (zs ? R5G_ZREC : 0) : 0;
     r5g_grow(g, in->nprims + 1, floats);
     sx0 = d->sc_x0 + ox;
     sy0 = d->sc_y0 + oy;
@@ -1331,7 +1630,10 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     sy1 = d->sc_y1 + oy + 1;
     bx0 = by0 = INT_MAX;
     bx1 = by1 = INT_MIN;
-    for (i = 0; i < in->nprims; i++) {
+    if (in->nprims) {
+        flat = in->prims[0].flat_inputs & ((1u << ninputs) - 1);
+    }
+    for (i = 0; i < in->nprims && kind == R5_PRIM_TRI; i++) {
         const R5Prim *p = &in->prims[i];
         double area = ((double)p->v[1].x - p->v[0].x) *
                       ((double)p->v[2].y - p->v[0].y) -
@@ -1363,6 +1665,13 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         if (!sa) {
             continue;
         }
+        if (zs && (front ? d->po_front : d->po_back) &&
+            r5xx_raster_poly_offset(r, &p->v[0], &p->v[1], &p->v[2],
+                front ? d->po_front_scale : d->po_back_scale,
+                front ? d->po_front_offset : d->po_back_offset) != 0) {
+            g_free(rq);
+            return r5g_fail(g, R5G_FB_ZOFF);
+        }
         mnx = MIN(X[0], MIN(X[1], X[2]));
         mxx = MAX(X[0], MAX(X[1], X[2]));
         mny = MIN(Y[0], MIN(Y[1], Y[2]));
@@ -1385,7 +1694,7 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
 
             o[0] = (float)((double)X[k] / sub) + ox;
             o[1] = (float)((double)Y[k] / sub) + oy;
-            o[2] = v->z;
+            o[2] = ntri * rl;
             o[3] = v->w;
             for (a = 0; a < ninputs; a++) {
                 const R5xxVertex *src = ((flat >> a) & 1) ? &p->v[prov] : v;
@@ -1393,8 +1702,144 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
                 memcpy(o + 4 + 4 * a, src->attr[a].f, 16);
             }
         }
+        if (zs) {
+            const R5xxVertex *pv[3] = { &p->v[0], &p->v[1], &p->v[2] };
+            R5GTriZ *tz = &g->tz[ntri];
+            int64_t sg = sa < 0 ? -1 : 1;
+
+            for (k = 0; k < 3; k++) {
+                int a = (k + 1) % 3, b = (k + 2) % 3;
+                int64_t ex = (X[b] - X[a]) * sg, ey = (Y[b] - Y[a]) * sg;
+
+                if (X[k] <= -R5G_EDGE_MAX || X[k] >= R5G_EDGE_MAX ||
+                    Y[k] <= -R5G_EDGE_MAX || Y[k] >= R5G_EDGE_MAX) {
+                    g_free(rq);
+                    return r5g_fail(g, R5G_FB_ZBIG);
+                }
+                tz->e[k][0] = -ey;
+                tz->e[k][1] = ex;
+                tz->e[k][2] = X[a];
+                tz->e[k][3] = Y[a];
+                tz->bias[k] = ((ey == 0 && ex > 0) || ey < 0) ? 0 : -1;
+            }
+            r5xx_raster_zplane(X, Y, pv, &tz->zp);
+            tz->front = front;
+        }
         have_flat |= flat != 0;
         ntri++;
+    }
+    if (kind == R5_PRIM_TRI && ntri && rl) {
+        if (!r5g_recs_room(g, 0, (size_t)ntri * rl)) {
+            g_free(rq);
+            return r5g_fail(g, R5G_FB_RECS);
+        }
+        r5g_tri_recs(g, ntri, ninputs, floats, rl, zs, &persp);
+        nrec = (size_t)ntri * rl;
+    }
+    if (kind == R5_PRIM_TRI && ntri && zs) {
+        /*
+         * The host rasteriser's coverage is not the CPU's: each triangle
+         * is drawn as its bounding box, the shader keeping the pixels
+         * the CPU's edge functions cover.
+         */
+        size_t need = (size_t)ntri * 6 * floats;
+        static const int cx[6] = { 0, 1, 0, 1, 1, 0 };
+        static const int cy[6] = { 0, 0, 1, 0, 1, 1 };
+
+        if (need > g->verts2_cap) {
+            g->verts2_cap = MAX(need, g->verts2_cap * 2);
+            g->verts2 = g_renew(float, g->verts2, g->verts2_cap);
+        }
+        for (i = 0; i < ntri; i++) {
+            const float *src = g->verts + (size_t)i * 3 * floats;
+            const int *tb = &g->tbox[4 * i];
+
+            for (k = 0; k < 6; k++) {
+                float *o = g->verts2 + ((size_t)i * 6 + k) * floats;
+
+                memcpy(o, src, floats * sizeof(float));
+                o[0] = cx[k] ? tb[2] : tb[0];
+                o[1] = cy[k] ? tb[3] : tb[1];
+                o[3] = (size_t)i * rl + 3 * ninputs + 1;
+            }
+        }
+        r5g_grow(g, (size_t)ntri * 2 + 1, floats);
+        memcpy(g->verts, g->verts2, need * sizeof(float));
+        for (i = ntri; i-- > 0;) {
+            memcpy(&g->tbox[4 * (2 * i + 1)], &g->tbox[4 * i], 4 * sizeof(int));
+            memcpy(&g->tbox[4 * (2 * i)], &g->tbox[4 * i], 4 * sizeof(int));
+        }
+        ntri *= 2;
+    }
+    if (kind != R5_PRIM_TRI) {
+        R5GBuild b = {
+            .g = g, .ninputs = ninputs, .floats = floats, .rl = rl,
+            .flat = flat, .zs = zs, .ox = ox, .oy = oy, .sub = d->subpix,
+        };
+        int prov = d->provoking == 3 || d->provoking > 1 ? 1 : d->provoking;
+
+        for (i = 0; i < in->nprims && kind == R5_PRIM_LINE; i++) {
+            const R5Prim *p = &in->prims[i];
+
+            if (!(p->v[0].w > 0.0f) || !isfinite(p->v[0].w) ||
+                !(p->v[1].w > 0.0f) || !isfinite(p->v[1].w)) {
+                g_free(rq);
+                return r5g_fail(g, R5G_FB_W);
+            }
+            b.persp |= ninputs && p->v[0].w != p->v[1].w;
+        }
+        for (i = 0; i < in->nprims && !b.fail; i++) {
+            const R5Prim *p = &in->prims[i];
+
+            b.pv = &p->v[kind == R5_PRIM_LINE ? prov : 0];
+            b.rec = r5g_rec_new(&b, NULL);
+            if (b.fail) {
+                break;
+            }
+            if (kind == R5_PRIM_LINE) {
+                if (b.rl) {
+                    r5g_line_rec(&b, &p->v[0], &p->v[1],
+                                 g->planes + b.rec * 4);
+                }
+                r5xx_raster_line_runs(r, &p->v[0], &p->v[1], r5g_line_run,
+                                      &b);
+                r5g_run_flush(&b);
+            } else {
+                int box[4];
+                float z;
+
+                if (!(p->v[0].w > 0.0f) || !isfinite(p->v[0].w)) {
+                    g_free(rq);
+                    return r5g_fail(g, R5G_FB_W);
+                }
+                if (!r5xx_raster_point_box(r, &p->v[0],
+                                           p->kind == R5_PRIM_POINT_SIZED,
+                                           p->size, box, &z)) {
+                    continue;
+                }
+                if (b.rl) {
+                    r5g_point_rec(&b, &p->v[0], z, g->planes + b.rec * 4);
+                }
+                r5g_rect(&b, box[0], box[1], box[2], box[3], b.rec,
+                         b.rec + 3 * ninputs + 1);
+            }
+        }
+        if (b.fail) {
+            g_free(rq);
+            return r5g_fail(g, R5G_FB_RECS);
+        }
+        ntri = b.ntri;
+        nrec = b.nrec;
+        persp = b.persp;
+        have_flat = flat != 0;
+        for (i = 0; i < ntri; i++) {
+            const int *tb = &g->tbox[4 * i];
+
+            bx0 = MIN(bx0, tb[0]);
+            by0 = MIN(by0, tb[1]);
+            bx1 = MAX(bx1, tb[2]);
+            by1 = MAX(by1, tb[3]);
+        }
     }
     if (!ntri) {
         g_free(rq);
@@ -1406,9 +1851,17 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         g_free(rq);
         return r5g_fail(g, R5G_FB_SURF);
     }
+    if (zsf && bx1 > zsf->w) {
+        g_free(rq);
+        return r5g_fail(g, R5G_FB_ZS);
+    }
     sx1 = MIN(sx1, sf->w);
+    if (zsf) {
+        sx1 = MIN(sx1, zsf->w);
+    }
 
-    need_dst = d->blend_enable || cmask != 0xf;
+    /* a pixel that fails the depth test, or is discarded, keeps its colour */
+    need_dst = d->blend_enable || cmask != 0xf || zs;
     rq->pass = g->pass;
     rq->pbox = g->pbox;
     if (need_dst && !g->dst_fetch && ntri > 1) {
@@ -1488,11 +1941,17 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     }
     g->pass[npass] = ntri * 3;
     rq->npass = npass;
-    rq->planes = r5g_planes(g, ntri, ninputs, floats, &persp);
+    rq->planes = nrec ? g->planes : NULL;
+    rq->nplanes = nrec;
 
     /* the destination and the textures, up to date */
     r5g_flush_range(g, sf->off, sf->off + (uint64_t)sf->pitch * sf->h, sf);
     r5g_surf_check(g, sf);
+    if (zsf) {
+        r5g_flush_range(g, zsf->off,
+                        zsf->off + (uint64_t)zsf->pitch * zsf->h, zsf);
+        r5g_surf_check(g, zsf);
+    }
     for (i = 0; i < R5G_UNITS; i++) {
         const R5xxTexSampler *smp = &in->samp[i];
         R5xxSurfaceLayout l0;
@@ -1518,17 +1977,17 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         }
         g->vtex[i].addr = l0.gpu_addr;
         g->vtex[i].pitch = l0.pitch_bytes;
-        g->vtex[i].mode = as ? (as == sf ? 2 : 1) : 0;
+        g->vtex[i].mode = as ? (as == sf || as == zsf ? 2 : 1) : 0;
         if (as) {
             r5g_flush_range(g, as->off, as->off + (uint64_t)as->pitch * as->h, as);
             r5g_surf_check(g, as);
             as->lru = ++g->tick;
             g->aliased++;
-            if (as == sf) {
+            if (as == sf || as == zsf) {
                 R5GpuImage *sc = r5g_scratch(g, i % R5G_NSCRATCH, smp->width,
                                              smp->height, smp->bpp);
 
-                if (!sc || !ati_r580_gl_r5_copy(g->ctx, sc, 0, 0, sf->img,
+                if (!sc || !ati_r580_gl_r5_copy(g->ctx, sc, 0, 0, as->img,
                                                 tx, ty, smp->width,
                                                 smp->height)) {
                     g_free(rq);
@@ -1583,6 +2042,7 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     rq->units = bound;
 
     rq->target = sf->img;
+    rq->ztarget = zsf ? zsf->img : NULL;
     rq->sx0 = sx0;
     rq->sy0 = sy0;
     rq->sx1 = sx1;
@@ -1621,9 +2081,27 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     rq->ki[9][1] = oy;
     memcpy(rq->kf[0], d->blend_const.f, 16);
     rq->kf[1][0] = d->alpha_ref;
+    if (zs) {
+        rq->ki[10][0] = (d->z_enable ? R5G_ZF_TEST : 0) |
+                        (d->z_enable && d->z_write ? R5G_ZF_WRITE : 0) |
+                        (d->stencil_enable && r->rt.has_stencil ?
+                         R5G_ZF_STENCIL : 0) |
+                        (r->rt.z_is_16 ? R5G_ZF_16 : 0);
+        rq->ki[10][1] = d->z_func;
+        rq->ki[10][2] = d->subpix;
+        for (k = 0; k < 2; k++) {
+            rq->ki[11 + k][0] = d->s_func[k];
+            rq->ki[11 + k][1] = d->s_fail[k];
+            rq->ki[11 + k][2] = d->s_zfail[k];
+            rq->ki[11 + k][3] = d->s_zpass[k];
+            rq->ki[13][k] = d->s_ref[k] | (d->s_mask[k] << 8) |
+                            (d->s_wmask[k] << 16);
+        }
+        rq->kf[2][0] = d->depth_scale;
+    }
 
     rq->fs = r5g_fs(g, in->us, ninputs, flat, bound,
-                    rq->planes ? 1 + persp : 0, rq,
+                    rq->planes ? 1 + persp : 0, zs ? zbpp : 0, rq,
                     &rq->key, &why);
     if (!rq->fs) {
         g_free(rq);
@@ -1646,6 +2124,9 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         g_free(rq);
         /* the target may hold part of the draw: VRAM decides again */
         r5g_surf_free(g, sf);
+        if (zsf) {
+            r5g_surf_free(g, zsf);
+        }
         r5g_res_update(g);
         return r5g_fail(g, R5G_FB_BACKEND);
     }
@@ -1654,6 +2135,9 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     }
     g_free(rq);
     g->drawn++;
+    g->zdrawn += zs;
+    g->ldrawn += kind == R5_PRIM_LINE;
+    g->pdrawn += kind == R5_PRIM_POINT;
     g->passes += npass;
     g->verts_n += ntri * 3;
     t0 = get_clock() - t0;
@@ -1675,6 +2159,19 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         if (!ati_r580_gl_r5_read(g->ctx, sf->img, bx0, by0, bx1 - bx0,
                                  by1 - by0, g->vbuf, (bx1 - bx0) * sf->bpp)) {
             g->vsf = NULL;
+        }
+        g->vzsf = NULL;
+        if (zsf && g->vsf) {
+            n = (size_t)(bx1 - bx0) * (by1 - by0) * zsf->bpp;
+            if (n > g->vzbuf_cap) {
+                g->vzbuf_cap = n;
+                g->vzbuf = g_realloc(g->vzbuf, n);
+            }
+            if (ati_r580_gl_r5_read(g->ctx, zsf->img, bx0, by0, bx1 - bx0,
+                                    by1 - by0, g->vzbuf,
+                                    (bx1 - bx0) * zsf->bpp)) {
+                g->vzsf = zsf;
+            }
         }
         {
             unsigned h = g->hist_n % R5G_HIST;
@@ -1700,6 +2197,15 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     /* what was decoded from these bytes is stale now */
     r5g_invalidate(g, sf->off + (uint64_t)by0 * sf->pitch,
                    sf->off + (uint64_t)by1 * sf->pitch, sf);
+    if (zsf) {
+        zsf->dx0 = zsf->dx1 > zsf->dx0 ? MIN(zsf->dx0, bx0) : bx0;
+        zsf->dy0 = zsf->dy1 > zsf->dy0 ? MIN(zsf->dy0, by0) : by0;
+        zsf->dx1 = MAX(zsf->dx1, bx1);
+        zsf->dy1 = MAX(zsf->dy1, by1);
+        r5g_guard_arm(g, zsf);
+        r5g_invalidate(g, zsf->off + (uint64_t)by0 * zsf->pitch,
+                       zsf->off + (uint64_t)by1 * zsf->pitch, zsf);
+    }
     qatomic_set(&s->r5g_res, true);
     qatomic_set(&s->r5g_any, true);
     return R5G_DONE;
@@ -1917,6 +2423,40 @@ void ati_r580_r5gpu_verify_end(ATIR580State *s)
     }
     /* the image becomes VRAM again over the compared rectangle */
     r5g_surf_put(g, sf, g->vx0, g->vx1, g->vy0, g->vy1);
+    if (g->vzsf) {
+        R5GSurf *zf = g->vzsf;
+        size_t row = (size_t)w * zf->bpp;
+
+        g->vzsf = NULL;
+        ndiff = 0;
+        for (y = g->vy0; y < g->vy1; y++) {
+            const uint8_t *c = r5g_vram(g) + zf->off + (size_t)y * zf->pitch +
+                               (size_t)g->vx0 * zf->bpp;
+            const uint8_t *p = g->vzbuf + (size_t)(y - g->vy0) * row;
+
+            if (!memcmp(c, p, row)) {
+                continue;
+            }
+            for (x = 0; x < w; x++) {
+                if (memcmp(c + x * zf->bpp, p + x * zf->bpp, zf->bpp)) {
+                    if (!ndiff++) {
+                        unsigned h = g->zhist_n++ % R5G_HIST;
+
+                        g->zhist[h].x = g->vx0 + x;
+                        g->zhist[h].y = y;
+                        g->zhist[h].gpu = 0;
+                        g->zhist[h].cpu = 0;
+                        memcpy(&g->zhist[h].gpu, p + x * zf->bpp, zf->bpp);
+                        memcpy(&g->zhist[h].cpu, c + x * zf->bpp, zf->bpp);
+                    }
+                }
+            }
+        }
+        g->zverified++;
+        g->zdiff_draws += ndiff != 0;
+        g->zdiff_px += ndiff;
+        r5g_surf_put(g, zf, g->vx0, g->vx1, g->vy0, g->vy1);
+    }
 }
 
 /* the CPU rasteriser is about to read and write VRAM */
@@ -2131,6 +2671,46 @@ void ati_r580_r5gpu_wrote(ATIR580State *s, uint32_t off, uint32_t len)
     r5g_res_update(g);
 }
 
+/*
+ * A depth fast clear is about to fill [0, w) x [0, h) of the buffer at
+ * `off` in VRAM: drawn pixels it covers need not go back first.
+ */
+void ati_r580_r5gpu_zclear(ATIR580State *s, uint32_t off, uint32_t pitch,
+                           uint32_t bpp, int w, int h)
+{
+    ATIR580R5Gpu *g = s->r5g;
+    uint64_t len;
+    int i;
+
+    if (!g || w <= 0 || h <= 0 || off >= ATI_R580_VRAM_SIZE) {
+        return;
+    }
+    len = (uint64_t)(h - 1) * pitch + (uint64_t)w * bpp;
+    len = MIN(len, (uint64_t)ATI_R580_VRAM_SIZE - off);
+    for (i = 0; i < R5G_NSURF && !qatomic_read(&s->r5g_quiet); i++) {
+        R5GSurf *sf = &g->surf[i];
+        uint32_t d;
+        int ox, oy;
+
+        if (!sf->live || sf->dx1 <= sf->dx0 || sf->pitch != pitch ||
+            sf->bpp != bpp || off < sf->off) {
+            continue;
+        }
+        d = off - sf->off;
+        if (d % bpp || d / pitch >= (uint32_t)sf->h) {
+            continue;
+        }
+        oy = d / pitch;
+        ox = (d % pitch) / bpp;
+        if (sf->dx0 >= ox && sf->dx1 <= ox + w &&
+            sf->dy0 >= oy && sf->dy1 <= oy + h) {
+            sf->dx0 = sf->dy0 = sf->dx1 = sf->dy1 = 0;
+            g->zcleared++;
+        }
+    }
+    ati_r580_r5gpu_wrote(s, off, len);
+}
+
 void ati_r580_r5gpu_epoch(ATIR580State *s)
 {
     if (s->r5g) {
@@ -2192,6 +2772,9 @@ void ati_r580_r5gpu_fini(ATIR580State *s)
     g_free(g->pbox);
     g_free(g->tbox);
     g_free(g->vbuf);
+    g_free(g->vzbuf);
+    g_free(g->tz);
+    g_free(g->verts2);
     g_free(g->vpre);
     g_free(g);
     s->r5g = NULL;
@@ -2223,6 +2806,9 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         "gpu path %s, %s, %s\n"
         "offered %" PRIu64 " gpu %" PRIu64 " empty %" PRIu64
         " cpu %" PRIu64 "\n"
+        "gpu draws with depth/stencil %" PRIu64 ", of lines %" PRIu64
+        ", of points %" PRIu64 "; drawn depth dropped by fast clears %"
+        PRIu64 "\n"
         "gpu draw ms total %.1f max %.2f, passes %" PRIu64 ", verts %" PRIu64
         "\nprograms linked %" PRIu64 " failed %" PRIu64 ", link ms total %.1f"
         " max %.1f\n"
@@ -2234,6 +2820,7 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
         g->verify ? "verify" : "on", ati_r580_gl_describe(g->ctx),
         g->dst_fetch ? "destination fetch" : "destination copies",
         g->offered, g->drawn, g->empty, fbt,
+        g->zdrawn, g->ldrawn, g->pdrawn, g->zcleared,
         g->draw_ns / 1e6, g->max_draw_ns / 1e6, g->passes, g->verts_n,
         progs, pfail, lus / 1e3, lmax / 1e3, ns, g->surf_new, g->evicts, nt, g->tex_new,
         g->tex_hits, g->aliased, g->feedback,
@@ -2281,6 +2868,17 @@ char *ati_r580_r5gpu_stats(ATIR580State *s)
             "verify: draws %" PRIu64 ", differing %" PRIu64 ", pixels %"
             PRIu64 " (by more than 1: %" PRIu64 "), max delta %" PRIu64 "\n",
             g->verified, g->vdiff_draws, g->vdiff_px, g->vdiff_px1, g->vmax);
+        g_string_append_printf(o,
+            "verify depth/stencil: draws %" PRIu64 ", differing %" PRIu64
+            ", pixels %" PRIu64 "\n", g->zverified, g->zdiff_draws,
+            g->zdiff_px);
+        for (i = 0; i < R5G_HIST && i < g->zhist_n; i++) {
+            unsigned h = (g->zhist_n - 1 - i) % R5G_HIST;
+
+            g_string_append_printf(o, "  depth first %d,%d gpu %08x cpu %08x\n",
+                                   g->zhist[h].x, g->zhist[h].y,
+                                   g->zhist[h].gpu, g->zhist[h].cpu);
+        }
         for (i = 0; i < R5G_HIST && i < g->hist_n; i++) {
             unsigned h = (g->hist_n - 1 - i) % R5G_HIST;
 

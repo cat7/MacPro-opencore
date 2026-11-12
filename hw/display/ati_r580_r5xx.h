@@ -45,6 +45,8 @@ void ati_r580_r5gpu_cpu_end(ATIR580State *s);
 void ati_r580_r5gpu_release(ATIR580State *s, int why);
 void ati_r580_r5gpu_sync(ATIR580State *s, uint32_t off, uint32_t len);
 void ati_r580_r5gpu_wrote(ATIR580State *s, uint32_t off, uint32_t len);
+void ati_r580_r5gpu_zclear(ATIR580State *s, uint32_t off, uint32_t pitch,
+                           uint32_t bpp, int w, int h);
 void ati_r580_r5gpu_epoch(ATIR580State *s);
 unsigned ati_r580_r5gpu_guard(ATIR580State *s, uint32_t off, unsigned len);
 char *ati_r580_r5gpu_stats(ATIR580State *s);

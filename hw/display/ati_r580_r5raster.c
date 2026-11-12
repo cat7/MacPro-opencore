@@ -12,6 +12,7 @@
  */
 #include "ati_r580_r5raster.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -1103,6 +1104,7 @@ typedef struct Prim {
      * top-left fill rule adjustment (0 or -1). */
     int64_t A[3], B[3], C[3], bias[3];
     int64_t area;
+    R5xxZPlane zp;
     /* line: window endpoints, major axis */
     float x0, y0, x1, y1;
     bool xmajor;
@@ -1122,6 +1124,36 @@ static int64_t center(const R5xxRaster *r, int px)
     return (int64_t)px * r->d.subpix + r->d.subpix / 2;
 }
 
+static bool line_covers(const Prim *p, int px, int py)
+{
+    float cx = px + 0.5f, cy = py + 0.5f;
+    float maj, maj0, maj1, min0, min1, minc, t, ml;
+    if (p->xmajor) {
+        maj = cx; maj0 = p->x0; maj1 = p->x1;
+        min0 = p->y0; min1 = p->y1; minc = cy;
+    } else {
+        maj = cy; maj0 = p->y0; maj1 = p->y1;
+        min0 = p->x0; min1 = p->x1; minc = cx;
+    }
+    /* diamond-exit approximation: the start pixel is drawn, the end
+     * pixel is not (half-open interval along the major axis) */
+    if (maj1 > maj0) {
+        if (maj < maj0 || maj >= maj1) return false;
+    } else {
+        if (maj <= maj1 || maj > maj0) return false;
+    }
+    t = (maj - maj0) / (maj1 - maj0);
+    ml = min0 + t * (min1 - min0);
+    return minc > ml - p->half_w && minc <= ml + p->half_w;
+}
+
+static bool point_covers(const Prim *p, int px, int py)
+{
+    float cx = px + 0.5f, cy = py + 0.5f;
+    return cx >= p->x0 - p->half_px && cx < p->x0 + p->half_px &&
+           cy >= p->y0 - p->half_py && cy < p->y0 + p->half_py;
+}
+
 static bool prim_covers(const R5xxRaster *r, const Prim *p, int px, int py)
 {
     if (!pixel_visible(r, px, py)) {
@@ -1137,29 +1169,9 @@ static bool prim_covers(const R5xxRaster *r, const Prim *p, int px, int py)
         }
         return true;
     } else if (p->kind == PRIM_LINE) {
-        float cx = px + 0.5f, cy = py + 0.5f;
-        float maj, maj0, maj1, min0, min1, minc, t, ml;
-        if (p->xmajor) {
-            maj = cx; maj0 = p->x0; maj1 = p->x1;
-            min0 = p->y0; min1 = p->y1; minc = cy;
-        } else {
-            maj = cy; maj0 = p->y0; maj1 = p->y1;
-            min0 = p->x0; min1 = p->x1; minc = cx;
-        }
-        /* diamond-exit approximation: the start pixel is drawn, the end
-         * pixel is not (half-open interval along the major axis) */
-        if (maj1 > maj0) {
-            if (maj < maj0 || maj >= maj1) return false;
-        } else {
-            if (maj <= maj1 || maj > maj0) return false;
-        }
-        t = (maj - maj0) / (maj1 - maj0);
-        ml = min0 + t * (min1 - min0);
-        return minc > ml - p->half_w && minc <= ml + p->half_w;
+        return line_covers(p, px, py);
     } else {
-        float cx = px + 0.5f, cy = py + 0.5f;
-        return cx >= p->x0 - p->half_px && cx < p->x0 + p->half_px &&
-               cy >= p->y0 - p->half_py && cy < p->y0 + p->half_py;
+        return point_covers(p, px, py);
     }
 }
 
@@ -1191,6 +1203,22 @@ static void prim_weights(const R5xxRaster *r, const Prim *p, int px, int py,
     }
 }
 
+/* The z the depth test takes at a pixel: a triangle's on its z plane */
+static float prim_z(const R5xxRaster *r, const Prim *p, int px, int py)
+{
+    double b[3], z = 0;
+    int k;
+
+    if (p->kind == PRIM_TRI) {
+        return r5xx_zplane_at(&p->zp, center(r, px), center(r, py));
+    }
+    prim_weights(r, p, px, py, b);
+    for (k = 0; k < 3; k++) {
+        z += b[k] * p->v[k]->z;
+    }
+    return (float)z;
+}
+
 static int provoking_index(const R5xxRaster *r, const Prim *p)
 {
     int nv = p->kind == PRIM_TRI ? 3 : (p->kind == PRIM_LINE ? 2 : 1);
@@ -1214,7 +1242,7 @@ static void emit_quad(R5xxRaster *r, const Prim *p, int qx, int qy,
     memset(&in, 0, sizeof(in));
     for (i = 0; i < 4; i++) {
         int px = qx + (i & 1), py = qy + (i >> 1);
-        double b[3], invw[3], denom = 0, z = 0;
+        double b[3], invw[3], denom = 0;
         int k, a;
 
         prim_weights(r, p, px, py, b);
@@ -1222,11 +1250,10 @@ static void emit_quad(R5xxRaster *r, const Prim *p, int qx, int qy,
             float w = p->v[k]->w;
             invw[k] = 1.0 / (w > 1e-30f ? w : 1e-30f);
             denom += b[k] * invw[k];
-            z += b[k] * p->v[k]->z;
         }
         in.x[i] = px + 0.5f;
         in.y[i] = py + 0.5f;
-        in.z[i] = (float)z;
+        in.z[i] = prim_z(r, p, px, py);
         in.w[i] = (float)denom;
         for (a = 0; a < nattr; a++) {
             if ((r->flat_inputs >> a) & 1) {
@@ -1333,6 +1360,7 @@ static void raster_tri(R5xxRaster *r, Prim *p)
     }
     s = area < 0 ? -1 : 1;
     p->area = area * s;
+    r5xx_raster_zplane(X, Y, p->v, &p->zp);
     for (i = 0; i < 3; i++) {
         /* edge opposite vertex i: from v[i+1] to v[i+2], oriented so the
          * inside is on the positive side */
@@ -1518,6 +1546,140 @@ void r5xx_raster_point_sized(R5xxRaster *r, const R5xxVertex *v, float size)
     raster_point_prim(r, &p);
 }
 
+/* ---- coverage for the host GPU path ---- */
+
+void r5xx_raster_zplane(const int64_t X[3], const int64_t Y[3],
+                        const R5xxVertex *const v[3], R5xxZPlane *zp)
+{
+    double dx1 = (double)(X[1] - X[0]), dy1 = (double)(Y[1] - Y[0]);
+    double dx2 = (double)(X[2] - X[0]), dy2 = (double)(Y[2] - Y[0]);
+    double dz1 = (double)v[1]->z - v[0]->z, dz2 = (double)v[2]->z - v[0]->z;
+    double det = dx1 * dy2 - dx2 * dy1;
+
+    zp->a = det ? (float)((dz1 * dy2 - dz2 * dy1) / det) : 0.0f;
+    zp->b = det ? (float)((dx1 * dz2 - dx2 * dz1) / det) : 0.0f;
+    zp->z0 = v[0]->z;
+    zp->x0 = X[0];
+    zp->y0 = Y[0];
+}
+
+bool r5xx_raster_line_runs(const R5xxRaster *r, const R5xxVertex *v0,
+                           const R5xxVertex *v1, R5xxRunFn *fn, void *opaque)
+{
+    const struct R5xxRasterDerived *d = &r->d;
+    Prim p;
+    float dx, dy;
+    int bx0, by0, bx1, by1, m, m0, m1, lo, hi, n0, n1, c, any = 0;
+
+    memset(&p, 0, sizeof(p));
+    p.kind = PRIM_LINE;
+    p.v[0] = v0;
+    p.v[1] = v1;
+    p.v[2] = v1;
+    p.front = true;
+    p.x0 = (float)snap(r, v0->x) / d->subpix;
+    p.y0 = (float)snap(r, v0->y) / d->subpix;
+    p.x1 = (float)snap(r, v1->x) / d->subpix;
+    p.y1 = (float)snap(r, v1->y) / d->subpix;
+    dx = p.x1 - p.x0;
+    dy = p.y1 - p.y0;
+    if (dx == 0 && dy == 0) {
+        return false;
+    }
+    p.xmajor = fabsf(dx) >= fabsf(dy);
+    p.half_w = d->line_half_w < 0.5f ? 0.5f : d->line_half_w;
+    bx0 = imax((int)floorf(fminf_(p.x0, p.x1) - p.half_w) - 1, d->sc_x0);
+    bx1 = imin((int)ceilf(fmaxf_(p.x0, p.x1) + p.half_w) + 1, d->sc_x1);
+    by0 = imax((int)floorf(fminf_(p.y0, p.y1) - p.half_w) - 1, d->sc_y0);
+    by1 = imin((int)ceilf(fmaxf_(p.y0, p.y1) + p.half_w) + 1, d->sc_y1);
+    if (bx0 > bx1 || by0 > by1) {
+        return false;
+    }
+    m0 = p.xmajor ? bx0 : by0;
+    m1 = p.xmajor ? bx1 : by1;
+    lo = p.xmajor ? by0 : bx0;
+    hi = p.xmajor ? by1 : bx1;
+    for (m = m0; m <= m1; m++) {
+        float maj = m + 0.5f;
+        float t = p.xmajor ? (maj - p.x0) / dx : (maj - p.y0) / dy;
+        float ml = p.xmajor ? p.y0 + t * dy : p.x0 + t * dx;
+        int a = imax((int)floorf(ml - p.half_w) - 2, lo);
+        int b = imin((int)ceilf(ml + p.half_w) + 2, hi);
+
+        n0 = n1 = 0;
+        for (c = a; c <= b; c++) {
+            bool in = p.xmajor ? line_covers(&p, m, c) : line_covers(&p, c, m);
+
+            if (in && n1 == n0) {
+                n0 = c;
+                n1 = c + 1;
+            } else if (in) {
+                n1 = c + 1;
+            }
+        }
+        if (n1 > n0) {
+            int px = p.xmajor ? m : n0, py = p.xmajor ? n0 : m;
+
+            fn(opaque, p.xmajor, m, n0, n1, prim_z(r, &p, px, py));
+            any = 1;
+        }
+    }
+    return any;
+}
+
+bool r5xx_raster_point_box(const R5xxRaster *r, const R5xxVertex *v,
+                           bool sized, float size, int box[4], float *z)
+{
+    const struct R5xxRasterDerived *d = &r->d;
+    Prim p;
+    int x0, y0, x1, y1, i;
+
+    memset(&p, 0, sizeof(p));
+    p.kind = PRIM_POINT;
+    p.v[0] = p.v[1] = p.v[2] = v;
+    if (sized) {
+        if (r->regs.ga_point_minmax != 0) {
+            size = r5xx_clampf(size, d->point_min, d->point_max);
+        }
+        p.half_px = p.half_py = (float)llrintf(size * 0.5f * d->subpix) /
+                                d->subpix;
+    } else {
+        p.half_px = d->point_half_w;
+        p.half_py = d->point_half_h;
+    }
+    p.x0 = (float)snap(r, v->x) / d->subpix;
+    p.y0 = (float)snap(r, v->y) / d->subpix;
+    if (p.half_px < 0.5f) p.half_px = 0.5f;
+    if (p.half_py < 0.5f) p.half_py = 0.5f;
+    x0 = imax((int)floorf(p.x0 - p.half_px) - 1, d->sc_x0);
+    x1 = imin((int)ceilf(p.x0 + p.half_px) + 1, d->sc_x1);
+    y0 = imax((int)floorf(p.y0 - p.half_py) - 1, d->sc_y0);
+    y1 = imin((int)ceilf(p.y0 + p.half_py) + 1, d->sc_y1);
+    box[0] = box[1] = INT_MAX;
+    box[2] = box[3] = INT_MIN;
+    for (i = x0; i <= x1; i++) {
+        float cx = i + 0.5f;
+
+        if (cx >= p.x0 - p.half_px && cx < p.x0 + p.half_px) {
+            box[0] = imin(box[0], i);
+            box[2] = imax(box[2], i + 1);
+        }
+    }
+    for (i = y0; i <= y1; i++) {
+        float cy = i + 0.5f;
+
+        if (cy >= p.y0 - p.half_py && cy < p.y0 + p.half_py) {
+            box[1] = imin(box[1], i);
+            box[3] = imax(box[3], i + 1);
+        }
+    }
+    if (box[2] <= box[0] || box[3] <= box[1]) {
+        return false;
+    }
+    *z = prim_z(r, &p, box[0], box[1]);
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Clears                                                              */
 /* ------------------------------------------------------------------ */
@@ -1531,41 +1693,51 @@ void r5xx_raster_point_sized(R5xxRaster *r, const R5xxVertex *v, float size)
  * (64x64 pixels per dword: 4 pipes, 8x8 compression) so a misjudged clear
  * never runs past the buffer.  Apple's driver clears depth this way.
  */
-void r5xx_raster_zmask_clear(R5xxRaster *r, uint32_t ndw, uint32_t value)
+bool r5xx_raster_zmask_area(const R5xxRaster *r, uint32_t ndw,
+                            R5xxSurfaceLayout *l, int *x1, int *y1)
 {
     const R5xxRasterRegs *g = &r->regs;
     uint32_t pitch = g->zb_depthpitch & DEPTHPITCH_MASK;
     uint32_t fmt = g->zb_format & DEPTHFORMAT_MASK;
-    R5xxSurfaceLayout l;
     uint64_t max_px = (uint64_t)ndw * 64 * 64;
-    int x1, y1, x, y;
     unsigned micro;
 
     if (!pitch || !ndw || (fmt != DEPTHFORMAT_16BIT_INT_Z &&
                            fmt != DEPTHFORMAT_24BIT_INT_Z_8BIT_STENCIL)) {
-        return;
+        return false;
     }
-    memset(&l, 0, sizeof(l));
-    l.gpu_addr = g->zb_depthoffset & COLOROFFSET_MASK;
-    l.bpp = fmt == DEPTHFORMAT_16BIT_INT_Z ? 2 : 4;
-    l.pitch_bytes = pitch * l.bpp;
-    l.width = pitch;
+    memset(l, 0, sizeof(*l));
+    l->gpu_addr = g->zb_depthoffset & COLOROFFSET_MASK;
+    l->bpp = fmt == DEPTHFORMAT_16BIT_INT_Z ? 2 : 4;
+    l->pitch_bytes = pitch * l->bpp;
+    l->width = pitch;
     micro = (g->zb_depthpitch >> DEPTHMICROTILE_SHIFT) & DEPTHMICROTILE_MASK;
-    l.tiling = decode_tiling(g->zb_depthpitch & DEPTHMACROTILE_ENABLE, micro);
-    l.micro_mode = (uint8_t)micro;
-    l.is_r500 = g->is_r500;
+    l->tiling = decode_tiling(g->zb_depthpitch & DEPTHMACROTILE_ENABLE, micro);
+    l->micro_mode = (uint8_t)micro;
+    l->is_r500 = g->is_r500;
 
     {
         int sx0, sy0, sx1, sy1;
         decode_rect(g->sc_scissors_tl, g->sc_scissors_br, g->is_r500 ? 0 : SC_R300_OFFSET,
                     &sx0, &sy0, &sx1, &sy1);
-        x1 = imin(sx1 + 1, (int)pitch);
-        y1 = sy1 + 1;
+        *x1 = imin(sx1 + 1, (int)pitch);
+        *y1 = sy1 + 1;
     }
-    if ((uint64_t)y1 * pitch > max_px) {
-        y1 = (int)(max_px / pitch);
+    if ((uint64_t)*y1 * pitch > max_px) {
+        *y1 = (int)(max_px / pitch);
     }
-    l.height = y1;
+    l->height = *y1;
+    return *x1 > 0 && *y1 > 0;
+}
+
+void r5xx_raster_zmask_clear(R5xxRaster *r, uint32_t ndw, uint32_t value)
+{
+    R5xxSurfaceLayout l;
+    int x1, y1, x, y;
+
+    if (!r5xx_raster_zmask_area(r, ndw, &l, &x1, &y1)) {
+        return;
+    }
     for (y = 0; y < y1; y++) {
         for (x = 0; x < x1; ) {
             uint32_t n = r5xx_surface_row_run(&l, x, y);

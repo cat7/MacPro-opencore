@@ -4,8 +4,10 @@
  * platform seam; plain GL otherwise.
  *
  * Images are R8UI / R16UI / R32UI textures. A colour buffer is drawn
- * through an FBO; a draw that reads its destination copies each pass's
- * bounding box to a scratch image first and reads that.
+ * through an FBO, with the depth/stencil buffer as its second colour
+ * attachment when there is one; a draw that reads its destination
+ * copies each pass's bounding box, of both, to scratch images first and
+ * reads those.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,6 +19,8 @@
 #define R5GL_UNIT_LUT   R5G_MAX_BOUND
 #define R5GL_UNIT_DST   (R5G_MAX_BOUND + 1)
 #define R5GL_UNIT_PLANE (R5G_MAX_BOUND + 2)
+/* a draw with a depth/stencil buffer binds one texture fewer */
+#define R5GL_UNIT_ZDST  (R5G_MAX_BOUND - 1)
 /* a unit no shader reads: image set-up and copies bind there */
 #define R5GL_UNIT_WORK  31
 #define R5GL_LUT_W      1024
@@ -50,8 +54,8 @@ typedef struct R5Gl {
     R5GlProg prog[R5GL_PROGS];
     uint64_t tick;
     GLuint vao, vbo, ubo, lut, plbo, pltex;
-    R5GpuImage *dst;
-    GLuint rfbo;
+    R5GpuImage *dst, *zdst;
+    GLuint rfbo, zfbo;
     R5GlBlock blk;
     uint64_t links, fails, draws, link_us, link_max;
     unsigned reports;
@@ -89,6 +93,7 @@ static R5Gl *r5gl_get(R580GlCtx *g)
     glBindBuffer(GL_UNIFORM_BUFFER, r->ubo);
     glBufferData(GL_UNIFORM_BUFFER, sizeof(R5GlBlock), NULL, GL_DYNAMIC_DRAW);
     glGenFramebuffers(1, &r->rfbo);
+    glGenFramebuffers(1, &r->zfbo);
     glGenBuffers(1, &r->plbo);
     glBindBuffer(GL_TEXTURE_BUFFER, r->plbo);
     glBufferData(GL_TEXTURE_BUFFER, 64, NULL, GL_STREAM_DRAW);
@@ -139,6 +144,10 @@ static void gl_r5_close(R580GlCtx *g)
     if (r->dst) {
         r5gl_image_destroy(r->dst);
     }
+    if (r->zdst) {
+        r5gl_image_destroy(r->zdst);
+    }
+    glDeleteFramebuffers(1, &r->zfbo);
     glDeleteTextures(1, &r->lut);
     glDeleteTextures(1, &r->pltex);
     glDeleteBuffers(1, &r->plbo);
@@ -389,7 +398,11 @@ static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
                                fl ? "flat " : "", n);
         g_string_append_printf(fs, "%sin vec4 fi%u;\n", fl ? "flat " : "", n);
     }
-    g_string_append(vs, "void main()\n{\n    float w = a_pos.w;\n");
+    g_string_append(vs, "flat out float fr;\nflat out float fz;\n");
+    g_string_append(fs, "flat in float fr;\nflat in float fz;\n");
+    g_string_append_printf(vs, "void main()\n{\n    float w = %s;\n"
+                           "    fr = a_pos.z;\n    fz = a_pos.w;\n",
+                           d->ztarget ? "1.0" : "a_pos.w");
     for (n = 0; n < d->ninputs; n++) {
         g_string_append_printf(vs, "    fi%u = a_in%u;\n", n, n);
     }
@@ -412,7 +425,8 @@ static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
         "#define R5_DFDX(e) dFdx(e)\n"
         "#define R5_DFDY(e) dFdy(e)\n"
         "#define R5_FRAG gl_FragCoord.xy\n"
-        "#define R5_PRIM (gl_PrimitiveID + R5_KI(4).y)\n"
+        "#define R5_REC int(fr)\n"
+        "#define R5_ZREC int(fz)\n"
         "uniform samplerBuffer r5_pl;\n"
         "#define R5_PLANE(i) texelFetch(r5_pl, i)\n"
         "#define R5_THIS\n"
@@ -421,7 +435,11 @@ static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
         "uniform usampler2D r5_dst;\n"
         "#define R5_DST texelFetch(r5_dst, ivec2(gl_FragCoord.xy) - "
         "R5_KI(4).zw, 0).r\n"
-        "layout(location = 0) out uint o_c;\n",
+        "uniform usampler2D r5_zdst;\n"
+        "#define R5_ZDST texelFetch(r5_zdst, ivec2(gl_FragCoord.xy) - "
+        "R5_KI(4).zw, 0).r\n"
+        "layout(location = 0) out uint o_c;\n"
+        "layout(location = 1) out uint o_z;\n",
         R5G_CONSTS, R5G_KI, R5G_KF, R5G_UNITS * R5G_TI, R5G_UNITS * R5G_TF,
         R5G_TI, R5G_TF);
     for (u = 0; u < R5G_UNITS; u++) {
@@ -437,6 +455,7 @@ static void r5gl_src(const R5GpuDraw *d, GString **vsp, GString **fsp)
         "    uint p = om_pixel();\n"
         "    if (!us_keep) discard;\n"
         "    o_c = p;\n"
+        "    o_z = om_zs;\n"
         "}\n");
     *vsp = vs;
     *fsp = fs;
@@ -484,6 +503,7 @@ static GLuint r5gl_link(R5Gl *r, const char *vs, const char *fs)
         glUniform1i(glGetUniformLocation(p, "r5_lut"), R5GL_UNIT_LUT);
         glUniform1i(glGetUniformLocation(p, "r5_dst"), R5GL_UNIT_DST);
         glUniform1i(glGetUniformLocation(p, "r5_pl"), R5GL_UNIT_PLANE);
+        glUniform1i(glGetUniformLocation(p, "r5_zdst"), R5GL_UNIT_ZDST);
         (void)nm;
     }
     return p;
@@ -641,27 +661,60 @@ int ati_r580_gl_r5_prog_ready(R580GlCtx *g, const struct R5GpuDraw *d,
     return ready;
 }
 
-/* the scratch the destination is copied to, at least w x h */
+/* a scratch the destination is copied to, at least w x h */
+static R5GpuImage *r5gl_scratch(R5GpuImage **sp, int w, int h, int bpp)
+{
+    R5GpuImage *sc = *sp;
+
+    if (sc && (sc->w < w || sc->h < h || sc->bpp != bpp)) {
+        w = MAX(w, sc->w);
+        h = MAX(h, sc->h);
+        r5gl_image_destroy(sc);
+        sc = NULL;
+    }
+    if (!sc) {
+        sc = r5gl_image_new(ROUND_UP(w, 64), ROUND_UP(h, 64), 1, bpp);
+    }
+    *sp = sc;
+    return sc;
+}
+
 static R5GpuImage *r5gl_dst(R5Gl *r, int w, int h, int bpp)
 {
-    if (r->dst && (r->dst->w < w || r->dst->h < h || r->dst->bpp != bpp)) {
-        w = MAX(w, r->dst->w);
-        h = MAX(h, r->dst->h);
-        r5gl_image_destroy(r->dst);
-        r->dst = NULL;
+    return r5gl_scratch(&r->dst, w, h, bpp);
+}
+
+/* the target's framebuffer, with the depth/stencil buffer when `zt` */
+static GLuint r5gl_draw_fbo(R5Gl *r, R5GpuImage *t, R5GpuImage *zt)
+{
+    static const GLenum bufs[2] = { GL_COLOR_ATTACHMENT0,
+                                    GL_COLOR_ATTACHMENT1 };
+
+    if (!r5gl_fbo(t)) {
+        return 0;
     }
-    if (!r->dst) {
-        r->dst = r5gl_image_new(ROUND_UP(w, 64), ROUND_UP(h, 64), 1, bpp);
+    if (!zt) {
+        return t->fbo;
     }
-    return r->dst;
+    glBindFramebuffer(GL_FRAMEBUFFER, r->zfbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, t->tex, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                           GL_TEXTURE_2D, zt->tex, 0);
+    glDrawBuffers(2, bufs);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return 0;
+    }
+    return r->zfbo;
 }
 
 bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
 {
-    R5GpuImage *t = d ? d->target : NULL;
+    R5GpuImage *t = d ? d->target : NULL, *zt = d ? d->ztarget : NULL;
     unsigned stride, n, u, k;
     R5GlProg *pr;
     R5Gl *r;
+    GLuint fbo = 0;
     bool ok = false;
 
     if (!g || !t || !d->nvert || d->sx1 <= d->sx0 || d->sy1 <= d->sy0) {
@@ -688,7 +741,7 @@ bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
 
     for (u = 0, k = 0; u < R5G_UNITS; u++) {
         if (d->units & (1u << u)) {
-            if (k == R5G_MAX_BOUND) {
+            if (k == (zt ? R5GL_UNIT_ZDST : R5G_MAX_BOUND)) {
                 goto out;
             }
             glActiveTexture(GL_TEXTURE0 + k);
@@ -708,14 +761,16 @@ bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
     glBindTexture(GL_TEXTURE_2D, r->lut);
     if (d->planes) {
         glBindBuffer(GL_TEXTURE_BUFFER, r->plbo);
-        glBufferData(GL_TEXTURE_BUFFER,
-                     (GLsizeiptr)(d->nvert / 3) * (d->ninputs * 3 + 1) * 16,
+        glBufferData(GL_TEXTURE_BUFFER, (GLsizeiptr)d->nplanes * 16,
                      d->planes, GL_STREAM_DRAW);
     }
     glActiveTexture(GL_TEXTURE0 + R5GL_UNIT_PLANE);
     glBindTexture(GL_TEXTURE_BUFFER, r->pltex);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+    fbo = r5gl_draw_fbo(r, t, zt);
+    if (!fbo) {
+        goto out;
+    }
     glViewport(0, 0, t->w, t->h);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -751,13 +806,20 @@ bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
             }
             glActiveTexture(GL_TEXTURE0 + R5GL_UNIT_DST);
             glBindTexture(GL_TEXTURE_2D, dst->tex);
-            r->blk.ki[4][1] = d->pass[k] / 3;
+            if (zt) {
+                dst = r5gl_scratch(&r->zdst, w, h, zt->bpp);
+                if (!dst || !r5gl_copy(dst, 0, 0, zt, b[0], b[1], w, h)) {
+                    goto out;
+                }
+                glActiveTexture(GL_TEXTURE0 + R5GL_UNIT_ZDST);
+                glBindTexture(GL_TEXTURE_2D, dst->tex);
+            }
             r->blk.ki[4][2] = b[0];
             r->blk.ki[4][3] = b[1];
             glBindBuffer(GL_UNIFORM_BUFFER, r->ubo);
             glBufferSubData(GL_UNIFORM_BUFFER,
                             offsetof(R5GlBlock, ki[4]), 16, r->blk.ki[4]);
-            glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glDrawArrays(GL_TRIANGLES, d->pass[k], d->pass[k + 1] - d->pass[k]);
         }
     } else {
@@ -769,6 +831,14 @@ bool ati_r580_gl_r5_draw(R580GlCtx *g, const struct R5GpuDraw *d)
     r->draws++;
     ok = glGetError() == GL_NO_ERROR;
 out:
+    if (zt) {
+        /* the images may go away before the next draw that uses it */
+        glBindFramebuffer(GL_FRAMEBUFFER, r->zfbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, 0, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                               GL_TEXTURE_2D, 0, 0);
+    }
     glDisable(GL_SCISSOR_TEST);
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(g->vao);

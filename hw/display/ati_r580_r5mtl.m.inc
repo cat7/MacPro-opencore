@@ -4,10 +4,10 @@
  * and staging arenas it shares.
  *
  * Images are R8Uint / R16Uint / R32Uint textures. The fragment stage
- * reads its destination as colour attachment 0 (Apple GPUs), so a draw
- * is one pass however its primitives overlap. The shader text is the
- * common dialect wrapped in a struct, whose members stand for its
- * globals.
+ * reads its destination as colour attachment 0 and the depth/stencil
+ * buffer as colour attachment 1 (Apple GPUs), so a draw is one pass
+ * however its primitives overlap. The shader text is the common dialect
+ * wrapped in a struct, whose members stand for its globals.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -51,6 +51,7 @@ typedef struct R5Mtl {
     uint64_t tick;
     id<MTLTexture> lut;
     R5GpuImage *enc_target;     /* g->enc renders into it when set */
+    R5GpuImage *enc_ztarget;    /* and into this as attachment 1 */
     QemuMutex lock;
     int inflight;               /* compiles not finished */
     uint64_t links, fails, draws, link_us, link_max;
@@ -84,8 +85,10 @@ static const char r5mtl_head[] =
 "#define R5_DFDX(e) dfdx(e)\n"
 "#define R5_DFDY(e) dfdy(e)\n"
 "#define R5_DST dst\n"
+"#define R5_ZDST zdst\n"
 "#define R5_FRAG in.pos.xy\n"
-"#define R5_PRIM int(pid)\n"
+"#define R5_REC int(in.rec)\n"
+"#define R5_ZREC int(in.zrec)\n"
 "#define R5_PLANE(i) pl[i]\n"
 "#define R5_THIS\n";
 
@@ -184,9 +187,10 @@ void ati_r580_gl_r5_image_free(R580MtlCtx *g, struct R5GpuImage *im)
     if (!g || !im) {
         return;
     }
-    if (g->r5 && g->r5->enc_target == im) {
+    if (g->r5 && (g->r5->enc_target == im || g->r5->enc_ztarget == im)) {
         mtl_end_enc(g);
         g->r5->enc_target = NULL;
+        g->r5->enc_ztarget = NULL;
     }
     /* command buffers in flight hold their own references */
     [im->tex release];
@@ -338,12 +342,13 @@ static char *r5mtl_source(const R5GpuDraw *d)
         "#define R5_TF(u, i) K->tf[(u) * %d + (i)]\n",
         R5G_CONSTS, R5G_KI, R5G_KF, R5G_UNITS * R5G_TI, R5G_UNITS * R5G_TF,
         R5G_TI, R5G_TF);
-    g_string_append(o, "struct VOut {\n    float4 pos [[position]];\n");
+    g_string_append(o, "struct VOut {\n    float4 pos [[position]];\n"
+                       "    float rec [[flat]];\n    float zrec [[flat]];\n");
     for (n = 0; n < d->ninputs; n++) {
         g_string_append_printf(o, "    float4 fi%u%s;\n", n,
                                (d->flat >> n) & 1 ? " [[flat]]" : "");
     }
-    g_string_append(o, "};\n"
+    g_string_append_printf(o, "};\n"
         "struct VA { float4 vp; uint stride; };\n"
         "vertex VOut r5_vs(uint vid [[vertex_id]],\n"
         "                  const device float *vb [[buffer(0)]],\n"
@@ -351,9 +356,11 @@ static char *r5mtl_source(const R5GpuDraw *d)
         "{\n"
         "    const device float *v = vb + vid * a.stride;\n"
         "    VOut o;\n"
-        "    float w = v[3];\n"
+        "    float w = %s;\n"
         "    o.pos = float4((v[0] * a.vp.x - 1.0) * w, (1.0 - v[1] * a.vp.y) * w,"
-        " 0.0, w);\n");
+        " 0.0, w);\n"
+        "    o.rec = v[2];\n"
+        "    o.zrec = v[3];\n", d->ztarget ? "1.0" : "v[3]");
     for (n = 0; n < d->ninputs; n++) {
         g_string_append_printf(o, "    o.fi%u = float4(v[%u], v[%u], v[%u], "
                                "v[%u]);\n", n, 4 + 4 * n, 5 + 4 * n,
@@ -370,7 +377,7 @@ static char *r5mtl_source(const R5GpuDraw *d)
                        "    constant R5K *K;\n"
                        "    VOut in;\n"
                        "    uint dst;\n"
-                       "    uint pid;\n"
+                       "    uint zdst;\n"
                        "    const device float4 *pl;\n"
                        "    texture2d<float> lut;\n");
     for (u = 0; u < R5G_UNITS; u++) {
@@ -379,13 +386,15 @@ static char *r5mtl_source(const R5GpuDraw *d)
         }
     }
     g_string_append(o, d->fs);
-    g_string_append(o, "};\n"
-        "struct FOut { uint c [[color(0)]]; };\n"
+    g_string_append_printf(o, "};\n"
+        "struct FOut { uint c [[color(0)]];%s };\n"
         "fragment FOut r5_fs(VOut in [[stage_in]],\n"
         "                    constant R5K &k [[buffer(0)]],\n"
         "                    const device float4 *pl [[buffer(1)]],\n"
-        "                    uint pid [[primitive_id]],\n"
-        "                    uint dst [[color(0)]],\n");
+        "%s"
+        "                    uint dst [[color(0)]],\n",
+        d->ztarget ? " uint z [[color(1)]];" : "",
+        d->ztarget ? "                    uint zdst [[color(1)]],\n" : "");
     for (u = 0, k = 0; u < R5G_UNITS; u++) {
         if (d->units & (1u << u)) {
             g_string_append_printf(o, "                    texture2d<uint> t%u "
@@ -399,9 +408,10 @@ static char *r5mtl_source(const R5GpuDraw *d)
         "    f.K = &k;\n"
         "    f.in = in;\n"
         "    f.dst = dst;\n"
-        "    f.pid = pid;\n"
+        "%s"
         "    f.pl = pl;\n"
-        "    f.lut = lut;\n", R5G_MAX_BOUND);
+        "    f.lut = lut;\n", R5G_MAX_BOUND,
+        d->ztarget ? "    f.zdst = zdst;\n" : "    f.zdst = 0u;\n");
     for (u = 0; u < R5G_UNITS; u++) {
         if (d->units & (1u << u)) {
             g_string_append_printf(o, "    f.t%u = t%u;\n", u, u);
@@ -410,7 +420,11 @@ static char *r5mtl_source(const R5GpuDraw *d)
     g_string_append(o,
         "    FOut o;\n"
         "    o.c = f.om_pixel();\n"
-        "    if (!f.us_keep) discard_fragment();\n"
+        "    if (!f.us_keep) discard_fragment();\n");
+    if (d->ztarget) {
+        g_string_append(o, "    o.z = f.om_zs;\n");
+    }
+    g_string_append(o,
         "    return o;\n"
         "}\n");
     return g_string_free(o, false);
@@ -451,7 +465,7 @@ static int r5mtl_prog(R580MtlCtx *g, R5Mtl *r, const R5GpuDraw *d, int bpp,
     R5MtlProg *pr, *victim = NULL;
     uint64_t key = d->key;
     unsigned k;
-    int st;
+    int st, zbpp;
 
     *out = nil;
     qemu_mutex_lock(&r->lock);
@@ -480,6 +494,7 @@ static int r5mtl_prog(R580MtlCtx *g, R5Mtl *r, const R5GpuDraw *d, int bpp,
     pr->bpp = bpp;
     pr->lru = ++r->tick;
     pr->state = R5MTL_PENDING;
+    zbpp = d->ztarget ? d->ztarget->bpp : 0;
     qatomic_inc(&r->inflight);
     qemu_mutex_unlock(&r->lock);
     @autoreleasepool {
@@ -504,6 +519,9 @@ static int r5mtl_prog(R580MtlCtx *g, R5Mtl *r, const R5GpuDraw *d, int bpp,
             pd.vertexFunction = vf;
             pd.fragmentFunction = ff;
             pd.colorAttachments[0].pixelFormat = r5mtl_fmt(bpp);
+            if (zbpp) {
+                pd.colorAttachments[1].pixelFormat = r5mtl_fmt(zbpp);
+            }
             [dev newRenderPipelineStateWithDescriptor:pd
                 completionHandler:^(id<MTLRenderPipelineState> pso,
                                     NSError *e2) {
@@ -531,11 +549,11 @@ int ati_r580_gl_r5_prog_ready(R580MtlCtx *g, const struct R5GpuDraw *d,
 }
 
 static id<MTLRenderCommandEncoder> r5mtl_enc(R580MtlCtx *g, R5Mtl *r,
-                                             R5GpuImage *t)
+                                             R5GpuImage *t, R5GpuImage *zt)
 {
     MTLRenderPassDescriptor *rp;
 
-    if (g->enc && r->enc_target == t) {
+    if (g->enc && r->enc_target == t && r->enc_ztarget == zt) {
         return g->enc;
     }
     mtl_end_enc(g);
@@ -544,6 +562,11 @@ static id<MTLRenderCommandEncoder> r5mtl_enc(R580MtlCtx *g, R5Mtl *r,
     rp.colorAttachments[0].texture = t->tex;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (zt) {
+        rp.colorAttachments[1].texture = zt->tex;
+        rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+    }
     g->enc = [[g->cb renderCommandEncoderWithDescriptor:rp] retain];
     [g->enc setCullMode:MTLCullModeNone];
     g->enc_pso = nil;
@@ -551,6 +574,7 @@ static id<MTLRenderCommandEncoder> r5mtl_enc(R580MtlCtx *g, R5Mtl *r,
     g->enc_sref = -1;
     g->enc_vw = g->enc_vh = 0;
     r->enc_target = t;
+    r->enc_ztarget = zt;
     g->passes++;
     return g->enc;
 }
@@ -594,13 +618,13 @@ bool ati_r580_gl_r5_draw(R580MtlCtx *g, const struct R5GpuDraw *d)
         va.vp[1] = 2.0f / t->h;
         va.stride = 4 + 4 * d->ninputs;
 
-        enc = r5mtl_enc(g, r, t);
+        enc = r5mtl_enc(g, r, t, d->ztarget);
         [enc setRenderPipelineState:pso];
         [enc setVertexBuffer:vb offset:voff atIndex:0];
         [enc setVertexBytes:&va length:sizeof(va) atIndex:1];
         [enc setFragmentBuffer:ub offset:uoff atIndex:0];
         if (d->planes) {
-            size_t plen = (size_t)(d->nvert / 3) * (d->ninputs * 3 + 1) * 16;
+            size_t plen = (size_t)d->nplanes * 16;
             size_t poff;
             id<MTLBuffer> pb = mtl_alloc(g, plen, &poff);
 

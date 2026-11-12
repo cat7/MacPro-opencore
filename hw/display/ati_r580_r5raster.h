@@ -95,6 +95,33 @@ typedef struct R5xxRasterRegs {
     uint32_t rb3d_aaresolve_offset, rb3d_aaresolve_pitch, rb3d_aaresolve_ctl;
 } R5xxRasterRegs;
 
+/*
+ * The plane on which the depth test takes a triangle's z: at subpixel
+ * position (x, y), r5xx_zplane_at(). Float operations only, so that the
+ * host GPU path reproduces it exactly.
+ */
+typedef struct R5xxZPlane {
+    float a, b, z0;             /* dz per subpixel in x and y; z at x0, y0 */
+    int64_t x0, y0;
+} R5xxZPlane;
+
+#if defined(__aarch64__)
+#define R5XX_ZMAD(a, b, c) fmaf(a, b, c)
+#else
+static inline float r5xx_zmad(float a, float b, float c)
+{
+    volatile float m = a * b;
+    return m + c;
+}
+#define R5XX_ZMAD(a, b, c) r5xx_zmad(a, b, c)
+#endif
+
+static inline float r5xx_zplane_at(const R5xxZPlane *zp, int64_t x, int64_t y)
+{
+    return R5XX_ZMAD(zp->a, (float)(x - zp->x0),
+                     R5XX_ZMAD(zp->b, (float)(y - zp->y0), zp->z0));
+}
+
 /* Decoded render-target description. */
 typedef struct R5xxRenderTarget {
     int num_cbufs;
@@ -196,12 +223,39 @@ bool r5xx_raster_setup(R5xxRaster *r, char *err, size_t errlen);
 
 /* PACKET3_3D_CLEAR_ZMASK: fill the depth buffer with ZB_DEPTHCLEARVALUE */
 void r5xx_raster_zmask_clear(R5xxRaster *r, uint32_t ndw, uint32_t value);
+/* the pixels [0, x1) x [0, y1) of `l` it fills; false: none */
+bool r5xx_raster_zmask_area(const R5xxRaster *r, uint32_t ndw,
+                            R5xxSurfaceLayout *l, int *x1, int *y1);
 
 void r5xx_raster_triangle(R5xxRaster *r, const R5xxVertex *v0,
                           const R5xxVertex *v1, const R5xxVertex *v2);
 void r5xx_raster_line(R5xxRaster *r, const R5xxVertex *v0,
                       const R5xxVertex *v1);
 void r5xx_raster_point(R5xxRaster *r, const R5xxVertex *v);
+
+/* The z plane of a triangle with snapped corners X, Y (subpixels) */
+void r5xx_raster_zplane(const int64_t X[3], const int64_t Y[3],
+                        const R5xxVertex *const v[3], R5xxZPlane *zp);
+
+/*
+ * The pixels a line covers inside the scissor, exactly as
+ * r5xx_raster_line() draws them: per step `major` along its major axis
+ * (x when `xmajor`), the pixels [minor0, minor1) across it, and the z
+ * the depth test takes there. False when it covers none.
+ */
+typedef void R5xxRunFn(void *opaque, bool xmajor, int major, int minor0,
+                       int minor1, float z);
+bool r5xx_raster_line_runs(const R5xxRaster *r, const R5xxVertex *v0,
+                           const R5xxVertex *v1, R5xxRunFn *fn, void *opaque);
+
+/*
+ * The pixels a point covers inside the scissor, as r5xx_raster_point()
+ * (or, `sized`, r5xx_raster_point_sized()) draws them: box[0..3] = x0,
+ * y0, x1, y1, end exclusive, and the z the depth test takes. False when
+ * it covers none.
+ */
+bool r5xx_raster_point_box(const R5xxRaster *r, const R5xxVertex *v,
+                           bool sized, float size, int box[4], float *z);
 
 /* Direct color/depth buffer clears used by the CLEAR_* packets and the
  * callers.  rect is inclusive-exclusive. */
