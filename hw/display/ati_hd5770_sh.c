@@ -5,8 +5,10 @@
  * A program is a list of 64-bit control flow (CF) instructions; ALU
  * clauses hold VLIW groups of up to five instructions (slots x, y, z, w
  * and the transcendental t) followed by their literals, fetch clauses
- * hold 128-bit TEX or VTX instructions. One invocation runs at a time:
- * the execution mask is one bit, the CF stack holds its saved values.
+ * hold 128-bit TEX or VTX instructions. The interpreter runs one
+ * invocation at a time: the execution mask is one bit, the CF stack holds
+ * its saved values. Pixel shaders without flow control also have a lane
+ * form that runs up to HD5770_LANES pixels per instruction.
  * Opcodes, CF instructions, operand selects and fetch modes the
  * interpreter does not implement are counted per opcode in the stats and
  * make the program "bad": the draw that uses it is skipped, not guessed.
@@ -124,7 +126,10 @@ typedef struct CfInst {
     uint16_t group0, ngroups;   /* ALU: groups[] range */
 } CfInst;
 
+typedef struct LaneProg LaneProg;
+
 struct HD5770Prog {
+    LaneProg *lane;             /* lane form, or NULL */
     uint32_t *code;
     uint32_t ndw;
     unsigned stage;
@@ -439,6 +444,9 @@ uint32_t hd5770_prog_size(const uint32_t *code, uint32_t max)
     return MIN(end, max);
 }
 
+static void lane_free(LaneProg *lp);
+static LaneProg *lane_compile(const HD5770Prog *p);
+
 HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
                             unsigned stage, HD5770GfxStats *st)
 {
@@ -499,12 +507,16 @@ HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
             break;
         }
     }
+    if (stage == HD5770_STAGE_PS && !p->bad) {
+        p->lane = lane_compile(p);
+    }
     return p;
 }
 
 void hd5770_prog_free(HD5770Prog *p)
 {
     if (p) {
+        lane_free(p->lane);
         g_free(p->code);
         g_free(p->groups);
         g_free(p);
@@ -1555,6 +1567,688 @@ bool hd5770_prog_run_until(const HD5770Prog *p, const HD5770ShEnv *env,
     }
     run_prog(&r);
     return r.stopped;
+}
+
+/* ---------------------------------------------------------------- */
+/* Lanes                                                            */
+
+enum { LS_GPR, LS_PV, LS_CONST, LS_IMM };
+
+typedef struct LSrc {
+    uint8_t kind, idx, chan;    /* GPR: compact register; PV: slot */
+    uint16_t k;                 /* constant slot */
+    HD5770Val imm;
+} LSrc;
+
+typedef struct LInst {
+    const AluInst *in;
+    LSrc src[3];
+    uint8_t dst;                /* compact register */
+    uint8_t prm;                /* INTERP: parameter */
+    bool wr, needed, interp, dot, max4, post;
+} LInst;
+
+typedef struct LGroup {
+    uint16_t first, n;
+    bool dot, max4;
+} LGroup;
+
+typedef struct LConst {
+    bool cfile;
+    uint8_t bank, chan;
+    uint32_t idx;
+} LConst;
+
+enum { LOP_ALU, LOP_FETCH, LOP_EXPORT };
+
+typedef struct LOp {
+    uint8_t kind;
+    uint16_t first, n;          /* ALU: groups */
+    const CfInst *cf;
+} LOp;
+
+struct LaneProg {
+    uint8_t map[HD5770_GPRS];   /* GPR to compact register, 0xff none */
+    unsigned ngpr;
+    LOp *ops;
+    LGroup *groups;
+    LInst *insts;
+    LConst *consts;
+    unsigned nops, ngroups, ninsts, nconsts;
+    uint8_t *res;               /* resources of the fetch instructions */
+    unsigned nres;
+    bool grad;                  /* GET_GRADIENTS_H/V */
+};
+
+static void lane_free(LaneProg *lp)
+{
+    if (lp) {
+        g_free(lp->ops);
+        g_free(lp->groups);
+        g_free(lp->insts);
+        g_free(lp->consts);
+        g_free(lp->res);
+        g_free(lp);
+    }
+}
+
+static bool lane_gpr(LaneProg *lp, unsigned gpr, uint8_t *out)
+{
+    gpr &= HD5770_GPRS - 1;
+    if (lp->map[gpr] == 0xff) {
+        if (lp->ngpr >= HD5770_LANE_GPRS) {
+            return false;
+        }
+        lp->map[gpr] = lp->ngpr++;
+    }
+    *out = lp->map[gpr];
+    return true;
+}
+
+static bool op_lane_ok(const AluInst *in)
+{
+    if (in->pred_sel || in->update_exec || in->update_pred ||
+        in->dst_rel || in->rel[0] || in->rel[1] || in->rel[2]) {
+        return false;
+    }
+    if (in->op & 0x800) {
+        return true;
+    }
+    switch (in->op) {
+    case OP2_MOVA_INT:
+    case OP2_PRED_SETE: case OP2_PRED_SETGT: case OP2_PRED_SETGE:
+    case OP2_PRED_SETNE: case OP2_PRED_SETGT_UINT: case OP2_PRED_SETGE_UINT:
+    case OP2_PRED_SETE_INT: case OP2_PRED_SETGT_INT:
+    case OP2_PRED_SETGE_INT: case OP2_PRED_SETNE_INT:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool op_kills(unsigned op)
+{
+    return (op >= OP2_KILLE && op <= OP2_KILLNE) ||
+           op == OP2_KILLGT_UINT || op == OP2_KILLGE_UINT ||
+           (op >= OP2_KILLE_INT && op <= OP2_KILLNE_INT);
+}
+
+static bool op_is_interp(unsigned op)
+{
+    return op == OP2_INTERP_XY || op == OP2_INTERP_ZW ||
+           op == OP2_INTERP_X || op == OP2_INTERP_Z ||
+           op == OP2_INTERP_LOAD_P0;
+}
+
+static bool lane_src(LaneProg *lp, const CfInst *cf, const AluInst *in,
+                     const AluGroup *g, unsigned k, LSrc *ls, unsigned *cap)
+{
+    unsigned sel = in->sel[k], chan = in->chan[k];
+
+    memset(ls, 0, sizeof(*ls));
+    ls->chan = chan;
+    if (sel < 128) {
+        ls->kind = LS_GPR;
+        return lane_gpr(lp, sel, &ls->idx);
+    }
+    if ((sel >= SEL_KCACHE0 && sel < 192) || (sel >= SEL_CFILE && sel < 512)) {
+        LConst *c;
+
+        if (lp->nconsts >= *cap) {
+            *cap *= 2;
+            lp->consts = g_renew(LConst, lp->consts, *cap);
+        }
+        c = &lp->consts[lp->nconsts];
+        memset(c, 0, sizeof(*c));
+        c->chan = chan;
+        if (sel < 192) {
+            unsigned kk = sel >= SEL_KCACHE1;
+
+            c->bank = kk ? (cf->w0 >> 26) & 0xf : (cf->w0 >> 22) & 0xf;
+            c->idx = (kk ? (cf->w1 >> 10) & 0xff : (cf->w1 >> 2) & 0xff) * 16 +
+                     sel - (kk ? SEL_KCACHE1 : SEL_KCACHE0);
+        } else {
+            c->cfile = true;
+            c->idx = sel - SEL_CFILE;
+        }
+        ls->kind = LS_CONST;
+        ls->k = lp->nconsts++;
+        return true;
+    }
+    ls->kind = LS_IMM;
+    switch (sel) {
+    case SEL_0:
+        ls->imm.f = 0.0f;
+        break;
+    case SEL_1:
+        ls->imm.f = 1.0f;
+        break;
+    case SEL_1_INT:
+        ls->imm.i = 1;
+        break;
+    case SEL_M_1_INT:
+        ls->imm.i = -1;
+        break;
+    case SEL_0_5:
+        ls->imm.f = 0.5f;
+        break;
+    case SEL_LITERAL:
+        ls->imm.u = g->lit[chan];
+        break;
+    case SEL_PV:
+        ls->kind = LS_PV;
+        break;
+    case SEL_PS:
+        ls->kind = LS_PV;
+        ls->chan = 4;
+        break;
+    default:
+        ls->imm.u = 0;
+        break;
+    }
+    return true;
+}
+
+/* the PV/PS value of slot s of group gi may be read by a later group */
+static bool lane_pv_read(const LaneProg *lp, unsigned gi, unsigned s)
+{
+    unsigned h, i, k;
+
+    for (h = gi + 1; h < lp->ngroups; h++) {
+        const LGroup *g = &lp->groups[h];
+        bool has = false;
+
+        for (i = 0; i < g->n; i++) {
+            const LInst *li = &lp->insts[g->first + i];
+
+            for (k = 0; k < li->in->nsrc; k++) {
+                if (li->src[k].kind == LS_PV && li->src[k].chan == s) {
+                    return true;
+                }
+            }
+            has |= li->in->slot == s;
+        }
+        if (has) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static LaneProg *lane_compile(const HD5770Prog *p)
+{
+    LaneProg *lp = g_new0(LaneProg, 1);
+    unsigned ccap = 16, pc, gi, i, k;
+    uint8_t dummy;
+
+    memset(lp->map, 0xff, sizeof(lp->map));
+    lp->ops = g_new0(LOp, p->ncf + 1);
+    lp->groups = g_new0(LGroup, p->ngroups + 1);
+    lp->insts = g_new0(LInst, p->ngroups * 5 + 1);
+    lp->consts = g_new0(LConst, ccap);
+    lp->res = g_new0(uint8_t, 64);
+    /* r0 holds the barycentrics */
+    lane_gpr(lp, 0, &dummy);
+    for (pc = 0; pc < p->ncf; pc++) {
+        const CfInst *cf = &p->cf[pc];
+        LOp *o = &lp->ops[lp->nops];
+
+        if (cf->op & 0x80) {
+            unsigned g;
+
+            if ((cf->op & 0xf) != CF_ALU) {
+                goto fail;
+            }
+            o->kind = LOP_ALU;
+            o->first = lp->ngroups;
+            o->n = cf->ngroups;
+            o->cf = cf;
+            for (g = 0; g < cf->ngroups; g++) {
+                const AluGroup *ag = &p->groups[cf->group0 + g];
+                LGroup *lg = &lp->groups[lp->ngroups++];
+
+                lg->first = lp->ninsts;
+                lg->n = ag->n;
+                for (i = 0; i < ag->n; i++) {
+                    const AluInst *in = &ag->inst[i];
+                    LInst *li = &lp->insts[lp->ninsts++];
+
+                    li->in = in;
+                    if (!op_lane_ok(in)) {
+                        goto fail;
+                    }
+                    li->interp = !(in->op & 0x800) && op_is_interp(in->op);
+                    li->dot = in->op == OP2_DOT4 || in->op == OP2_DOT4_IEEE;
+                    li->max4 = in->op == OP2_MAX4;
+                    li->post = in->omod || in->clamp;
+                    lg->dot |= li->dot;
+                    lg->max4 |= li->max4;
+                    for (k = 0; k < in->nsrc; k++) {
+                        if (li->interp && in->sel[k] >= SEL_PARAM &&
+                            in->sel[k] < SEL_PARAM + 32) {
+                            li->prm = in->sel[k] - SEL_PARAM;
+                        }
+                        if (!lane_src(lp, cf, in, ag, k, &li->src[k], &ccap)) {
+                            goto fail;
+                        }
+                    }
+                    li->wr = in->write && in->op != OP2_NOP;
+                    if (li->wr && !lane_gpr(lp, in->dst_gpr, &li->dst)) {
+                        goto fail;
+                    }
+                }
+            }
+            lp->nops++;
+            continue;
+        }
+        switch (cf->op) {
+        case CF_NOP:
+        case CF_WAIT_ACK:
+        case CF_TEX_ACK:
+        case CF_VTX_ACK:
+            break;
+        case CF_TEX:
+        case CF_VTX: {
+            uint32_t addr = (cf->w0 & 0xffffff) * 2;
+            uint32_t count = ((cf->w1 >> 10) & 0x3f) + 1;
+
+            for (i = 0; i < count && addr + i * 4 + 3 <= p->ndw; i++) {
+                const uint32_t *w = &p->code[addr + i * 4];
+                unsigned op = w[0] & 0x1f;
+
+                if (cf->op == CF_TEX && (op == 0x07 || op == 0x08)) {
+                    lp->grad = true;
+                }
+                if (!lane_gpr(lp, (w[0] >> 16) & 0x7f, &dummy) ||
+                    !lane_gpr(lp, w[1] & 0x7f, &dummy)) {
+                    goto fail;
+                }
+                if (cf->op == CF_TEX && op != 0 && op != 0x07 && op != 0x08 &&
+                    lp->nres < 64) {
+                    lp->res[lp->nres++] = (w[0] >> 8) & 0xff;
+                }
+            }
+            o->kind = LOP_FETCH;
+            o->cf = cf;
+            lp->nops++;
+            break;
+        }
+        case CF_EXPORT:
+        case CF_EXPORT_DONE: {
+            unsigned gpr = (cf->w0 >> 15) & 0x7f, burst = (cf->w1 >> 16) & 0xf;
+
+            for (i = 0; i <= burst; i++) {
+                if (!lane_gpr(lp, gpr + i, &dummy)) {
+                    goto fail;
+                }
+            }
+            o->kind = LOP_EXPORT;
+            o->cf = cf;
+            lp->nops++;
+            break;
+        }
+        case CF_END_PROGRAM:
+            pc = p->ncf;
+            continue;
+        default:
+            goto fail;
+        }
+        if ((cf->w1 >> 21) & 1) {
+            break;
+        }
+    }
+    for (gi = 0; gi < lp->ngroups; gi++) {
+        const LGroup *g = &lp->groups[gi];
+
+        for (i = 0; i < g->n; i++) {
+            LInst *li = &lp->insts[g->first + i];
+
+            li->needed = li->wr || li->dot || li->max4 ||
+                         op_kills(li->in->op) ||
+                         lane_pv_read(lp, gi, li->in->slot);
+        }
+    }
+    return lp;
+fail:
+    lane_free(lp);
+    return NULL;
+}
+
+bool hd5770_prog_lanes(const HD5770Prog *p, unsigned *nconst, bool *grad)
+{
+    if (!p->lane) {
+        return false;
+    }
+    *nconst = p->lane->nconsts;
+    *grad = p->lane->grad;
+    return true;
+}
+
+void hd5770_prog_resources(const HD5770Prog *p, uint8_t *ids, unsigned *n,
+                           unsigned max)
+{
+    unsigned i;
+
+    *n = 0;
+    for (i = 0; p->lane && i < p->lane->nres && i < max; i++) {
+        ids[(*n)++] = p->lane->res[i];
+    }
+}
+
+void hd5770_prog_bind(const HD5770Prog *p, const HD5770ShEnv *env,
+                      HD5770Val *kv)
+{
+    const LaneProg *lp = p->lane;
+    unsigned i;
+
+    for (i = 0; i < lp->nconsts; i++) {
+        const LConst *c = &lp->consts[i];
+
+        if (c->cfile) {
+            kv[i].u = env->cfile ? env->cfile[(c->idx & 255) * 4 + c->chan]
+                                 : 0;
+        } else {
+            HD5770Val v[4];
+
+            env->kcache(env->opaque, c->bank, c->idx, v);
+            kv[i] = v[c->chan];
+        }
+    }
+}
+
+static void lane_group(const LaneProg *lp, const LGroup *g,
+                       const HD5770ShEnv *env, const HD5770Val *kv,
+                       HD5770Lanes *l)
+{
+    HD5770Val res[5][HD5770_LANES], tmp[5][3][HD5770_LANES];
+    const HD5770Val *src[5][3];
+    float dot[HD5770_LANES];
+    unsigned n = l->n, i, k, x;
+
+    for (i = 0; i < g->n; i++) {
+        const LInst *li = &lp->insts[g->first + i];
+
+        if (!li->needed) {
+            continue;
+        }
+        for (k = 0; k < li->in->nsrc; k++) {
+            const LSrc *ls = &li->src[k];
+
+            switch (ls->kind) {
+            case LS_GPR:
+                src[i][k] = l->r[ls->idx][ls->chan];
+                break;
+            case LS_PV:
+                src[i][k] = l->pv[ls->chan];
+                break;
+            default:
+                for (x = 0; x < n; x++) {
+                    tmp[i][k][x] = ls->kind == LS_CONST ? kv[ls->k] : ls->imm;
+                }
+                src[i][k] = tmp[i][k];
+                break;
+            }
+        }
+    }
+    if (g->dot) {
+        for (x = 0; x < n; x++) {
+            dot[x] = 0.0f;
+        }
+    }
+    for (i = 0; i < g->n; i++) {
+        const LInst *li = &lp->insts[g->first + i];
+        const AluInst *in = li->in;
+        unsigned op = in->op;
+
+        if (!li->needed) {
+            continue;
+        }
+        if (li->dot) {
+            for (x = 0; x < n; x++) {
+                float a = fmod_src(in, 0, src[i][0][x]);
+                float b = fmod_src(in, 1, src[i][1][x]);
+
+                dot[x] += op == OP2_DOT4 ? mul_dx9(a, b) : a * b;
+            }
+            continue;
+        }
+        if (li->interp) {
+            env->interp_n(env->opaque, l, li->prm, in->dst_chan,
+                          op == OP2_INTERP_LOAD_P0, res[i]);
+            continue;
+        }
+        if (li->max4) {
+            continue;
+        }
+        for (x = 0; x < n; x++) {
+            HD5770Val sv[3];
+            bool hp = false, pr = false, kill = false;
+
+            for (k = 0; k < in->nsrc; k++) {
+                sv[k] = src[i][k][x];
+            }
+            res[i][x] = eval(NULL, in, NULL, sv, &pr, &hp, &kill);
+            if (kill) {
+                l->killed[x] = true;
+            }
+        }
+    }
+    if (g->dot) {
+        for (i = 0; i < g->n; i++) {
+            if (lp->insts[g->first + i].dot) {
+                for (x = 0; x < n; x++) {
+                    res[i][x].f = dot[x];
+                }
+            }
+        }
+    }
+    if (g->max4) {
+        for (x = 0; x < n; x++) {
+            float m = -FLT_MAX;
+
+            for (i = 0; i < g->n; i++) {
+                const LInst *li = &lp->insts[g->first + i];
+
+                if (li->max4) {
+                    m = max_dx9(m, fmod_src(li->in, 0, src[i][0][x]));
+                }
+            }
+            for (i = 0; i < g->n; i++) {
+                if (lp->insts[g->first + i].max4) {
+                    res[i][x].f = m;
+                }
+            }
+        }
+    }
+    for (i = 0; i < g->n; i++) {
+        const LInst *li = &lp->insts[g->first + i];
+
+        if (!li->needed) {
+            continue;
+        }
+        if (li->post) {
+            for (x = 0; x < n; x++) {
+                res[i][x] = post(li->in, res[i][x]);
+            }
+        }
+        memcpy(l->pv[li->in->slot], res[i], n * sizeof(HD5770Val));
+    }
+    for (i = 0; i < g->n; i++) {
+        const LInst *li = &lp->insts[g->first + i];
+
+        if (li->wr) {
+            memcpy(l->r[li->dst][li->in->dst_chan], res[i],
+                   n * sizeof(HD5770Val));
+        }
+    }
+}
+
+static void lane_dst(HD5770Val (*r)[HD5770_LANES], const uint32_t *w,
+                     unsigned x, const HD5770Val out[4])
+{
+    unsigned k;
+
+    for (k = 0; k < 4; k++) {
+        unsigned sel = (w[1] >> (9 + 3 * k)) & 7;
+
+        if (sel < 4) {
+            r[k][x] = out[sel];
+        } else if (sel == 4) {
+            r[k][x].f = 0.0f;
+        } else if (sel == 5) {
+            r[k][x].f = 1.0f;
+        }
+    }
+}
+
+/*
+ * Fetch clause on the lane sets l[0..nl-1]: l[0] the pixels, l[1] and
+ * l[2] (if nl is 3) their neighbours to the right and below. Each
+ * instruction runs on the pixels first: a gradient reads a neighbour as
+ * it is when it reaches the instruction. In a neighbour, as in a
+ * neighbour run of the interpreter, a gradient reads the pixel itself.
+ */
+static void lane_fetch(const HD5770Prog *p, const CfInst *cf,
+                       const HD5770ShEnv *env, HD5770Lanes **l, unsigned nl)
+{
+    const LaneProg *lp = p->lane;
+    uint32_t addr = (cf->w0 & 0xffffff) * 2;
+    uint32_t count = ((cf->w1 >> 10) & 0x3f) + 1, i, k, x;
+    unsigned q;
+
+    for (i = 0; i < count && addr + i * 4 + 3 <= p->ndw; i++) {
+        const uint32_t *w = &p->code[addr + i * 4];
+        unsigned sgi = lp->map[(w[0] >> 16) & 0x7f], dsti = lp->map[w[1] & 0x7f];
+        unsigned op = w[0] & 0x1f;
+
+        for (q = 0; q < nl; q++) {
+            HD5770Val (*sg)[HD5770_LANES] = l[q]->r[sgi];
+            HD5770Val (*dst)[HD5770_LANES] = l[q]->r[dsti];
+            HD5770Val out[4], src[4];
+
+            if (cf->op == CF_TEX && (op == 0x07 || op == 0x08)) {
+                HD5770Lanes *nb = q ? l[q] : l[op == 0x07 ? 1 : 2];
+                HD5770Val (*ng)[HD5770_LANES] = nb->r[sgi];
+
+                for (x = 0; x < l[q]->n; x++) {
+                    for (k = 0; k < 4; k++) {
+                        unsigned sel = (w[2] >> (20 + 3 * k)) & 7;
+
+                        out[k].f = sel < 4 ? ng[sel][x].f - sg[sel][x].f : 0.0f;
+                    }
+                    lane_dst(dst, w, x, out);
+                }
+                continue;
+            }
+            if (cf->op == CF_VTX || op == 0) {
+                unsigned ssel = (w[0] >> 24) & 3;
+
+                for (x = 0; x < l[q]->n; x++) {
+                    env->vfetch(env->opaque, w, sg[ssel][x].u, p->stage, out);
+                    lane_dst(dst, w, x, out);
+                }
+                continue;
+            }
+            for (x = 0; x < l[q]->n; x++) {
+                for (k = 0; k < 4; k++) {
+                    unsigned sel = (w[2] >> (20 + 3 * k)) & 7;
+
+                    src[k] = sel < 4 ? sg[sel][x]
+                                     : fval(sel == 5 ? 1.0f : 0.0f);
+                }
+                env->tfetch(env->opaque, w, src, NULL, out);
+                lane_dst(dst, w, x, out);
+            }
+        }
+    }
+}
+
+static void lane_export(const LaneProg *lp, const CfInst *cf, HD5770Lanes *l)
+{
+    unsigned type = (cf->w0 >> 13) & 3, base = cf->w0 & 0x1fff;
+    unsigned gpr = (cf->w0 >> 15) & 0x7f, burst = (cf->w1 >> 16) & 0xf;
+    unsigned i, k, x;
+
+    if (type != 0 || base > 0) {
+        return;
+    }
+    for (i = 0; i <= burst; i++) {
+        HD5770Val (*r)[HD5770_LANES] = l->r[lp->map[(gpr + i) & 127]];
+
+        if (base + i != 0) {
+            continue;
+        }
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (cf->w1 >> (3 * k)) & 7;
+
+            for (x = 0; x < l->n; x++) {
+                if (sel < 4) {
+                    l->color[k][x] = r[sel][x];
+                } else if (sel == 4) {
+                    l->color[k][x].f = 0.0f;
+                } else if (sel == 5) {
+                    l->color[k][x].f = 1.0f;
+                } else {
+                    l->color[k][x].u = 0;
+                }
+            }
+        }
+        l->color0 = true;
+    }
+}
+
+static void lane_inputs(const LaneProg *lp, HD5770Lanes *l)
+{
+    unsigned x, r0 = lp->map[0];
+
+    memset(l->killed, 0, sizeof(l->killed));
+    if (l->pos_gpr >= 0 && lp->map[l->pos_gpr] != 0xff) {
+        unsigned q = lp->map[l->pos_gpr];
+
+        for (x = 0; x < l->n; x++) {
+            l->r[q][0][x].f = l->px[x];
+            l->r[q][1][x].f = l->py[x];
+            l->r[q][2][x].f = 0.0f;
+            l->r[q][3][x].f = 1.0f;
+        }
+    }
+    for (x = 0; x < l->n; x++) {
+        l->r[r0][0][x].f = l->b1[x];
+        l->r[r0][1][x].f = l->b2[x];
+    }
+}
+
+void hd5770_prog_run_lanes(const HD5770Prog *p, const HD5770ShEnv *env,
+                           const HD5770Val *kv, HD5770Lanes *l,
+                           HD5770Lanes *nh, HD5770Lanes *nv)
+{
+    const LaneProg *lp = p->lane;
+    HD5770Lanes *set[3] = { l, nh, nv };
+    unsigned i, g, q, nl = lp->grad ? 3 : 1;
+
+    l->color0 = false;
+    for (q = 0; q < nl; q++) {
+        lane_inputs(lp, set[q]);
+    }
+    for (i = 0; i < lp->nops; i++) {
+        const LOp *o = &lp->ops[i];
+
+        switch (o->kind) {
+        case LOP_ALU:
+            for (g = 0; g < o->n; g++) {
+                for (q = 0; q < nl; q++) {
+                    lane_group(lp, &lp->groups[o->first + g], env, kv, set[q]);
+                }
+            }
+            break;
+        case LOP_FETCH:
+            lane_fetch(p, o->cf, env, set, nl);
+            break;
+        default:
+            lane_export(lp, o->cf, l);
+            break;
+        }
+    }
 }
 
 /* ---------------------------------------------------------------- */
