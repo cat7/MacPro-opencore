@@ -360,6 +360,8 @@ static void whpx_set_xcrs(CPUState *cpu)
     }
 }
 
+static void whpx_set_mtrrs(CPUState *cpu);
+
 static int whpx_set_tsc(CPUState *cpu)
 {
     WHV_REGISTER_NAME tsc_reg = WHvX64RegisterTsc;
@@ -534,6 +536,7 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
      */
     if (level >= WHPX_LEVEL_RESET_STATE) {
         whpx_set_tsc(cpu);
+        whpx_set_mtrrs(cpu);
     }
 
     memset(&vcxt, 0, sizeof(struct whpx_register_set));
@@ -663,6 +666,74 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         WHV_REGISTER_VALUE apic_base = {};
         apic_base.Reg64 = cpu_get_apic_base(X86_CPU(cpu)->apic_state);
         whpx_set_reg(cpu, WHvX64RegisterApicBase, apic_base);
+    }
+}
+
+/* MTRR MSRs: deftype, 11 fixed ranges, MSR_MTRRcap_VCNT base/mask pairs */
+#define WHPX_MTRR_REGS (1 + 11 + 2 * MSR_MTRRcap_VCNT)
+
+static void whpx_mtrr_names(WHV_REGISTER_NAME *names)
+{
+    int i, n = 0;
+
+    names[n++] = WHvX64RegisterMsrMtrrDefType;
+    for (i = 0; i < 11; i++) {
+        names[n++] = WHvX64RegisterMsrMtrrFix64k00000 + i;
+    }
+    for (i = 0; i < MSR_MTRRcap_VCNT; i++) {
+        names[n++] = WHvX64RegisterMsrMtrrPhysBase0 + i;
+        names[n++] = WHvX64RegisterMsrMtrrPhysMask0 + i;
+    }
+}
+
+static void whpx_set_mtrrs(CPUState *cpu)
+{
+    struct whpx_state *whpx = &whpx_global;
+    CPUX86State *env = cpu_env(cpu);
+    WHV_REGISTER_NAME names[WHPX_MTRR_REGS];
+    WHV_REGISTER_VALUE values[WHPX_MTRR_REGS] = {};
+    HRESULT hr;
+    int i, n = 0;
+
+    whpx_mtrr_names(names);
+    values[n++].Reg64 = env->mtrr_deftype;
+    for (i = 0; i < 11; i++) {
+        values[n++].Reg64 = env->mtrr_fixed[i];
+    }
+    for (i = 0; i < MSR_MTRRcap_VCNT; i++) {
+        values[n++].Reg64 = env->mtrr_var[i].base;
+        values[n++].Reg64 = env->mtrr_var[i].mask;
+    }
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, names, n, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to set MTRRs, hr=%08lx", hr);
+    }
+}
+
+static void whpx_get_mtrrs(CPUState *cpu)
+{
+    struct whpx_state *whpx = &whpx_global;
+    CPUX86State *env = cpu_env(cpu);
+    WHV_REGISTER_NAME names[WHPX_MTRR_REGS];
+    WHV_REGISTER_VALUE values[WHPX_MTRR_REGS] = {};
+    HRESULT hr;
+    int i, n = 0;
+
+    whpx_mtrr_names(names);
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, names, WHPX_MTRR_REGS, values);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to get MTRRs, hr=%08lx", hr);
+        return;
+    }
+    env->mtrr_deftype = values[n++].Reg64;
+    for (i = 0; i < 11; i++) {
+        env->mtrr_fixed[i] = values[n++].Reg64;
+    }
+    for (i = 0; i < MSR_MTRRcap_VCNT; i++) {
+        env->mtrr_var[i].base = values[n++].Reg64;
+        env->mtrr_var[i].mask = values[n++].Reg64;
     }
 }
 
@@ -875,6 +946,7 @@ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
         whpx_get_tsc(cpu);
         env->tsc_valid = !runstate_is_running();
     }
+    whpx_get_mtrrs(cpu);
 
     hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
         whpx->partition, cpu->cpu_index,
