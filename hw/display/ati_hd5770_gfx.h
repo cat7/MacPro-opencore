@@ -57,6 +57,13 @@ typedef struct HD5770Surf {
     uint32_t pipes;             /* from GB_ADDR_CONFIG */
     uint32_t pipe_interleave;   /* bytes */
     bool nondisp;               /* non-displayable micro tile order */
+    /* derived by hd5770_surf_prep() */
+    bool fast;                  /* offsets from the tables below */
+    uint8_t mt_w_sh, mt_h_sh, pipes_sh, banks_sh, bankw_sh, bankh_sh;
+    uint8_t pib_sh, hi_sh;
+    uint32_t mt_per_row, tile_bytes, row_bytes;
+    uint64_t mt_bytes;
+    uint32_t eoff[64];          /* offset of element (x & 7, y & 7) */
 } HD5770Surf;
 
 #define HD5770_GB_ADDR_CONFIG_JUNIPER   0x02010002
@@ -65,6 +72,33 @@ bool hd5770_surf_mode_ok(uint32_t mode);
 uint64_t hd5770_surf_offset(const HD5770Surf *s, uint32_t x, uint32_t y);
 uint64_t hd5770_surf_size(const HD5770Surf *s);
 void hd5770_surf_set_addr_config(HD5770Surf *s, uint32_t gb_addr_config);
+/* precompute the address tables; after every change of the fields above */
+void hd5770_surf_prep(HD5770Surf *s);
+/* offset of micro tile (tx, ty) of a prepared 1D/2D surface */
+uint64_t hd5770_surf_tile(const HD5770Surf *s, uint32_t tx, uint32_t ty);
+/* MC range [*lo, *hi) holding rows y0..y1-1 */
+void hd5770_surf_rows(const HD5770Surf *s, uint32_t y0, uint32_t y1,
+                      uint64_t *lo, uint64_t *hi);
+
+/* hd5770_surf_offset() of a prepared surface */
+static inline uint64_t hd5770_surf_offset_fast(const HD5770Surf *s,
+                                               uint32_t x, uint32_t y)
+{
+    if (!s->fast) {
+        return hd5770_surf_offset(s, x, y);
+    }
+    if (s->mode < HD5770_ARRAY_1D_TILED_THIN1) {
+        return (uint64_t)y * s->row_bytes + (uint64_t)x * s->bpe;
+    }
+    return hd5770_surf_tile(s, x >> 3, y >> 3) + s->eoff[(y & 7) * 8 + (x & 7)];
+}
+
+/*
+ * Offsets of elements x0..x0+n-1 of row y of a prepared surface; one
+ * micro tile address per eight elements.
+ */
+void hd5770_surf_row(const HD5770Surf *s, uint32_t x0, uint32_t y, uint32_t n,
+                     uint64_t *off);
 
 /* ---------------------------------------------------------------- */
 /* Formats (FMT_* of resources and CB_COLORn_INFO)                  */

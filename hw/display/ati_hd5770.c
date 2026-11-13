@@ -537,13 +537,13 @@ static uint32_t *draw_row(DisplaySurface *ds, int y)
 
 /* one row of a tiled surface, gathered into linear order */
 static void tiled_row(const uint8_t *vram, const ATIHD5770Mode *m, uint32_t y,
-                      uint8_t *row)
+                      uint8_t *row, uint64_t *off)
 {
     uint32_t x;
 
+    hd5770_surf_row(&m->surf, m->x0, m->y0 + y, m->width, off);
     for (x = 0; x < m->width; x++) {
-        memcpy(row + x * m->bpp, vram + m->fb_offset +
-               hd5770_surf_offset(&m->surf, m->x0 + x, m->y0 + y), m->bpp);
+        memcpy(row + x * m->bpp, vram + m->fb_offset + off[x], m->bpp);
     }
 }
 
@@ -558,13 +558,14 @@ static void ati_hd5770_draw(ATIHD5770State *s, DisplaySurface *ds,
     const uint8_t *lin = vram + m->fb_offset, *src;
     const uint8_t (*pal)[3] = (const uint8_t (*)[3])s->palette;
     g_autofree uint8_t *row = m->tiled ? g_malloc(m->width * m->bpp) : NULL;
+    g_autofree uint64_t *off = m->tiled ? g_new(uint64_t, m->width) : NULL;
     uint32_t x, y;
 
     for (y = 0; y < m->height; y++) {
         uint32_t *dst = draw_row(ds, y);
 
         if (m->tiled) {
-            tiled_row(vram, m, y, row);
+            tiled_row(vram, m, y, row, off);
             src = row;
         } else {
             src = lin;

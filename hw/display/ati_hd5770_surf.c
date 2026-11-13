@@ -210,6 +210,164 @@ uint64_t hd5770_surf_offset(const HD5770Surf *s, uint32_t x, uint32_t y)
            (total >> ctz32(pib)) << (ctz32(pib) + pbits + bbits);
 }
 
+/*
+ * Every quantity of the 2D layout is a power of two except the pitch, so
+ * an element's offset is the offset of its micro tile plus a table entry
+ * for its place inside the tile: the tile part of the address is a
+ * multiple of the tile size, and an element offset below the tile size
+ * only reaches the bits a tile offset does not use (no carry). Surfaces
+ * whose tiles are split are left to hd5770_surf_offset().
+ */
+void hd5770_surf_prep(HD5770Surf *s)
+{
+    uint32_t mt_w, mt_h, i, pbits, bbits;
+
+    s->fast = false;
+    s->row_bytes = s->pitch * s->bpe;
+    if (s->mode == HD5770_ARRAY_LINEAR_GENERAL ||
+        s->mode == HD5770_ARRAY_LINEAR_ALIGNED) {
+        s->fast = true;
+        return;
+    }
+    if (!s->bpe || (s->bpe & (s->bpe - 1)) || s->bpe > 16) {
+        return;
+    }
+    s->tile_bytes = 64 * s->bpe;
+    for (i = 0; i < 64; i++) {
+        s->eoff[i] = micro_index(i & 7, i >> 3, s->bpe, s->nondisp) * s->bpe;
+    }
+    if (s->mode == HD5770_ARRAY_1D_TILED_THIN1) {
+        s->mt_per_row = s->pitch / 8;
+        s->fast = true;
+        return;
+    }
+    if (s->mode != HD5770_ARRAY_2D_TILED_THIN1 ||
+        s->tile_bytes > s->tile_split || !s->pipes || !s->banks ||
+        !s->bankw || !s->bankh || !s->mtilea ||
+        (s->pipes & (s->pipes - 1)) || (s->banks & (s->banks - 1)) ||
+        (s->bankw & (s->bankw - 1)) || (s->bankh & (s->bankh - 1)) ||
+        (s->mtilea & (s->mtilea - 1)) ||
+        (s->pipe_interleave & (s->pipe_interleave - 1))) {
+        return;
+    }
+    mt_w = 8 * s->bankw * s->pipes * s->mtilea;
+    mt_h = 8 * s->bankh * s->banks / s->mtilea;
+    if (mt_h < 8) {
+        return;
+    }
+    pbits = ctz32(s->pipes);
+    bbits = ctz32(s->banks);
+    s->mt_w_sh = ctz32(mt_w);
+    s->mt_h_sh = ctz32(mt_h);
+    s->pipes_sh = pbits;
+    s->banks_sh = bbits;
+    s->bankw_sh = ctz32(s->bankw);
+    s->bankh_sh = ctz32(s->bankh);
+    s->pib_sh = ctz32(s->pipe_interleave);
+    s->hi_sh = s->pib_sh + pbits + bbits;
+    s->mt_bytes = (uint64_t)s->tile_bytes * (mt_w / 8) * (mt_h / 8) /
+                  (s->pipes * s->banks);
+    s->mt_per_row = s->pitch / mt_w;
+    for (i = 0; i < 64; i++) {
+        uint32_t e = s->eoff[i];
+
+        s->eoff[i] = (e & (s->pipe_interleave - 1)) |
+                     (e >> s->pib_sh) << s->hi_sh;
+    }
+    s->fast = true;
+}
+
+uint64_t hd5770_surf_tile(const HD5770Surf *s, uint32_t tx, uint32_t ty)
+{
+    uint64_t total;
+    uint32_t pipe, bank;
+
+    if (s->mode == HD5770_ARRAY_1D_TILED_THIN1) {
+        return ((uint64_t)ty * s->mt_per_row + tx) * s->tile_bytes;
+    }
+    total = ((uint64_t)(ty >> (s->mt_h_sh - 3)) * s->mt_per_row +
+             (tx >> (s->mt_w_sh - 3))) * s->mt_bytes +
+            (((ty & (s->bankh - 1)) << s->bankw_sh) +
+             ((tx >> s->pipes_sh) & (s->bankw - 1))) * s->tile_bytes;
+    pipe = pipe_of(tx, ty, s->pipes);
+    bank = bank_of(tx >> (s->bankw_sh + s->pipes_sh), ty >> s->bankh_sh,
+                   s->banks) & (s->banks - 1);
+    return (total & (s->pipe_interleave - 1)) |
+           (uint64_t)pipe << s->pib_sh |
+           (uint64_t)bank << (s->pib_sh + s->pipes_sh) |
+           (total >> s->pib_sh) << s->hi_sh;
+}
+
+void hd5770_surf_row(const HD5770Surf *s, uint32_t x0, uint32_t y, uint32_t n,
+                     uint64_t *off)
+{
+    uint32_t x = x0, end = x0 + n;
+
+    if (!s->fast) {
+        for (; x < end; x++) {
+            *off++ = hd5770_surf_offset(s, x, y);
+        }
+        return;
+    }
+    if (s->mode < HD5770_ARRAY_1D_TILED_THIN1) {
+        uint64_t o = (uint64_t)y * s->row_bytes + (uint64_t)x * s->bpe;
+
+        for (; x < end; x++, o += s->bpe) {
+            *off++ = o;
+        }
+        return;
+    }
+    while (x < end) {
+        uint64_t t = hd5770_surf_tile(s, x >> 3, y >> 3);
+        const uint32_t *e = &s->eoff[(y & 7) * 8];
+        uint32_t stop = MIN(end, (x | 7) + 1);
+
+        for (; x < stop; x++) {
+            *off++ = t + e[x & 7];
+        }
+    }
+}
+
+void hd5770_surf_rows(const HD5770Surf *s, uint32_t y0, uint32_t y1,
+                      uint64_t *lo, uint64_t *hi)
+{
+    uint64_t a, b;
+
+    if (y1 <= y0) {
+        *lo = *hi = s->base;
+        return;
+    }
+    if (s->fast && s->mode < HD5770_ARRAY_1D_TILED_THIN1) {
+        a = (uint64_t)y0 * s->row_bytes;
+        b = (uint64_t)y1 * s->row_bytes;
+    } else if (s->fast && s->mode == HD5770_ARRAY_1D_TILED_THIN1) {
+        a = (uint64_t)(y0 / 8) * s->mt_per_row * s->tile_bytes;
+        b = (uint64_t)DIV_ROUND_UP(y1, 8) * s->mt_per_row * s->tile_bytes;
+    } else if (s->fast) {
+        uint64_t band = (uint64_t)s->mt_per_row * s->mt_bytes;
+
+        /* a pitch that is not a whole number of macro tiles overhangs */
+        a = (uint64_t)(y0 >> s->mt_h_sh) * band;
+        b = (uint64_t)((y1 - 1) >> s->mt_h_sh) * band +
+            (uint64_t)DIV_ROUND_UP(s->pitch, 1u << s->mt_w_sh) * s->mt_bytes;
+        a = (a >> s->pib_sh) << s->hi_sh;
+        b = b ? (((b - 1) >> s->pib_sh) + 1) << s->hi_sh : 0;
+    } else if (s->mode == HD5770_ARRAY_2D_TILED_THIN1) {
+        /* split tiles: the whole surface, padded to whole macro tiles */
+        uint32_t mt_w = 8 * s->bankw * s->pipes * MAX(s->mtilea, 1);
+        uint32_t mt_h = MAX(8 * s->bankh * s->banks / MAX(s->mtilea, 1), 8);
+
+        a = 0;
+        b = 2 * (uint64_t)ROUND_UP(s->pitch, mt_w) * ROUND_UP(s->height, mt_h) *
+            s->bpe + s->pipe_interleave * s->pipes * s->banks;
+    } else {
+        a = 0;
+        b = hd5770_surf_size(s);
+    }
+    *lo = s->base + a;
+    *hi = s->base + b;
+}
+
 /* bytes from the base the surface's slice 0 covers */
 uint64_t hd5770_surf_size(const HD5770Surf *s)
 {

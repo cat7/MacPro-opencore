@@ -446,6 +446,7 @@ bool ati_hd5770_dce4_scanout(ATIHD5770State *s, ATIHD5770Mode *m)
         hd5770_surf_set_addr_config(sf, s->regs[EG_GB_ADDR_CONFIG >> 2]
                                     ? s->regs[EG_GB_ADDR_CONFIG >> 2]
                                     : HD5770_GB_ADDR_CONFIG_JUNIPER);
+        hd5770_surf_prep(sf);
         m->tiled = true;
         m->x0 = x0;
         m->y0 = y0;
