@@ -9,6 +9,7 @@
 #define ATI_HD5770_SH_H
 
 #include "ati_hd5770_gfx.h"
+#include "ati_hd5770_ir.h"
 
 #define HD5770_GPRS             128
 #define HD5770_PARAMS           32
@@ -94,7 +95,7 @@ bool hd5770_prog_run_until(const HD5770Prog *p, const HD5770ShEnv *env,
  * pixel, operation for operation.
  */
 #define HD5770_LANES            16
-#define HD5770_LANE_GPRS        16
+#define HD5770_LANE_GPRS        HD5770_IR_GPRS
 
 typedef struct HD5770Lanes {
     unsigned n;
@@ -121,6 +122,8 @@ typedef struct HD5770Lanes {
  * pixels to the right and below each lane in nh and nv
  */
 bool hd5770_prog_lanes(const HD5770Prog *p, unsigned *nconst, bool *grad);
+/* the IR of a program that runs on lanes, else NULL */
+const HD5770IR *hd5770_prog_ir(const HD5770Prog *p);
 /* resources [0..*n) the program's fetch instructions read */
 void hd5770_prog_resources(const HD5770Prog *p, uint8_t *ids, unsigned *n,
                            unsigned max);
