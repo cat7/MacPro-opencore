@@ -127,7 +127,14 @@ struct ATIHD5770State {
     PCIDevice parent_obj;
 
     MemoryRegion vram;
-    MemoryRegion aper;
+    MemoryRegion aper;          /* VRAM as BAR 0 shows it, under bar0 */
+    MemoryRegion bar0;
+    /* HDP surfaces: tiled views of VRAM for the CPU, see ati_hd5770_mc.c */
+    MemoryRegion hdp_io;
+    MemoryRegion hdp_win[6];
+    HD5770Surf hdp_surf[6];
+    uint64_t hdp_lo[6], hdp_hi[6];
+    uint64_t hdp_accesses;
     MemoryRegion mmio;
     MemoryRegion io;
     QemuConsole *con;
@@ -287,6 +294,8 @@ void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);
 bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 void ati_hd5770_mc_gfx_init(ATIHD5770State *s);
+void ati_hd5770_hdp_init(ATIHD5770State *s);
+void ati_hd5770_hdp_update(ATIHD5770State *s);
 void ati_hd5770_mc_unmap_all(ATIHD5770State *s);
 
 /* ati_hd5770_cp.c */

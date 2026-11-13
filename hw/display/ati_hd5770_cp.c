@@ -1151,9 +1151,12 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         c->ucode_rlc, s->mc.gart, s->mc.gart_invalid, s->mc.tlb_inval);
     g_string_append_printf(out, " thread %s runs %" PRIu64 " idle waits %"
                            PRIu64 " draw ms %" PRIu64 " scanout redraws %"
-                           PRIu64 "\nscratch:", s->eng_on ? "on" : "off",
+                           PRIu64 "\nhdp: window 0x%" PRIx64 "-0x%" PRIx64
+                           " cpu accesses %" PRIu64 "\nscratch:",
+                           s->eng_on ? "on" : "off",
                            s->eng_runs, s->eng_waits, s->eng_draw_ns / 1000000,
-                           s->redraws);
+                           s->redraws, s->hdp_lo[0], s->hdp_hi[0],
+                           s->hdp_accesses);
     for (i = 0; i < 8; i++) {
         g_string_append_printf(out, " 0x%x",
                                s->regs[(EG_SCRATCH_REG0 >> 2) + i]);

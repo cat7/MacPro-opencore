@@ -296,3 +296,167 @@ void ati_hd5770_mc_gfx_init(ATIHD5770State *s)
     s->gfx3d.mem.map = gfx_map;
     s->gfx3d.mem.dirty = gfx_dirty;
 }
+
+/* ---------------------------------------------------------------- */
+/* HDP surfaces                                                     */
+
+/*
+ * The host data path tiles CPU accesses through BAR 0 that fall into an
+ * HDP surface: the bytes of a linear picture of the surface's pitch go
+ * to their places in its tiled layout. The controller lays surface n over
+ * CRTC n's scanout at mode set (0x2c14 + n * 0x18: first and last byte
+ * >> 8, base, INFO, SIZE), so a CPU writing the screen linearly -- the
+ * kernel console -- draws on the tiled scanout correctly. A window traps
+ * BAR accesses over each surface whose array mode is tiled; linear
+ * surfaces need none.
+ */
+static bool hdp_find(ATIHD5770State *s, uint64_t addr, unsigned *n)
+{
+    unsigned i;
+
+    for (i = 0; i < EG_HDP_SURFACES; i++) {
+        if (addr >= s->hdp_lo[i] && addr < s->hdp_hi[i]) {
+            *n = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* VRAM offset of BAR 0 byte addr */
+static uint64_t hdp_byte(ATIHD5770State *s, uint64_t addr)
+{
+    const HD5770Surf *sf;
+    uint64_t o, e;
+    unsigned n;
+
+    if (!hdp_find(s, addr, &n)) {
+        return addr;
+    }
+    sf = &s->hdp_surf[n];
+    o = addr - s->hdp_lo[n];
+    e = o / sf->bpe;
+    return s->hdp_lo[n] + hd5770_surf_offset_fast(sf, e % sf->pitch,
+                                                   e / sf->pitch) +
+           o % sf->bpe;
+}
+
+static uint64_t hdp_read(void *opaque, hwaddr addr, unsigned size)
+{
+    ATIHD5770State *s = opaque;
+    uint8_t *v = vram_ptr(s);
+    uint64_t val = 0;
+    unsigned i;
+
+    s->hdp_accesses++;
+    for (i = 0; i < size; i++) {
+        uint64_t a = hdp_byte(s, addr + i);
+
+        if (a < s->vram_size) {
+            hd5770_gfx_touch(&s->gfx3d, a, 1);
+            val |= (uint64_t)v[a] << (8 * i);
+        }
+    }
+    return val;
+}
+
+static void hdp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    ATIHD5770State *s = opaque;
+    uint8_t *v = vram_ptr(s);
+    unsigned i;
+
+    s->hdp_accesses++;
+    for (i = 0; i < size; i++) {
+        uint64_t a = hdp_byte(s, addr + i);
+
+        if (a < s->vram_size) {
+            hd5770_gfx_touch(&s->gfx3d, a, 1);
+            v[a] = val >> (8 * i);
+            memory_region_set_dirty(&s->vram, a, 1);
+        }
+    }
+}
+
+static const MemoryRegionOps hdp_ops = {
+    .read = hdp_read,
+    .write = hdp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
+void ati_hd5770_hdp_init(ATIHD5770State *s)
+{
+    Object *obj = OBJECT(s);
+    uint64_t size = memory_region_size(&s->aper);
+    unsigned i;
+
+    memory_region_init(&s->bar0, obj, "ati-hd5770-bar0", size);
+    memory_region_add_subregion(&s->bar0, 0, &s->aper);
+    memory_region_init_io(&s->hdp_io, obj, &hdp_ops, s, "ati-hd5770-hdp",
+                          size);
+    for (i = 0; i < EG_HDP_SURFACES; i++) {
+        memory_region_init_alias(&s->hdp_win[i], obj, "ati-hd5770-hdp-win",
+                                 &s->hdp_io, 0, 0x1000);
+        memory_region_set_enabled(&s->hdp_win[i], false);
+        memory_region_add_subregion_overlap(&s->bar0, 0, &s->hdp_win[i], 1);
+    }
+}
+
+/* the windows of the tiled surfaces, from the registers */
+void ati_hd5770_hdp_update(ATIHD5770State *s)
+{
+    uint64_t size = memory_region_size(&s->aper);
+    uint32_t cfg = s->regs[EG_GB_ADDR_CONFIG >> 2];
+    unsigned i;
+
+    memory_region_transaction_begin();
+    for (i = 0; i < EG_HDP_SURFACES; i++) {
+        const uint32_t *r = &s->regs[(EG_HDP_SURFACE0 +
+                                      i * EG_HDP_SURFACE_STRIDE) >> 2];
+        uint32_t info = r[EG_HDP_SURF_INFO >> 2];
+        uint64_t lo = (uint64_t)r[EG_HDP_SURF_LOWER >> 2] << 8;
+        uint64_t hi = ((uint64_t)r[EG_HDP_SURF_UPPER >> 2] << 8) + 0x100;
+        HD5770Surf *sf = &s->hdp_surf[i];
+
+        memset(sf, 0, sizeof(*sf));
+        /* INFO: array mode 4:1, log2 bytes per element 9:7, then the
+         * bank fields encoded as in GRPH_CONTROL */
+        sf->mode = (info >> 1) & 0xf;
+        sf->bpe = 1u << ((info >> 7) & 7);
+        sf->tile_split = 64u << ((info >> 17) & 7);
+        sf->banks = 2u << ((info >> 20) & 3);
+        sf->bankw = 1u << ((info >> 22) & 3);
+        sf->bankh = 1u << ((info >> 24) & 3);
+        sf->mtilea = 1u << ((info >> 26) & 3);
+        sf->pitch = ((r[EG_HDP_SURF_SIZE >> 2] & 0x7ff) + 1) * 8;
+        sf->height = sf->pitch ? (hi - lo) / sf->bpe / sf->pitch : 0;
+        hd5770_surf_set_addr_config(sf, cfg ? cfg
+                                            : HD5770_GB_ADDR_CONFIG_JUNIPER);
+        hd5770_surf_prep(sf);
+        if (sf->mode < HD5770_ARRAY_1D_TILED_THIN1 ||
+            !hd5770_surf_mode_ok(sf->mode) || !r[EG_HDP_SURF_UPPER >> 2] ||
+            hi <= lo || hi > size || hi > s->vram_size) {
+            lo = hi = 0;
+        }
+        s->hdp_lo[i] = lo;
+        s->hdp_hi[i] = hi;
+        memory_region_set_enabled(&s->hdp_win[i], false);
+        if (hi > lo) {
+            memory_region_set_alias_offset(&s->hdp_win[i], lo);
+            memory_region_set_size(&s->hdp_win[i], hi - lo);
+            memory_region_set_address(&s->hdp_win[i], lo);
+            memory_region_set_enabled(&s->hdp_win[i], true);
+        }
+    }
+    memory_region_transaction_commit();
+}

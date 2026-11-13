@@ -413,6 +413,11 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         s->regs[off >> 2] = val;
         s->force_redraw = true;
         return;
+    case EG_HDP_SURFACE0 ...
+         EG_HDP_SURFACE0 + EG_HDP_SURFACES * EG_HDP_SURFACE_STRIDE - 4:
+        s->regs[off >> 2] = val;
+        ati_hd5770_hdp_update(s);
+        return;
     case EG_SMC_SRAM_DATA:
         *smc_sram_word(s, true) = val;
         return;
@@ -715,6 +720,7 @@ static void ati_hd5770_reset_hold(Object *obj, ResetType type)
     s->ih_level = false;
     ati_hd5770_cp_reset(s);
     ati_hd5770_dce4_reset(s);
+    ati_hd5770_hdp_update(s);
     ati_hd5770_update_irq(s);
 }
 
@@ -768,8 +774,9 @@ static void ati_hd5770_realize(PCIDevice *dev, Error **errp)
      */
     bar_type = PCI_BASE_ADDRESS_SPACE_MEMORY |
                (s->bar64 ? PCI_BASE_ADDRESS_MEM_TYPE_64 : 0);
+    ati_hd5770_hdp_init(s);
     pci_register_bar(dev, 0, bar_type | PCI_BASE_ADDRESS_MEM_PREFETCH,
-                     &s->aper);
+                     &s->bar0);
     pci_register_bar(dev, 2, bar_type, &s->mmio);
     pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_config_set_interrupt_pin(dev->config, 1);
@@ -816,6 +823,7 @@ static int ati_hd5770_post_load(void *opaque, int version_id)
     s->force_redraw = true;
     s->lut_gen++;
     ati_hd5770_update_irq(s);
+    ati_hd5770_hdp_update(s);
     return 0;
 }
 

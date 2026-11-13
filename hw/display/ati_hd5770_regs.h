@@ -61,6 +61,15 @@
 #define EG_HDP_HOST_PATH_CNTL           0x2c00
 #define EG_HDP_NONSURFACE_BASE          0x2c04
 #define EG_HDP_NONSURFACE_INFO          0x2c08
+/* HDP surface n (0..5): registers at EG_HDP_SURFACE0 + n * 0x18 + 0..0x10 */
+#define EG_HDP_SURFACE0                 0x2c14
+#define EG_HDP_SURFACE_STRIDE           0x18
+#define EG_HDP_SURFACES                 6
+#define EG_HDP_SURF_LOWER               0x0     /* first byte >> 8 */
+#define EG_HDP_SURF_UPPER               0x4     /* last byte >> 8 */
+#define EG_HDP_SURF_BASE                0x8
+#define EG_HDP_SURF_INFO                0xc
+#define EG_HDP_SURF_SIZE                0x10
 #define EG_IH_RB_CNTL                   0x3e00
 #define EG_IH_RB_ENABLE                 (1u << 0)
 #define EG_IH_WPTR_WRITEBACK_ENABLE     (1u << 8)
