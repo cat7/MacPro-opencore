@@ -2680,8 +2680,12 @@ int whpx_vcpu_run(CPUState *cpu)
 
             ret = 1;
             break;
-        case WHvRunVpExitReasonNone:
         case WHvRunVpExitReasonUnrecoverableException:
+            /* triple fault: the machine resets */
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            ret = 1;
+            break;
+        case WHvRunVpExitReasonNone:
         case WHvRunVpExitReasonInvalidVpRegisterValue:
         case WHvRunVpExitReasonUnsupportedFeature:
         default:
