@@ -103,6 +103,17 @@ system_ss.add(when: 'CONFIG_ATI_R580_EDID', if_true: files('ati_r580_edid.c'))
 
 system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5770_dce4.c', 'ati_hd5770_atom.c'))
 
+# the HD 5770's synthetic AtomBIOS option ROM
+if have_system and config_all_devices.has_key('CONFIG_ATI_HD5770')
+  custom_target('ati-hd5770-atombios.rom',
+                output: 'ati-hd5770-atombios.rom',
+                input: files('ati_hd5770_atombios.py'),
+                command: [python, '@INPUT0@', '@OUTPUT@'],
+                build_by_default: true,
+                install: get_option('install_blobs'),
+                install_dir: qemu_datadir)
+endif
+
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
 
