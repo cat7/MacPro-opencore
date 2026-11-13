@@ -295,7 +295,7 @@ void ati_r580_edid_build(uint8_t edid[ATI_R580_EDID_SIZE], uint32_t prefx,
         b[72 + 3] = 0x10;   /* dummy descriptor */
     }
     put_ranges(b + 90, max_clock, max_hz, max_hfreq);
-    put_text(b + 108, 0xfc, "R580 Display");
+    put_text(b + 108, 0xfc, "QEMU Monitor");
     b[126] = 1;             /* one extension */
     checksum(b);
 
