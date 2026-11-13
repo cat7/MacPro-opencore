@@ -703,15 +703,22 @@ struct ATIR580State {
     /*
      * DEPTH WINDOW: a window over aperture 0 at [zw_lo, zw_hi), the real
      * extent of a depth buffer whose layout is not the linear one VRAM
-     * keeps, laid while a SURFACEn range holds the buffer's start. Guest
+     * keeps, laid while a SURFACEn range starts at the buffer. Guest
      * CPU accesses there reach the model's word for the same pixel (see
-     * ati_r580_zwin_update()). Derived from the registers; changed with
-     * the BQL and the engine both held.
+     * ati_r580_zwin_update()). Derived from the depth buffers drawn
+     * lately, most recent first, not from the live registers, which
+     * another context may have changed by the time the guest reads;
+     * changed with the BQL and the engine both held.
      */
+    struct {
+        uint32_t off, zp, aa;
+        bool z16;
+    } zw_buf[4];
     bool zw_on;
     MemoryRegion zw_io, zw_win;
     uint32_t zw_surf;           /* SURFACEn with a range: bit n */
     uint32_t zw_lo, zw_hi, zw_pitch;
+    unsigned zw_smp;            /* log2 of the samples a pixel */
     unsigned zw_miss;           /* untranslated layout last noted, + 1 */
     uint64_t zw_arms, zw_hits, zw_untr;
     uint64_t gl_zclr_px;        /* cleared on the GPU only */
@@ -1084,6 +1091,7 @@ bool ati_r580_cguard_set(ATIR580State *s, int k, uint32_t lo, uint32_t hi);
  * caller does not hold it; the engine must be this thread's or idle.
  */
 void ati_r580_zwin_update(ATIR580State *s);
+void ati_r580_zwin_note(ATIR580State *s);
 /* window k traps every guest CPU access to [cg_lo[k], cg_hi[k]) */
 static inline bool ati_r580_cguard_live(ATIR580State *s, int k)
 {

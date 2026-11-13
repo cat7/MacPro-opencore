@@ -4519,6 +4519,7 @@ static bool r300_setup_draw(ATIR580State *s, R300DrawState *d,
                 uint32_t rm = s->regs[R300_ZB_STENCILREFMASK >> 2];
 
                 s->zb.z_en = true;
+                ati_r580_zwin_note(s);
                 s->zb.z_test = zc & R300_ZB_Z_ENABLE;
                 s->zb.z_wr = s->zb.z_test && (zc & R300_ZB_ZWRITEENABLE);
                 s->zb.s_en = zc & R300_ZB_STENCIL_ENABLE;

@@ -1665,11 +1665,6 @@ void ati_r580_reg_write32(ATIR580State *s, uint32_t base,
             s->us_sig = 0;
         }
         s->regs[base >> 2] = val;
-        if (unlikely(s->zw_surf) &&
-            (base == R300_ZB_DEPTHOFFSET || base == R300_ZB_DEPTHPITCH ||
-             base == R300_ZB_FORMAT || base == R300_GB_AA_CONFIG)) {
-            ati_r580_zwin_update(s);
-        }
         break;
     }
 }
@@ -2265,30 +2260,33 @@ static const MemoryRegionOps ati_r580_cguard_ops = {
 };
 
 /*
- * DEPTH WINDOW. A 2-sample Z24S8 buffer, macro and micro tiled, is laid
- * out by the chip as 32 x 8 pixel tiles of 2 KiB in rows of pitch / 32
- * tiles, each of 2 x 2 pixel micro tiles of 32 bytes, sample 0 then
- * sample 1. Byte b of sample n of pixel (x, y) is at
- *   (y >> 3) * pitch * 64 + (x >> 5) * 2048 + ((x >> 2) & 7) * 256
- *   + ((y >> 1) & 3) * 64 + ((x >> 1) & 1) * 32 + n * 16 + (y & 1) * 8
- *   + (x & 1) * 4 + b
+ * DEPTH WINDOW. A Z24S8 buffer of 2^k samples (k = 1, 2), macro and
+ * micro tiled, is laid out by the chip in rows of 8 lines, each of
+ * 4 x 4 pixel blocks of 64 << k bytes, of 2 x 2 pixel quads of 16 << k
+ * bytes. Byte b of sample n of pixel (x, y), xN and yN bit N of x and y:
+ *   (y >> 3) * pitch * (32 << k) + (x >> 2) * (128 << k) + y2 * (64 << k)
+ *   + (y1 ^ (k == 2 && x2)) * (32 << k) + x1 * (16 << k) + n * 16
+ *   + y0 * 8 + x0 * 4 + b
  * VRAM keeps one word a pixel for all samples, linear at the same
- * offset. Other layouts that differ from the linear one are noted as
- * gaps and not mapped.
+ * offset. The window is laid while a SURFACEn range starts at a depth
+ * buffer drawn lately. Other layouts that differ from the linear one
+ * are noted as gaps and not mapped.
  */
 static uint32_t ati_r580_zwin_map(ATIR580State *s, uint32_t off)
 {
-    uint32_t rel = off - s->zw_lo, row = s->zw_pitch * 64;
-    uint32_t t = rel % row, u = t & 2047, x, y;
+    unsigned k = s->zw_smp;
+    uint32_t rel = off - s->zw_lo, row = s->zw_pitch * (32u << k);
+    uint32_t t = rel % row, u = t & ((128u << k) - 1), q = t >> (7 + k);
+    uint32_t x, y;
 
-    x = t / 2048 * 32 + ((u >> 8) & 7) * 4 + ((u >> 5) & 1) * 2 +
-        ((u >> 2) & 1);
-    y = rel / row * 8 + ((u >> 6) & 3) * 2 + ((u >> 3) & 1);
+    x = q * 4 + ((u >> (4 + k)) & 1) * 2 + ((u >> 2) & 1);
+    y = rel / row * 8 + ((u >> (6 + k)) & 1) * 4 +
+        (((u >> (5 + k)) ^ (k == 2 ? q : 0)) & 1) * 2 + ((u >> 3) & 1);
     return s->zw_lo + (y * s->zw_pitch + x) * 4 + (u & 3);
 }
 
 static void ati_r580_zwin_set(ATIR580State *s, uint32_t lo, uint32_t hi,
-                              uint32_t pitch)
+                              uint32_t pitch, unsigned smp)
 {
     uint32_t pg = qemu_target_page_size();
     bool bql = !bql_locked();
@@ -2312,6 +2310,7 @@ static void ati_r580_zwin_set(ATIR580State *s, uint32_t lo, uint32_t hi,
     s->zw_lo = lo;
     s->zw_hi = hi;
     s->zw_pitch = pitch;
+    s->zw_smp = smp;
     if (bql) {
         bql_unlock();
     }
@@ -2319,13 +2318,8 @@ static void ati_r580_zwin_set(ATIR580State *s, uint32_t lo, uint32_t hi,
 
 void ati_r580_zwin_update(ATIR580State *s)
 {
-    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
-    uint32_t pitch = zp & 0x3ffc, micro = (zp >> 17) & 3;
-    uint32_t aa = s->regs[R300_GB_AA_CONFIG >> 2] & 7;
-    bool macro = zp & (1u << 16);
-    bool z16 = (s->regs[R300_ZB_FORMAT >> 2] & 15) == R300_ZB_FORMAT_16;
-    uint32_t zoff, lo = 0, hi = 0, surf = 0;
-    unsigned miss = 0, n;
+    uint32_t lo = 0, hi = 0, surf = 0, pitch = 0;
+    unsigned miss = 0, smp = 0, n, k;
 
     for (n = 0; n < 8; n++) {
         uint32_t r = (R580_SURFACE0_LOWER_BOUND >> 2) +
@@ -2336,26 +2330,33 @@ void ati_r580_zwin_update(ATIR580State *s)
         }
     }
     s->zw_surf = surf;
-    if (surf && pitch && (aa & R300_AA_ENABLE || macro || micro) &&
-        ati_r580_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
-                            &zoff)) {
+    for (k = 0; surf && k < ARRAY_SIZE(s->zw_buf) && !hi && !miss; k++) {
+        uint32_t zoff = s->zw_buf[k].off, zp = s->zw_buf[k].zp;
+        uint32_t aa = s->zw_buf[k].aa, micro = (zp >> 17) & 3;
+        bool macro = zp & (1u << 16), z16 = s->zw_buf[k].z16;
+
+        pitch = zp & 0x3ffc;
+        if (!pitch || !(aa & R300_AA_ENABLE || macro || micro)) {
+            continue;
+        }
         for (n = 0; n < 8; n++) {
             uint32_t r = (R580_SURFACE0_LOWER_BOUND >> 2) +
                          n * (R580_SURFACE_STRIDE >> 2);
             uint64_t end;
 
-            if (!(surf & (1u << n)) || zoff < s->regs[r] ||
-                zoff > s->regs[r + 1]) {
+            if (!(surf & (1u << n)) || zoff != s->regs[r]) {
                 continue;
             }
-            if (aa != R300_AA_ENABLE || z16 || !macro || micro != 1 ||
-                pitch % 32) {
+            /* GB_AA_CONFIG 1: 2 samples, 5: 4 samples */
+            smp = aa == 1 ? 1 : aa == 5 ? 2 : 0;
+            if (!smp || z16 || !macro || micro != 1 || pitch % 32) {
                 miss = 1 + (aa | macro << 3 | micro << 4 | z16 << 6);
                 break;
             }
             end = MIN((uint64_t)s->regs[r + 1] + 1, ATI_R580_VRAM_SIZE);
             lo = zoff;
-            hi = zoff + (end - zoff) / (pitch * 64) * (pitch * 64);
+            hi = zoff + (end - zoff) / (pitch * (32u << smp)) *
+                        (pitch * (32u << smp));
             break;
         }
     }
@@ -2365,8 +2366,41 @@ void ati_r580_zwin_update(ATIR580State *s)
     }
     s->zw_miss = miss;
     pitch = hi > lo ? pitch : 0;
-    if (lo != s->zw_lo || hi != s->zw_hi || pitch != s->zw_pitch) {
-        ati_r580_zwin_set(s, lo, hi, pitch);
+    smp = hi > lo ? smp : 0;
+    if (lo != s->zw_lo || hi != s->zw_hi || pitch != s->zw_pitch ||
+        smp != s->zw_smp) {
+        ati_r580_zwin_set(s, lo, hi, pitch, smp);
+    }
+}
+
+/* On the engine: a draw or clear used the depth buffer the registers name */
+void ati_r580_zwin_note(ATIR580State *s)
+{
+    uint32_t zoff, zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    uint32_t aa = s->regs[R300_GB_AA_CONFIG >> 2] & 7;
+    bool z16 = (s->regs[R300_ZB_FORMAT >> 2] & 15) == R300_ZB_FORMAT_16;
+    unsigned k;
+
+    if (!ati_r580_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
+                             &zoff)) {
+        return;
+    }
+    if (s->zw_buf[0].off == zoff && s->zw_buf[0].zp == zp &&
+        s->zw_buf[0].aa == aa && s->zw_buf[0].z16 == z16) {
+        return;
+    }
+    for (k = 0; k < ARRAY_SIZE(s->zw_buf) - 1; k++) {
+        if (s->zw_buf[k].off == zoff) {
+            break;
+        }
+    }
+    memmove(&s->zw_buf[1], &s->zw_buf[0], k * sizeof(s->zw_buf[0]));
+    s->zw_buf[0].off = zoff;
+    s->zw_buf[0].zp = zp;
+    s->zw_buf[0].aa = aa;
+    s->zw_buf[0].z16 = z16;
+    if (s->zw_surf) {
+        ati_r580_zwin_update(s);
     }
 }
 
@@ -2470,6 +2504,7 @@ static void ati_r580_reset_hold(Object *obj, ResetType type)
         ati_r580_cguard_set(s, k, 0, 0);
     }
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->zw_buf, 0, sizeof(s->zw_buf));
     ati_r580_zwin_update(s);
     ati_r580_r5xx_reset(s);
     ati_r580_r5gpu_reset(s);

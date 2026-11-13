@@ -1738,6 +1738,9 @@ static void r5_draw(ATIR580State *s, uint32_t vf, const VtxSource *src,
             break;
         }
     }
+    if (g->raster.rt.zbuf_enabled && (REG(s, ZB_CNTL) & 3)) {
+        ati_r580_zwin_note(s);
+    }
     g->last_dst = REG(s, RB3D_COLOROFFSET0);
     g->last_tex0 = REG(s, TX_OFFSET_0);
     g->raster.pixels_in = g->raster.pixels_out = g->raster.quads = 0;
@@ -1987,6 +1990,7 @@ void ati_r580_r5xx_clear_zmask(ATIR580State *s, uint32_t first, uint32_t n,
 
     r5_raster_regs(s, &r->regs);
     r->mem = &g->m[0].mem;
+    ati_r580_zwin_note(s);
     if (r5xx_raster_zmask_area(r, n, &l, &x1, &y1) &&
         ati_r580_mc_to_vram(s, l.gpu_addr, &off)) {
         ati_r580_r5gpu_zclear(s, off, l.pitch_bytes, l.bpp, x1, y1);
