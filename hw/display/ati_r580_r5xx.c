@@ -2019,6 +2019,10 @@ char *ati_r580_r5xx_stats(ATIR580State *s)
 
         g_string_append(o, gs);
     }
+    g_string_append_printf(o, "depth window: laid %" PRIu64 ", guest CPU "
+                           "accesses %" PRIu64 ", untranslated layouts "
+                           "%" PRIu64 "\n", s->zw_arms, s->zw_hits,
+                           s->zw_untr);
     g_string_append(o, "last draws (vf n dst cpitch blend ablend outfmt "
                        "txen tx0:f0/f1/f2/off/filt0 us_addr us[0] us[3] "
                        "scissor pixels):\n");

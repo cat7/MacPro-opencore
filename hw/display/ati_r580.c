@@ -1399,6 +1399,7 @@ void ati_r580_reg_write32(ATIR580State *s, uint32_t base,
     case R580_SURFACE0_LOWER_BOUND ... R580_SURFACE7_INFO:
         s->regs[base >> 2] = val;
         trace_ati_r580_surface(ati_r580_reg_name(base), val);
+        ati_r580_zwin_update(s);
         break;
     case R580_PM4_FIFO_DATA_EVEN ... R580_PM4_FIFO_APER_END:
         /*
@@ -1664,6 +1665,11 @@ void ati_r580_reg_write32(ATIR580State *s, uint32_t base,
             s->us_sig = 0;
         }
         s->regs[base >> 2] = val;
+        if (unlikely(s->zw_surf) &&
+            (base == R300_ZB_DEPTHOFFSET || base == R300_ZB_DEPTHPITCH ||
+             base == R300_ZB_FORMAT || base == R300_GB_AA_CONFIG)) {
+            ati_r580_zwin_update(s);
+        }
         break;
     }
 }
@@ -2258,6 +2264,190 @@ static const MemoryRegionOps ati_r580_cguard_ops = {
     },
 };
 
+/*
+ * DEPTH WINDOW. A 2-sample Z24S8 buffer, macro and micro tiled, is laid
+ * out by the chip as 32 x 8 pixel tiles of 2 KiB in rows of pitch / 32
+ * tiles, each of 2 x 2 pixel micro tiles of 32 bytes, sample 0 then
+ * sample 1. Byte b of sample n of pixel (x, y) is at
+ *   (y >> 3) * pitch * 64 + (x >> 5) * 2048 + ((x >> 2) & 7) * 256
+ *   + ((y >> 1) & 3) * 64 + ((x >> 1) & 1) * 32 + n * 16 + (y & 1) * 8
+ *   + (x & 1) * 4 + b
+ * VRAM keeps one word a pixel for all samples, linear at the same
+ * offset. Other layouts that differ from the linear one are noted as
+ * gaps and not mapped.
+ */
+static uint32_t ati_r580_zwin_map(ATIR580State *s, uint32_t off)
+{
+    uint32_t rel = off - s->zw_lo, row = s->zw_pitch * 64;
+    uint32_t t = rel % row, u = t & 2047, x, y;
+
+    x = t / 2048 * 32 + ((u >> 8) & 7) * 4 + ((u >> 5) & 1) * 2 +
+        ((u >> 2) & 1);
+    y = rel / row * 8 + ((u >> 6) & 3) * 2 + ((u >> 3) & 1);
+    return s->zw_lo + (y * s->zw_pitch + x) * 4 + (u & 3);
+}
+
+static void ati_r580_zwin_set(ATIR580State *s, uint32_t lo, uint32_t hi,
+                              uint32_t pitch)
+{
+    uint32_t pg = qemu_target_page_size();
+    bool bql = !bql_locked();
+
+    if (bql) {
+        bql_lock();
+    }
+    memory_region_transaction_begin();
+    memory_region_set_enabled(&s->zw_win, false);
+    if (hi > lo) {
+        uint32_t a = lo & ~(pg - 1), b = ROUND_UP(hi, pg);
+
+        memory_region_set_alias_offset(&s->zw_win, a);
+        memory_region_set_size(&s->zw_win, b - a);
+        memory_region_set_address(&s->zw_win, a);
+        memory_region_set_enabled(&s->zw_win, true);
+        s->zw_arms++;
+    }
+    memory_region_transaction_commit();
+    s->zw_on = hi > lo;
+    s->zw_lo = lo;
+    s->zw_hi = hi;
+    s->zw_pitch = pitch;
+    if (bql) {
+        bql_unlock();
+    }
+}
+
+void ati_r580_zwin_update(ATIR580State *s)
+{
+    uint32_t zp = s->regs[R300_ZB_DEPTHPITCH >> 2];
+    uint32_t pitch = zp & 0x3ffc, micro = (zp >> 17) & 3;
+    uint32_t aa = s->regs[R300_GB_AA_CONFIG >> 2] & 7;
+    bool macro = zp & (1u << 16);
+    bool z16 = (s->regs[R300_ZB_FORMAT >> 2] & 15) == R300_ZB_FORMAT_16;
+    uint32_t zoff, lo = 0, hi = 0, surf = 0;
+    unsigned miss = 0, n;
+
+    for (n = 0; n < 8; n++) {
+        uint32_t r = (R580_SURFACE0_LOWER_BOUND >> 2) +
+                     n * (R580_SURFACE_STRIDE >> 2);
+
+        if (s->regs[r + 1] > s->regs[r]) {
+            surf |= 1u << n;
+        }
+    }
+    s->zw_surf = surf;
+    if (surf && pitch && (aa & R300_AA_ENABLE || macro || micro) &&
+        ati_r580_mc_to_vram(s, s->regs[R300_ZB_DEPTHOFFSET >> 2] & ~0x1fu,
+                            &zoff)) {
+        for (n = 0; n < 8; n++) {
+            uint32_t r = (R580_SURFACE0_LOWER_BOUND >> 2) +
+                         n * (R580_SURFACE_STRIDE >> 2);
+            uint64_t end;
+
+            if (!(surf & (1u << n)) || zoff < s->regs[r] ||
+                zoff > s->regs[r + 1]) {
+                continue;
+            }
+            if (aa != R300_AA_ENABLE || z16 || !macro || micro != 1 ||
+                pitch % 32) {
+                miss = 1 + (aa | macro << 3 | micro << 4 | z16 << 6);
+                break;
+            }
+            end = MIN((uint64_t)s->regs[r + 1] + 1, ATI_R580_VRAM_SIZE);
+            lo = zoff;
+            hi = zoff + (end - zoff) / (pitch * 64) * (pitch * 64);
+            break;
+        }
+    }
+    if (miss && miss != s->zw_miss) {
+        ati_r580_note_gap(s, R580_GAP_ZB_LAYOUT, miss - 1);
+        s->zw_untr++;
+    }
+    s->zw_miss = miss;
+    pitch = hi > lo ? pitch : 0;
+    if (lo != s->zw_lo || hi != s->zw_hi || pitch != s->zw_pitch) {
+        ati_r580_zwin_set(s, lo, hi, pitch);
+    }
+}
+
+/*
+ * The BQL is held. Drawn depth newer than VRAM goes back first, and a
+ * store makes what was decoded from the word stale.
+ */
+static uint64_t ati_r580_zwin_access(ATIR580State *s, uint32_t off,
+                                     unsigned size, uint64_t data, bool wr)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t a[8], lo = UINT32_MAX, hi = 0;
+    uint64_t val = 0;
+    unsigned i;
+
+    if (s->lockless) {
+        ati_r580_engine_claim(s);
+    } else {
+        ati_r580_engine_wait(s);
+    }
+    for (i = 0; i < size; i++) {
+        a[i] = off + i;
+        if (s->zw_on && a[i] >= s->zw_lo && a[i] < s->zw_hi) {
+            a[i] = ati_r580_zwin_map(s, a[i]);
+        }
+        lo = MIN(lo, a[i]);
+        hi = MAX(hi, a[i] + 1);
+    }
+    s->zw_hits++;
+    ati_r580_gl_touch(s, lo, hi - lo);
+    if (wr) {
+        ati_r580_gl_dirty(s, lo, hi - lo);
+        for (i = 0; i < size; i++) {
+            vram[a[i]] = data >> (8 * i);
+        }
+        memory_region_set_dirty(&s->vram, lo & ~3u,
+                                ((hi + 3) & ~3u) - (lo & ~3u));
+    } else {
+        for (i = 0; i < size; i++) {
+            val |= (uint64_t)vram[a[i]] << (8 * i);
+        }
+    }
+    if (s->lockless) {
+        ati_r580_engine_unclaim(s, false);
+    }
+    return val;
+}
+
+static uint64_t ati_r580_zwin_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr + size > ATI_R580_VRAM_SIZE) {
+        return 0;
+    }
+    return ati_r580_zwin_access(opaque, addr, size, 0, false);
+}
+
+static void ati_r580_zwin_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    if (addr + size > ATI_R580_VRAM_SIZE) {
+        return;
+    }
+    ati_r580_zwin_access(opaque, addr, size, data, true);
+}
+
+static const MemoryRegionOps ati_r580_zwin_ops = {
+    .read = ati_r580_zwin_read,
+    .write = ati_r580_zwin_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
 /* ---------------------------------------------------------------- */
 
 static void ati_r580_reset_hold(Object *obj, ResetType type)
@@ -2280,6 +2470,7 @@ static void ati_r580_reset_hold(Object *obj, ResetType type)
         ati_r580_cguard_set(s, k, 0, 0);
     }
     memset(s->regs, 0, sizeof(s->regs));
+    ati_r580_zwin_update(s);
     ati_r580_r5xx_reset(s);
     ati_r580_r5gpu_reset(s);
     memset(s->plls, 0, sizeof(s->plls));
@@ -2573,6 +2764,13 @@ static void ati_r580_realize(PCIDevice *dev, Error **errp)
         }
         s->cg_ready = true;
     }
+    memory_region_init_io(&s->zw_io, obj, &ati_r580_zwin_ops, s,
+                          "ati-r580-zwin", ATI_R580_VRAM_SIZE);
+    memory_region_init_alias(&s->zw_win, obj, "ati-r580-zwin-win",
+                             &s->zw_io, 0, qemu_target_page_size());
+    memory_region_set_enabled(&s->zw_win, false);
+    /* above the guards: it writes back what they would */
+    memory_region_add_subregion_overlap(&s->aper, 0, &s->zw_win, 5);
 
     memory_region_init_io(&s->mmio, obj, &ati_r580_mmio_ops, s,
                           "ati-r580-mmio", ATI_R580_MMIO_SIZE);
@@ -2683,6 +2881,7 @@ static int ati_r580_post_load(void *opaque, int version_id)
 
     s->force_redraw = true;
     s->lut_gen++;
+    ati_r580_zwin_update(s);
     ati_r580_update_irq(s);
     return 0;
 }
@@ -2823,6 +3022,7 @@ static const char *const ati_r580_gap_names[R580_GAP_MAX] = {
     [R580_GAP_VS_ADDR_MODE] = "vertex operand address mode",
     [R580_GAP_UCP]          = "user clip planes",
     [R580_GAP_ZPASS]        = "occlusion counter use",
+    [R580_GAP_ZB_LAYOUT]    = "depth layout through the aperture",
 };
 
 void ati_r580_note_gap(ATIR580State *s, ATIR580GapKind kind, unsigned idx)

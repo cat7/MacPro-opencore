@@ -85,6 +85,7 @@ typedef enum ATIR580GapKind {
     R580_GAP_VS_ADDR_MODE,   /* PVS operand addressing mode not modelled */
     R580_GAP_UCP,            /* VAP_CLIP_CNTL user clip planes enabled */
     R580_GAP_ZPASS,          /* occlusion counter use not modelled */
+    R580_GAP_ZB_LAYOUT,      /* depth layout the aperture does not map */
     R580_GAP_MAX
 } ATIR580GapKind;
 
@@ -699,6 +700,20 @@ struct ATIR580State {
      */
     uint32_t cg_gen[ATI_R580_CGUARDS], cg_live[ATI_R580_CGUARDS];
     unsigned cg_acks[ATI_R580_CGUARDS], cg_need[ATI_R580_CGUARDS];
+    /*
+     * DEPTH WINDOW: a window over aperture 0 at [zw_lo, zw_hi), the real
+     * extent of a depth buffer whose layout is not the linear one VRAM
+     * keeps, laid while a SURFACEn range holds the buffer's start. Guest
+     * CPU accesses there reach the model's word for the same pixel (see
+     * ati_r580_zwin_update()). Derived from the registers; changed with
+     * the BQL and the engine both held.
+     */
+    bool zw_on;
+    MemoryRegion zw_io, zw_win;
+    uint32_t zw_surf;           /* SURFACEn with a range: bit n */
+    uint32_t zw_lo, zw_hi, zw_pitch;
+    unsigned zw_miss;           /* untranslated layout last noted, + 1 */
+    uint64_t zw_arms, zw_hits, zw_untr;
     uint64_t gl_zclr_px;        /* cleared on the GPU only */
     /* gl=verify over the depth buffer, classed as the colour is */
     uint64_t gl_vz_draws, gl_vz_px, gl_vz_diff, gl_vz_cover_px, gl_vz_cover;
@@ -1062,6 +1077,13 @@ bool ati_r580_gl_zguard(ATIR580State *s, uint32_t off, unsigned len);
  * thread's. False when no window can be laid.
  */
 bool ati_r580_cguard_set(ATIR580State *s, int k, uint32_t lo, uint32_t hi);
+
+/*
+ * The depth window again after a write to SURFACEn or to the depth
+ * buffer's offset, pitch, format or GB_AA_CONFIG. Takes the BQL if the
+ * caller does not hold it; the engine must be this thread's or idle.
+ */
+void ati_r580_zwin_update(ATIR580State *s);
 /* window k traps every guest CPU access to [cg_lo[k], cg_hi[k]) */
 static inline bool ati_r580_cguard_live(ATIR580State *s, int k)
 {
