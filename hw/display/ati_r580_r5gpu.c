@@ -617,8 +617,8 @@ static bool r5g_surf_adopt(ATIR580R5Gpu *g, R5GSurf *n, const R5GSurf *o)
     n->dx0 = x0;
     n->dy0 = y0;
     n->dx1 = x1;
-    r5g_bounds_grow(g, n);
     n->dy1 = y1;
+    r5g_bounds_grow(g, n);
     g->adopted++;
     return true;
 }
@@ -1768,8 +1768,8 @@ static int r5g_resolve(ATIR580R5Gpu *g, const R5GpuIn *in)
     rsf->dx0 = rsf->dx1 > rsf->dx0 ? MIN(rsf->dx0, bx0) : bx0;
     rsf->dy0 = rsf->dy1 > rsf->dy0 ? MIN(rsf->dy0, by0) : by0;
     rsf->dx1 = MAX(rsf->dx1, bx1);
-    r5g_bounds_grow(g, rsf);
     rsf->dy1 = MAX(rsf->dy1, by1);
+    r5g_bounds_grow(g, rsf);
     r5g_guard_arm(g, rsf);
     r5g_invalidate(g, rsf->off + (uint64_t)by0 * rsf->pitch,
                    rsf->off + (uint64_t)by1 * rsf->pitch, rsf);
@@ -2505,8 +2505,8 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
     sf->dx0 = sf->dx1 > sf->dx0 ? MIN(sf->dx0, bx0) : bx0;
     sf->dy0 = sf->dy1 > sf->dy0 ? MIN(sf->dy0, by0) : by0;
     sf->dx1 = MAX(sf->dx1, bx1);
-    r5g_bounds_grow(g, sf);
     sf->dy1 = MAX(sf->dy1, by1);
+    r5g_bounds_grow(g, sf);
     /* laid now, so that it is in force by the next release */
     r5g_guard_arm(g, sf);
     /* what was decoded from these bytes is stale now */
@@ -2516,8 +2516,8 @@ int ati_r580_r5gpu_draw(ATIR580State *s, const R5GpuIn *in)
         zsf->dx0 = zsf->dx1 > zsf->dx0 ? MIN(zsf->dx0, bx0) : bx0;
         zsf->dy0 = zsf->dy1 > zsf->dy0 ? MIN(zsf->dy0, by0) : by0;
         zsf->dx1 = MAX(zsf->dx1, bx1);
-        r5g_bounds_grow(g, zsf);
         zsf->dy1 = MAX(zsf->dy1, by1);
+        r5g_bounds_grow(g, zsf);
         r5g_guard_arm(g, zsf);
         r5g_invalidate(g, zsf->off + (uint64_t)by0 * zsf->pitch,
                        zsf->off + (uint64_t)by1 * zsf->pitch, zsf);
