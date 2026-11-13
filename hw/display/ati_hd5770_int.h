@@ -29,6 +29,7 @@
 #include "ui/console.h"
 #include "hw/display/edid.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 #include "ati_r580_edid.h"
 #include "ati_hd5770_gfx.h"
@@ -217,6 +218,20 @@ struct ATIHD5770State {
     uint32_t *cp_pkt;
     uint64_t gpu_clock_capture;
     QEMUTimer *cp_timer;        /* re-polls stalled waits */
+    /*
+     * Command processor thread: see ENGINE THREAD in ati_hd5770_cp.c.
+     * eng_kick, eng_busy, eng_quit under eng_lock; eng_hold under the BQL.
+     */
+    bool cp_thread;             /* property */
+    bool eng_on;
+    QemuThread eng_thread;
+    QemuMutex eng_lock;
+    QemuCond eng_cond, eng_idle_cond;
+    bool eng_kick, eng_busy, eng_quit;
+    bool eng_hold;
+    VMChangeStateEntry *eng_vmse;
+    uint64_t eng_runs, eng_waits, eng_draw_ns;
+    uint64_t redraws;           /* scanout conversions */
     HD5770CPStats cp;
     HD5770Census census_cb0, census_ps, census_vs, census_prim;
     uint64_t census_ctx_writes[1024];

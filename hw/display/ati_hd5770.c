@@ -658,6 +658,7 @@ static bool ati_hd5770_update_display(void *opaque)
     s->mode = mode;
     if (redraw) {
         s->force_redraw = false;
+        s->redraws++;
         ati_hd5770_draw(s, ds, &mode);
         ati_hd5770_dce4_cursor_apply(s);
         qemu_console_update_full(s->con);
@@ -904,6 +905,7 @@ static const Property ati_hd5770_properties[] = {
     DEFINE_PROP_BOOL("bar64", ATIHD5770State, bar64, false),
     DEFINE_PROP_BOOL("msi", ATIHD5770State, msi, true),
     DEFINE_PROP_BOOL("accel", ATIHD5770State, accel, false),
+    DEFINE_PROP_BOOL("cp-thread", ATIHD5770State, cp_thread, true),
     DEFINE_PROP_UINT32("device-id", ATIHD5770State, device_id,
                        PCI_DEVICE_ID_ATI_JUNIPER_XT),
     DEFINE_PROP_UINT32("subsys-vendor-id", ATIHD5770State, subsys_vendor_id,

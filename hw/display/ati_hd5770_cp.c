@@ -3,8 +3,9 @@
  *
  * The microcode the driver uploads (PFP, ME, RLC) is stored, not run;
  * the CP is modelled at packet level. A CP_RB_WPTR write runs the ring
- * from the read pointer to the write pointer on the calling thread, with
- * the BQL: type-0 packets and SET_CONFIG_REG write registers, the other
+ * from the read pointer to the write pointer (on the command processor
+ * thread, see ENGINE THREAD below, or with cp-thread=off on the calling
+ * thread), with the BQL: type-0 packets and SET_CONFIG_REG write registers, the other
  * SET_* packets fill the register file at 0x28000-0x3ffff (and its
  * shadow in memory when CONTEXT_CONTROL enables it), LOAD_* fill it from
  * memory, indirect buffers nest two deep. Fences, timestamps, memory
@@ -25,6 +26,9 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
+#include "qemu/rcu.h"
+#include "system/runstate.h"
 #include "hw/pci/pci_device.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_regs.h"
@@ -107,6 +111,9 @@ static const bool op_known[256] = {
     [OP_SET_RESOURCE_OFFSET] = true, [OP_SET_ALU_CONST_VS] = true,
     [OP_SET_ALU_CONST_DI] = true, [OP_SET_APPEND_CNT] = true,
 };
+
+/* this thread is running a command stream */
+static __thread bool cp_in_stream;
 
 static bool op_is_draw(unsigned op)
 {
@@ -398,7 +405,17 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         s->cp.draws++;
         ati_hd5770_census_add(&s->census_prim,
                               s->regs[EG_VGT_PRIMITIVE_TYPE >> 2] & 0x3f);
-        hd5770_gfx_draw(&s->gfx3d, b, n);
+        if (s->eng_on) {
+            int64_t t0 = get_clock();
+
+            /* the vCPUs and the main loop go on meanwhile */
+            bql_unlock();
+            hd5770_gfx_draw(&s->gfx3d, b, n);
+            bql_lock();
+            s->eng_draw_ns += get_clock() - t0;
+        } else {
+            hd5770_gfx_draw(&s->gfx3d, b, n);
+        }
         ati_hd5770_mc_unmap_all(s);
         return PKT_DONE;
     }
@@ -692,6 +709,7 @@ static void cp_run(ATIHD5770State *s)
         return;
     }
     s->cp_running = true;
+    cp_in_stream = true;
     s->cp_stalled = false;
     size = ring_dwords(s);
     mask = size - 1;
@@ -703,6 +721,10 @@ static void cp_run(ATIHD5770State *s)
         uint32_t avail, h, n, skip = 0;
         int r;
 
+        if (s->eng_hold) {
+            /* stopped between two packets; a kick resumes */
+            break;
+        }
         if (s->cp_depth) {
             r = ib_step(s);
             if (r == PKT_STALL) {
@@ -753,10 +775,113 @@ static void cp_run(ATIHD5770State *s)
         rptr_writeback(s);
     }
     s->cp_running = false;
+    cp_in_stream = false;
     if (s->cp_stalled) {
         s->cp.stalls++;
         timer_mod(s->cp_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                   CP_POLL_NS);
+    }
+}
+
+/*
+ * ENGINE THREAD (cp-thread=on). The ring runs on a thread of its own: a
+ * kick (CP_RB_WPTR, ME_CNTL, the poll of a stalled wait) only wakes it.
+ * The thread takes the BQL to run the ring and drops it for the length
+ * of each draw, so packets and their side effects -- registers, memory
+ * writes, fences, interrupts -- happen in ring order with the BQL held,
+ * and a fence written after a draw is written once the draw is in
+ * memory. GRBM_STATUS and CP_STAT read busy until the thread has run out
+ * of work.
+ *
+ * eng_hold (BQL) stops the ring at the next packet boundary: set while
+ * the VM is stopped and for a reset, it leaves read pointer and indirect
+ * buffer state consistent for migration. cp_wait_idle() waits for the
+ * thread with the BQL released.
+ *
+ * LOCK ORDER: BQL -> eng_lock; the thread holds no eng_lock while it
+ * takes the BQL.
+ */
+static void cp_kick(ATIHD5770State *s)
+{
+    if (!s->eng_on) {
+        cp_run(s);
+        return;
+    }
+    qemu_mutex_lock(&s->eng_lock);
+    s->eng_kick = true;
+    qatomic_set(&s->eng_busy, true);
+    qemu_cond_signal(&s->eng_cond);
+    qemu_mutex_unlock(&s->eng_lock);
+}
+
+/* with the BQL, which is released while waiting */
+static void cp_wait_idle(ATIHD5770State *s)
+{
+    if (!s->eng_on || qemu_thread_is_self(&s->eng_thread)) {
+        return;
+    }
+    qemu_mutex_lock(&s->eng_lock);
+    while (s->eng_busy) {
+        qemu_mutex_unlock(&s->eng_lock);
+        bql_unlock();
+        qemu_mutex_lock(&s->eng_lock);
+        while (s->eng_busy) {
+            qemu_cond_wait(&s->eng_idle_cond, &s->eng_lock);
+        }
+        qemu_mutex_unlock(&s->eng_lock);
+        bql_lock();
+        qemu_mutex_lock(&s->eng_lock);
+        s->eng_waits++;
+    }
+    qemu_mutex_unlock(&s->eng_lock);
+}
+
+static void *cp_thread_fn(void *opaque)
+{
+    ATIHD5770State *s = opaque;
+
+    rcu_register_thread();
+    qemu_mutex_lock(&s->eng_lock);
+    for (;;) {
+        while (!s->eng_kick && !s->eng_quit) {
+            qemu_cond_wait(&s->eng_cond, &s->eng_lock);
+        }
+        if (s->eng_quit) {
+            break;
+        }
+        s->eng_kick = false;
+        qemu_mutex_unlock(&s->eng_lock);
+
+        bql_lock();
+        if (!s->eng_hold) {
+            cp_run(s);
+            s->eng_runs++;
+        }
+        bql_unlock();
+
+        qemu_mutex_lock(&s->eng_lock);
+        if (!s->eng_kick) {
+            qatomic_set(&s->eng_busy, false);
+            qemu_cond_broadcast(&s->eng_idle_cond);
+        }
+    }
+    qatomic_set(&s->eng_busy, false);
+    qemu_cond_broadcast(&s->eng_idle_cond);
+    qemu_mutex_unlock(&s->eng_lock);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void cp_vm_state(void *opaque, bool running, RunState state)
+{
+    ATIHD5770State *s = opaque;
+
+    if (running) {
+        s->eng_hold = false;
+        cp_kick(s);
+    } else {
+        s->eng_hold = true;
+        cp_wait_idle(s);
     }
 }
 
@@ -765,7 +890,7 @@ static void cp_timer_cb(void *opaque)
     ATIHD5770State *s = opaque;
 
     if (s->cp_stalled) {
-        cp_run(s);
+        cp_kick(s);
     }
     ati_hd5770_dma_run(s);
 }
@@ -788,10 +913,11 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
         *val = s->cp_rptr;
         return true;
     case EG_GRBM_STATUS:
-        *val = s->cp_stalled ? EG_GRBM_STATUS_GUI_ACTIVE | EG_GRBM_CP_BUSY : 0;
+        *val = s->cp_stalled || qatomic_read(&s->eng_busy)
+               ? EG_GRBM_STATUS_GUI_ACTIVE | EG_GRBM_CP_BUSY : 0;
         return true;
     case EG_CP_STAT:
-        *val = s->cp_stalled ? 0x80000000u : 0;
+        *val = s->cp_stalled || qatomic_read(&s->eng_busy) ? 0x80000000u : 0;
         return true;
     case EG_CP_COHER_STATUS:
         *val = 0;
@@ -839,7 +965,7 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     case EG_CP_RB_WPTR:
         s->regs[off >> 2] = val;
         s->cp.kicks++;
-        cp_run(s);
+        cp_kick(s);
         return true;
     case EG_CP_RB_RPTR_WR:
         s->regs[off >> 2] = val;
@@ -851,7 +977,7 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     case EG_CP_ME_CNTL:
         s->regs[off >> 2] = val;
         if (!(val & EG_CP_ME_HALT)) {
-            cp_run(s);
+            cp_kick(s);
         }
         return true;
     case EG_GRBM_SOFT_RESET:
@@ -864,7 +990,7 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         }
         return true;
     case EG_CP_INT_STATUS:
-        if (s->cp_running) {
+        if (cp_in_stream) {
             /* from a command stream: raise the interrupt the bit names */
             if (val & EG_CP_RB_INT) {
                 cp_irq(s, EG_CP_RB_INT, HD5770_IH_SRC_CP_RB);
@@ -983,7 +1109,7 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         " load %" PRIu64 " shadow %" PRIu64 "\n"
         "ucode dwords: pfp %" PRIu64 " me %" PRIu64 " rlc %" PRIu64 "\n"
         "MC: gart %" PRIu64 " invalid %" PRIu64 " tlb_inval %" PRIu64 "\n"
-        "scratch:",
+        "engine:",
         c->kicks, c->dwords, c->type0, c->type2, c->type3, c->ibs,
         s->regs[EG_CP_RB_BASE >> 2], s->regs[EG_CP_RB_CNTL >> 2],
         s->cp_rptr, s->regs[EG_CP_RB_WPTR >> 2], s->cp_depth, s->cp_stalled,
@@ -993,6 +1119,11 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         c->skipped, c->resets, c->draws, c->type0_regs, c->set_regs,
         c->load_regs, c->shadow_writes, c->ucode_pfp, c->ucode_me,
         c->ucode_rlc, s->mc.gart, s->mc.gart_invalid, s->mc.tlb_inval);
+    g_string_append_printf(out, " thread %s runs %" PRIu64 " idle waits %"
+                           PRIu64 " draw ms %" PRIu64 " scanout redraws %"
+                           PRIu64 "\nscratch:", s->eng_on ? "on" : "off",
+                           s->eng_runs, s->eng_waits, s->eng_draw_ns / 1000000,
+                           s->redraws);
     for (i = 0; i < 8; i++) {
         g_string_append_printf(out, " 0x%x",
                                s->regs[(EG_SCRATCH_REG0 >> 2) + i]);
@@ -1026,6 +1157,11 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
 
 void ati_hd5770_cp_reset(ATIHD5770State *s)
 {
+    bool hold = s->eng_hold;
+
+    s->eng_hold = true;
+    cp_wait_idle(s);
+    s->eng_hold = hold;
     if (s->cp_timer) {
         timer_del(s->cp_timer);
     }
@@ -1060,10 +1196,34 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     s->gfx3d.st = s->gfx_stats;
     hd5770_gfx_init(&s->gfx3d);
     ati_hd5770_mc_gfx_init(s);
+    if (s->accel && s->cp_thread) {
+        s->eng_on = true;
+        s->eng_hold = !runstate_is_running();
+        qemu_mutex_init(&s->eng_lock);
+        qemu_cond_init(&s->eng_cond);
+        qemu_cond_init(&s->eng_idle_cond);
+        s->eng_vmse = qemu_add_vm_change_state_handler(cp_vm_state, s);
+        qemu_thread_create(&s->eng_thread, "ati-hd5770-cp", cp_thread_fn, s,
+                           QEMU_THREAD_JOINABLE);
+    }
 }
 
 void ati_hd5770_cp_fini(ATIHD5770State *s)
 {
+    if (s->eng_on) {
+        s->eng_hold = true;
+        cp_wait_idle(s);
+        qemu_mutex_lock(&s->eng_lock);
+        s->eng_quit = true;
+        qemu_cond_signal(&s->eng_cond);
+        qemu_mutex_unlock(&s->eng_lock);
+        qemu_thread_join(&s->eng_thread);
+        qemu_del_vm_change_state_handler(s->eng_vmse);
+        qemu_cond_destroy(&s->eng_cond);
+        qemu_cond_destroy(&s->eng_idle_cond);
+        qemu_mutex_destroy(&s->eng_lock);
+        s->eng_on = false;
+    }
     timer_free(s->cp_timer);
     s->cp_timer = NULL;
     g_free(s->gfx);
