@@ -1,0 +1,38 @@
+## @file
+#  Graphics Output Protocol for the emulated ATI Radeon HD 5770 (Juniper).
+#  The card resets with DCE 4 CRTC 0 scanning out a linear ARGB8888
+#  surface; the driver publishes that surface as a single-mode GOP.
+#
+#  Adapted from AtiR580GopDxe.inf.
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = AtiHd5770GopDxe
+  FILE_GUID      = 6b2e9d40-1c73-4f5a-9e08-68b85770a900
+  MODULE_TYPE    = UEFI_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = AtiHd5770GopEntry
+
+[Sources]
+  AtiHd5770GopDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  DevicePathLib
+  DebugLib
+  FrameBufferBltLib
+
+[Protocols]
+  gEfiPciIoProtocolGuid
+  gEfiGraphicsOutputProtocolGuid
+  gEfiDevicePathProtocolGuid
