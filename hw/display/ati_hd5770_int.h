@@ -12,7 +12,8 @@
  * handshake (ati_hd5770_mc.c), the command processor with its ring,
  * indirect buffers, register file and fences (ati_hd5770_cp.c), and the
  * asynchronous DMA engine (ati_hd5770_dma.c). Draws are parsed and
- * counted, nothing is rendered.
+ * counted, nothing is rendered. The display path detiles a tiled
+ * scanout surface (ati_hd5770_surf.c).
  *
  * Everything runs on the BQL.
  *
@@ -30,6 +31,7 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "ati_r580_edid.h"
+#include "ati_hd5770_gfx.h"
 
 #define TYPE_ATI_HD5770 "ati-radeon-hd5770"
 OBJECT_DECLARE_SIMPLE_TYPE(ATIHD5770State, ATI_HD5770)
@@ -106,7 +108,11 @@ typedef struct HD5770MCStats {
 typedef struct ATIHD5770Mode {
     uint32_t width, height, bpp, pitch;
     uint32_t depth, format;
-    uint64_t fb_offset;
+    uint64_t fb_offset;         /* first pixel; a tiled surface's base */
+    uint64_t fb_len;            /* bytes the scanout reads from fb_offset */
+    bool tiled;
+    uint32_t x0, y0;            /* first pixel of a tiled surface */
+    HD5770Surf surf;            /* layout of a tiled surface */
 } ATIHD5770Mode;
 
 struct ATIHD5770State {

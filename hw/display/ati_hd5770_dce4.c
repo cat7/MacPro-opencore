@@ -356,8 +356,8 @@ static void lut_set(ATIHD5770State *s, int crtc, unsigned i, uint8_t r,
 /* Scanout                                                          */
 
 /*
- * CRTC 0's graphics surface as a mode for the display path. Linear
- * surfaces only; a tiled one is read as if linear.
+ * CRTC 0's graphics surface as a mode for the display path. A tiled
+ * surface keeps its base and origin; the display path detiles it.
  */
 bool ati_hd5770_dce4_scanout(ATIHD5770State *s, ATIHD5770Mode *m)
 {
@@ -425,8 +425,40 @@ bool ati_hd5770_dce4_scanout(ATIHD5770State *s, ATIHD5770Mode *m)
     x0 = (uint64_t)CREG(s, 0, EG_GRPH_SURFACE_OFFSET_X) + xs +
          ((vps >> 16) & 0x3fff);
     y0 = (uint64_t)CREG(s, 0, EG_GRPH_SURFACE_OFFSET_Y) + ys + (vps & 0x3fff);
+    if (((ctl >> 20) & 0xf) != HD5770_ARRAY_LINEAR_GENERAL &&
+        ((ctl >> 20) & 0xf) != HD5770_ARRAY_LINEAR_ALIGNED) {
+        HD5770Surf *sf = &m->surf;
+
+        sf->mode = (ctl >> 20) & 0xf;
+        if (!hd5770_surf_mode_ok(sf->mode)) {
+            return false;
+        }
+        sf->base = off;
+        sf->pitch = m->pitch / m->bpp;
+        sf->height = y0 + m->height;
+        sf->bpe = m->bpp;
+        sf->banks = 2u << ((ctl >> 2) & 3);
+        sf->bankw = 1u << ((ctl >> 6) & 3);
+        sf->bankh = 1u << ((ctl >> 11) & 3);
+        sf->tile_split = 64u << ((ctl >> 13) & 7);
+        sf->mtilea = 1u << ((ctl >> 18) & 3);
+        sf->nondisp = false;
+        hd5770_surf_set_addr_config(sf, s->regs[EG_GB_ADDR_CONFIG >> 2]
+                                    ? s->regs[EG_GB_ADDR_CONFIG >> 2]
+                                    : HD5770_GB_ADDR_CONFIG_JUNIPER);
+        m->tiled = true;
+        m->x0 = x0;
+        m->y0 = y0;
+        m->fb_len = hd5770_surf_size(sf);
+        if (off + m->fb_len > s->vram_size) {
+            return false;
+        }
+        m->fb_offset = off;
+        return true;
+    }
     off += y0 * m->pitch + x0 * m->bpp;
-    if (off + (uint64_t)m->pitch * m->height > s->vram_size) {
+    m->fb_len = (uint64_t)m->pitch * m->height;
+    if (off + m->fb_len > s->vram_size) {
         return false;
     }
     m->fb_offset = off;

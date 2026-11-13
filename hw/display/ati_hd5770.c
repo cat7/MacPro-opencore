@@ -535,6 +535,18 @@ static uint32_t *draw_row(DisplaySurface *ds, int y)
     return (uint32_t *)((uint8_t *)surface_data(ds) + y * surface_stride(ds));
 }
 
+/* one row of a tiled surface, gathered into linear order */
+static void tiled_row(const uint8_t *vram, const ATIHD5770Mode *m, uint32_t y,
+                      uint8_t *row)
+{
+    uint32_t x;
+
+    for (x = 0; x < m->width; x++) {
+        memcpy(row + x * m->bpp, vram + m->fb_offset +
+               hd5770_surf_offset(&m->surf, m->x0 + x, m->y0 + y), m->bpp);
+    }
+}
+
 /*
  * CRTC 0's surface into the console. The LUT is a per-channel gamma
  * table in every depth; 8bpp indexes it with the pixel.
@@ -542,13 +554,22 @@ static uint32_t *draw_row(DisplaySurface *ds, int y)
 static void ati_hd5770_draw(ATIHD5770State *s, DisplaySurface *ds,
                             const ATIHD5770Mode *m)
 {
-    const uint8_t *src = (const uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                         m->fb_offset;
+    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    const uint8_t *lin = vram + m->fb_offset, *src;
     const uint8_t (*pal)[3] = (const uint8_t (*)[3])s->palette;
+    g_autofree uint8_t *row = m->tiled ? g_malloc(m->width * m->bpp) : NULL;
     uint32_t x, y;
 
     for (y = 0; y < m->height; y++) {
         uint32_t *dst = draw_row(ds, y);
+
+        if (m->tiled) {
+            tiled_row(vram, m, y, row);
+            src = row;
+        } else {
+            src = lin;
+            lin += m->pitch;
+        }
 
         for (x = 0; x < m->width; x++) {
             uint8_t r, g, b;
@@ -585,7 +606,6 @@ static void ati_hd5770_draw(ATIHD5770State *s, DisplaySurface *ds,
             dst[x] = 0xff000000u | ((uint32_t)r << 16) |
                      ((uint32_t)g << 8) | b;
         }
-        src += m->pitch;
     }
 }
 
@@ -628,7 +648,7 @@ static bool ati_hd5770_update_display(void *opaque)
     if (memcmp(&s->mode, &mode, sizeof(mode))) {
         redraw = true;
     }
-    len = (uint64_t)mode.pitch * mode.height;
+    len = mode.fb_len;
     if (memory_region_snapshot_get_dirty(&s->vram, snap, mode.fb_offset,
                                          len)) {
         redraw = true;
