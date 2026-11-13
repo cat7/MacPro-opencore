@@ -130,6 +130,18 @@ config ATI_R580
     depends on PCI
     select EDID
     select BITBANG_I2C
+    select ATI_R580_EDID
+
+config ATI_R580_EDID
+    bool
+
+config ATI_HD5770
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+    select BITBANG_I2C
+    select ATI_R580_EDID
 
 config ATI_VGA
     bool
