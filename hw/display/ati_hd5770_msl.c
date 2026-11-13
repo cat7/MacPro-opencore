@@ -75,6 +75,9 @@ const char hd5770_msl_lib[] =
 "    int x0, y0, x1, y1;\n"
 "};\n"
 "\n"
+"/* c / 255.0f for c = 0..255, as the CPU path computes it */\n"
+"HD_U8_TABLE\n"
+"\n"
 "/* ---- formats ---- */\n"
 "\n"
 "constant uchar hd_fmt_bits[64][4] = {\n"
@@ -513,14 +516,14 @@ const char hd5770_msl_lib[] =
 "                     thread uint *out)\n"
 "{\n"
 "    device uchar *p = hd_at(t.s, hd_addr(t.s, x, y), vram, ram, st);\n"
-"    uint v[6], c[4];\n"
+"    uint4 v;\n"
+"    uint c[4];\n"
 "\n"
 "    if (t.unorm8) {\n"
 "        uint e = hd_rd(p, 0, 4);\n"
 "\n"
-"        for (uint k = 0; k < 4; k++) {\n"
-"            v[k] = U((float)((e >> (8 * k)) & 0xff) / 255.0f);\n"
-"        }\n"
+"        v = uint4(U(hd_u8[e & 0xff]), U(hd_u8[(e >> 8) & 0xff]),\n"
+"                  U(hd_u8[(e >> 16) & 0xff]), U(hd_u8[e >> 24]));\n"
 "    } else {\n"
 "        hd_unpack(t.fmt, p, 0, c);\n"
 "        for (uint k = 0; k < 4; k++) {\n"
@@ -531,12 +534,10 @@ const char hd5770_msl_lib[] =
 "            }\n"
 "        }\n"
 "    }\n"
-"    v[4] = U(0.0f);\n"
-"    v[5] = U(1.0f);\n"
 "    for (uint k = 0; k < 4; k++) {\n"
 "        uint s = t.dst_sel[k];\n"
 "\n"
-"        out[k] = s < 6 ? v[s] : v[4];\n"
+"        out[k] = s < 4 ? v[s] : s == 5 ? U(1.0f) : U(0.0f);\n"
 "    }\n"
 "}\n"
 "\n"
@@ -713,7 +714,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static __attribute__((always_inline)) float hd_bfactor(uint f, thread const float *src, thread const float *dst,\n"
+"static __attribute__((always_inline)) float hd_bfactor(uint f, float4 src, float4 dst,\n"
 "                        device const float *cst, uint ch)\n"
 "{\n"
 "    switch (f) {\n"
@@ -783,19 +784,19 @@ const char hd5770_msl_lib[] =
 "                   thread const uint *col)\n"
 "{\n"
 "    device uchar *p = hd_at(u.rt, hd_addr(u.rt, x, y), vram, ram, st);\n"
-"    uint c[4] = { 0, 0, 0, 0 }, old[4];\n"
+"    uint4 c = uint4(0), old;\n"
 "    uint n = u.rt_comps;\n"
-"    float src[4], dst[4];\n"
+"    float4 src, dst;\n"
 "\n"
 "    if (u.rt_unorm8) {\n"
 "        uint e = *(device const uint *)p;\n"
 "\n"
-"        old[0] = e & 0xff;\n"
-"        old[1] = (e >> 8) & 0xff;\n"
-"        old[2] = (e >> 16) & 0xff;\n"
-"        old[3] = e >> 24;\n"
+"        old = uint4(e & 0xff, (e >> 8) & 0xff, (e >> 16) & 0xff, e >> 24);\n"
 "    } else {\n"
-"        hd_unpack(u.rt_fmt, p, 0, old);\n"
+"        uint o[4];\n"
+"\n"
+"        hd_unpack(u.rt_fmt, p, 0, o);\n"
+"        old = uint4(o[0], o[1], o[2], o[3]);\n"
 "    }\n"
 "    if (u.rt_num == 4 || u.rt_float) {\n"
 "        for (uint i = 0; i < n; i++) {\n"
@@ -803,7 +804,11 @@ const char hd5770_msl_lib[] =
 "\n"
 "            c[i] = (u.wmask >> s) & 1 ? col[s] : old[i];\n"
 "        }\n"
-"        hd_pack_store(p, 0, u.rt_fmt, c);\n"
+"        {\n"
+"            uint cc[4] = { c[0], c[1], c[2], c[3] };\n"
+"\n"
+"            hd_pack_store(p, 0, u.rt_fmt, cc);\n"
+"        }\n"
 "        return;\n"
 "    }\n"
 "    for (uint i = 0; i < 4; i++) {\n"
@@ -814,13 +819,14 @@ const char hd5770_msl_lib[] =
 "        dst[i] = i == 3 ? 1.0f : 0.0f;\n"
 "    }\n"
 "    for (uint i = 0; i < n; i++) {\n"
-"        dst[u.rt_src[i]] = (float)old[i] / (float)((1u << u.rt_bits[i]) - 1);\n"
+"        dst[u.rt_src[i]] = u.rt_unorm8 ? hd_u8[old[i]]\n"
+"                                       : (float)old[i] / (float)((1u << u.rt_bits[i]) - 1);\n"
 "    }\n"
 "    if ((u.blend & (1u << 30)) && u.rt_blend) {\n"
 "        uint csrc = u.blend & 0x1f, cfn = (u.blend >> 5) & 7;\n"
 "        uint cdst = (u.blend >> 8) & 0x1f;\n"
 "        uint asrc = csrc, afn = cfn, adst = cdst;\n"
-"        float out[4], sc[4];\n"
+"        float4 out, sc;\n"
 "\n"
 "        if ((u.blend >> 29) & 1) {\n"
 "            asrc = (u.blend >> 16) & 0x1f;\n"
@@ -838,9 +844,7 @@ const char hd5770_msl_lib[] =
 "                                hd_bfactor(fs, sc, dst, u.blend_const, i), dst[i],\n"
 "                                hd_bfactor(fd, sc, dst, u.blend_const, i));\n"
 "        }\n"
-"        for (uint i = 0; i < 4; i++) {\n"
-"            src[i] = out[i];\n"
-"        }\n"
+"        src = out;\n"
 "    }\n"
 "    for (uint i = 0; i < n; i++) {\n"
 "        uint s = u.rt_src[i];\n"
@@ -854,7 +858,11 @@ const char hd5770_msl_lib[] =
 "                                       (c[2] & 0xff) << 16 | (c[3] & 0xff) << 24;\n"
 "        return;\n"
 "    }\n"
-"    hd_pack_store(p, 0, u.rt_fmt, c);\n"
+"    {\n"
+"        uint cc[4] = { c[0], c[1], c[2], c[3] };\n"
+"\n"
+"        hd_pack_store(p, 0, u.rt_fmt, cc);\n"
+"    }\n"
 "}\n"
 "\n"
 "static __attribute__((always_inline)) bool hd_clip(device const GDraw &u, int x, int y)\n"
@@ -868,13 +876,8 @@ const char hd5770_msl_lib[] =
 "        }\n"
 "    }\n"
 "    return (u.cliprule >> idx) & 1;\n"
-"}\n"
-"\n";
+"}\n";
 
-/*
- * Register set q: 0 the pixel, 1 and 2 (programs with gradients) its
- * neighbours to the right and below, run alongside as the CPU lanes do.
- */
 static void src_expr(GString *o, const HD5770IRSrc *s, unsigned q)
 {
     switch (s->kind) {
@@ -1067,7 +1070,25 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
 char *hd5770_msl_program(const HD5770IR *ir)
 {
     GString *o = g_string_new(hd5770_msl_lib);
+    GString *tab = g_string_new("constant float hd_u8[256] = {");
+    const char *mark = strstr(o->str, "HD_U8_TABLE");
     unsigned i, j, k, q, nq = ir->grad ? 3 : 1, ng = MAX(ir->ngpr, 1u);
+
+    for (i = 0; i < 256; i++) {
+        float f = i / (float)((1u << 8) - 1);
+        uint32_t b;
+
+        memcpy(&b, &f, 4);
+        g_string_append_printf(tab, "%sas_type<float>(0x%08xu)", i ? ", " : "", b);
+    }
+    g_string_append(tab, "};");
+    if (mark) {
+        size_t at = mark - o->str;
+
+        g_string_erase(o, at, strlen("HD_U8_TABLE"));
+        g_string_insert(o, at, tab->str);
+    }
+    g_string_free(tab, true);
 
     g_string_append(o,
         "static float hd_mulieee(float a, float b) { return a * b; }\n"
