@@ -241,4 +241,85 @@
 #define EG_PTE_SYSTEM                   (1ull << 1)
 #define EG_PTE_ADDR_MASK                0x000000fffffff000ull
 
+/* graphics: config space reachable by SET_CONFIG_REG */
+#define EG_GRBM_SOFT_RESET_CP           (1u << 0)
+#define EG_GRBM_CP_BUSY                 (1u << 29)
+#define EG_SRBM_SOFT_RESET_DMA          (1u << 12)
+#define EG_WAIT_UNTIL                   0x8040
+#define EG_SCRATCH_REG0                 0x8500
+#define EG_SCRATCH_REG7                 0x851c
+#define EG_SCRATCH_UMSK                 0x8540
+#define EG_SCRATCH_ADDR                 0x8544
+#define EG_CP_COHER_STATUS              0x85fc
+#define EG_CP_ME_CNTL                   0x86d8
+#define EG_CP_ME_HALT                   (1u << 28)
+#define EG_CP_PFP_HALT                  (1u << 26)
+#define EG_CP_RB_RPTR                   0x8700
+#define EG_VGT_PRIMITIVE_TYPE           0x8958
+#define EG_GB_ADDR_CONFIG               0x98f8
+#define EG_GB_ADDR_CONFIG_JUNIPER       0x02010002
+#define EG_CONFIG_REG_FIRST             0x8000
+#define EG_CONFIG_REG_END               0xac00
+
+/* command processor: ring, interrupts, microcode */
+#define EG_CP_RB_BASE                   0xc100
+#define EG_CP_RB_CNTL                   0xc104
+#define EG_CP_RB_BUFSZ_MASK             0x3f
+#define EG_CP_RB_NO_UPDATE              (1u << 27)
+#define EG_CP_RB_RPTR_WR_ENA            (1u << 31)
+#define EG_CP_RB_RPTR_WR                0xc108
+#define EG_CP_RB_RPTR_ADDR              0xc10c
+#define EG_CP_RB_RPTR_ADDR_HI           0xc110
+#define EG_CP_RB_WPTR                   0xc114
+#define EG_CP_INT_CNTL                  0xc124
+#define EG_CP_INT_STATUS                0xc128
+#define EG_CP_CNTX_BUSY_INT             (1u << 19)
+#define EG_CP_CNTX_EMPTY_INT            (1u << 20)
+#define EG_CP_TIME_STAMP_INT            (1u << 26)
+#define EG_CP_IB2_INT                   (1u << 29)
+#define EG_CP_IB1_INT                   (1u << 30)
+#define EG_CP_RB_INT                    (1u << 31)
+#define EG_CP_PFP_UCODE_ADDR            0xc150
+#define EG_CP_PFP_UCODE_DATA            0xc154
+#define EG_CP_ME_RAM_RADDR              0xc158
+#define EG_CP_ME_RAM_WADDR              0xc15c
+#define EG_CP_ME_RAM_DATA               0xc160
+#define EG_RLC_UCODE_ADDR               0x3f2c
+#define EG_RLC_UCODE_DATA               0x3f30
+#define EG_RLC_GPU_CLOCK_COUNT_LSB      0x3f38
+#define EG_RLC_GPU_CLOCK_COUNT_MSB      0x3f3c
+#define EG_RLC_CAPTURE_GPU_CLOCK_COUNT  0x3f40
+
+/* asynchronous DMA engine */
+#define EG_DMA_RB_CNTL                  0xd000
+#define EG_DMA_RB_ENABLE                (1u << 0)
+#define EG_DMA_RPTR_WRITEBACK_ENABLE    (1u << 12)
+#define EG_DMA_RB_BASE                  0xd004
+#define EG_DMA_RB_RPTR                  0xd008
+#define EG_DMA_RB_WPTR                  0xd00c
+#define EG_DMA_RB_RPTR_ADDR_HI          0xd01c
+#define EG_DMA_RB_RPTR_ADDR_LO          0xd020
+#define EG_DMA_IB_CNTL                  0xd024
+#define EG_DMA_CNTL                     0xd02c
+#define EG_DMA_TRAP_ENABLE              (1u << 0)
+#define EG_DMA_IDLE                     (1u << 0)
+#define EG_DMA_FIRST                    0xd000
+#define EG_DMA_LAST                     0xd0ff
+
+/* register spaces of the SET_* packets above the MMIO aperture */
+#define EG_CONTEXT_REG_FIRST            0x28000
+#define EG_CONTEXT_REG_END              0x29000
+#define EG_RESOURCE_FIRST               0x30000
+#define EG_LOOP_CONST_FIRST             0x3a200
+#define EG_BOOL_CONST_FIRST             0x3a500
+#define EG_SAMPLER_FIRST                0x3c000
+#define EG_CTL_CONST_FIRST              0x3cff0
+#define EG_GFX_FIRST                    0x28000
+#define EG_GFX_END                      0x40000
+#define EG_CB_COLOR0_INFO               0x28c70
+#define EG_CB_COLOR_STRIDE              0x3c
+#define EG_SQ_PGM_START_PS              0x28840
+#define EG_SQ_PGM_START_VS              0x2885c
+#define EG_SQ_PGM_START_FS              0x288a4
+
 #endif

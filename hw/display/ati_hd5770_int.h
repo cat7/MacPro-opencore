@@ -9,7 +9,10 @@
  * the engine registers are then plain storage and read idle.
  *
  * With accel on: VM context 0 (GART) translation and its TLB invalidate
- * handshake (ati_hd5770_mc.c).
+ * handshake (ati_hd5770_mc.c), the command processor with its ring,
+ * indirect buffers, register file and fences (ati_hd5770_cp.c), and the
+ * asynchronous DMA engine (ati_hd5770_dma.c). Draws are parsed and
+ * counted, nothing is rendered.
  *
  * Everything runs on the BQL.
  *
@@ -55,6 +58,46 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIHD5770State, ATI_HD5770)
 /* IH source ids (Evergreen) */
 #define HD5770_IH_SRC_D1                1   /* D1..D6 = 1..6, data 0 vblank 1 vline */
 #define HD5770_IH_SRC_HPD               42  /* data = HPD pin - 1 */
+#define HD5770_IH_SRC_CP_RB             176 /* CP_INT_STATUS write, ring */
+#define HD5770_IH_SRC_CP_IB1            177
+#define HD5770_IH_SRC_CP_IB2            178
+#define HD5770_IH_SRC_CP_EOP            181 /* EVENT_WRITE_EOP with INT_SEL */
+#define HD5770_IH_SRC_DMA_TRAP          224
+
+#define HD5770_GFX_DWORDS               ((0x40000 - 0x28000) / 4)
+#define HD5770_UCODE_DWORDS             2048
+#define HD5770_CP_MAX_PKT               (0x4000 + 2)
+#define HD5770_CP_IB_LEVELS             2
+#define HD5770_CENSUS_SLOTS             32
+
+/* a command stream the CP is inside: an indirect buffer */
+typedef struct HD5770Stream {
+    uint64_t base;              /* MC address */
+    uint32_t size;              /* dwords */
+    uint32_t pos;               /* dwords consumed */
+} HD5770Stream;
+
+/* distinct values seen, with counts */
+typedef struct HD5770Census {
+    uint32_t val[HD5770_CENSUS_SLOTS];
+    uint64_t cnt[HD5770_CENSUS_SLOTS];
+    uint32_t used;
+    uint64_t other;
+} HD5770Census;
+
+typedef struct HD5770CPStats {
+    uint64_t kicks, dwords, type0, type2, type3, op[256], gap_op[256];
+    uint64_t ibs, ib_overrun, eop, eop_irq, eop_masked, rb_irq;
+    uint64_t scratch_wb, rptr_wb, stalls, wait_ok, sem_signal, sem_wait;
+    uint64_t draws, resets, ucode_pfp, ucode_me, ucode_rlc, skipped;
+    uint64_t type0_regs, set_regs, load_regs, shadow_writes;
+    uint64_t bad_header;
+} HD5770CPStats;
+
+typedef struct HD5770DMAStats {
+    uint64_t kicks, packets, cmd[16], fences, traps, traps_masked;
+    uint64_t write_dw, copy_bytes, fill_bytes, sub_gap, ibs, stalls;
+} HD5770DMAStats;
 
 typedef struct HD5770MCStats {
     uint64_t gart, gart_invalid, tlb_inval, fault_reads, fault_writes;
@@ -144,11 +187,40 @@ struct ATIHD5770State {
     uint32_t unk_wr[ATI_HD5770_NUM_REGS];
     uint32_t atom_calls[128];
 
+    /* command processor (accel on) */
+    uint32_t *gfx;              /* SET_* register file 0x28000-0x3ffff */
+    uint32_t gfx_dwords;
+    uint32_t pfp_ucode[HD5770_UCODE_DWORDS];
+    uint32_t me_ucode[HD5770_UCODE_DWORDS];
+    uint32_t rlc_ucode[HD5770_UCODE_DWORDS];
+    uint32_t cp_rptr;           /* ring read pointer, dwords */
+    uint32_t cp_skip;           /* ring dwords to discard (COND/PRED_EXEC) */
+    uint32_t cp_depth;          /* indirect buffers entered */
+    HD5770Stream cp_ib[HD5770_CP_IB_LEVELS];
+    bool cp_stalled;            /* a wait packet's condition is false */
+    bool cp_running;
+    uint32_t cp_load_ctl, cp_shadow_ctl;
+    uint64_t cp_shadow_base[8]; /* LOAD_* bases: config .. ctl const */
+    uint32_t *cp_pkt;
+    uint64_t gpu_clock_capture;
+    QEMUTimer *cp_timer;        /* re-polls stalled waits */
+    HD5770CPStats cp;
+    HD5770Census census_cb0, census_ps, census_vs, census_prim;
+    uint64_t census_ctx_writes[1024];
+
+    /* asynchronous DMA engine */
+    uint32_t dma_rptr;          /* bytes */
+    bool dma_stalled;
+    bool dma_running;
+    HD5770DMAStats dma;
+
     HD5770MCStats mc;
 };
 
 /* ati_hd5770.c */
 void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data);
+uint32_t ati_hd5770_reg_read(ATIHD5770State *s, uint32_t off);
+void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 void ati_hd5770_update_irq(ATIHD5770State *s);
 bool ati_hd5770_mc_to_vram(ATIHD5770State *s, uint64_t mc, uint64_t *off);
 void ati_hd5770_cursor_update(ATIHD5770State *s);
@@ -175,6 +247,25 @@ uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
 void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);
 bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+
+/* ati_hd5770_cp.c */
+void ati_hd5770_cp_init(ATIHD5770State *s);
+void ati_hd5770_cp_fini(ATIHD5770State *s);
+void ati_hd5770_cp_reset(ATIHD5770State *s);
+bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
+bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+bool ati_hd5770_cp_known(uint32_t off);
+void ati_hd5770_cp_gaps(ATIHD5770State *s, GString *out);
+void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out);
+uint64_t ati_hd5770_gpu_clock(void);
+void ati_hd5770_census_add(HD5770Census *c, uint32_t val);
+
+/* ati_hd5770_dma.c */
+void ati_hd5770_dma_reset(ATIHD5770State *s);
+bool ati_hd5770_dma_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
+bool ati_hd5770_dma_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+void ati_hd5770_dma_run(ATIHD5770State *s);
+void ati_hd5770_dma_stats(ATIHD5770State *s, GString *out);
 
 /* ati_hd5770_atom.c */
 bool ati_hd5770_atom_write(ATIHD5770State *s, uint32_t off, uint32_t val);

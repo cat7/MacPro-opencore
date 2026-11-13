@@ -246,6 +246,12 @@ ati_hd5770_atom_call(uint32_t table, uint32_t ndw, uint32_t p0, uint32_t p1, uin
 ati_hd5770_gart_fault(uint64_t mc, uint64_t pte) "MC 0x%" PRIx64 " PTE 0x%" PRIx64
 ati_hd5770_tlb_invalidate(uint32_t off, uint32_t val) "0x%04x <- 0x%08x"
 ati_hd5770_vm_setup(uint32_t off, uint32_t val) "0x%04x <- 0x%08x"
+ati_hd5770_cp_packet(unsigned level, unsigned op, uint32_t n) "level %u op 0x%02x %u dwords"
+ati_hd5770_cp_gap(unsigned op) "op 0x%02x"
+ati_hd5770_cp_type0(unsigned level, uint32_t header, uint32_t val) "level %u header 0x%08x first 0x%08x"
+ati_hd5770_cp_wait(uint32_t ctl, uint32_t addr, uint32_t val, uint32_t ref, uint32_t mask) "ctl 0x%x addr 0x%08x val 0x%08x ref 0x%08x mask 0x%08x"
+ati_hd5770_eop(uint32_t event, uint64_t addr, uint32_t dsel, uint32_t isel, uint32_t data) "event 0x%x addr 0x%" PRIx64 " data_sel %u int_sel %u data 0x%08x"
+ati_hd5770_dma_packet(uint32_t h) "header 0x%08x"
 
 # hw/display/ati_r580.c (Radeon X1900 XT / R580)
 ati_r580_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s -> 0x%"PRIx64

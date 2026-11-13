@@ -231,7 +231,7 @@ static void note_unknown(ATIHD5770State *s, uint32_t off, bool write,
 {
     uint32_t *cnt = write ? s->unk_wr : s->unk_rd;
 
-    if (reg_known(off)) {
+    if (reg_known(off) || (s->accel && ati_hd5770_cp_known(off))) {
         return;
     }
     if (write) {
@@ -308,6 +308,8 @@ static uint32_t reg_read(ATIHD5770State *s, uint32_t off)
     off &= ATI_HD5770_MMIO_SIZE - 4;
     if (display_reg(off)) {
         ati_hd5770_dce4_read(s, off, &val);
+    } else if (s->accel && ati_hd5770_cp_read(s, off, &val)) {
+        /* engine registers with accel on */
     } else {
         switch (off) {
         case EG_PCIE_DATA:
@@ -384,7 +386,7 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     if (ati_hd5770_atom_write(s, off, val)) {
         return;
     }
-    if (s->accel && ati_hd5770_mc_reg_write(s, off, val)) {
+    if (s->accel && ati_hd5770_cp_write(s, off, val)) {
         return;
     }
     if (display_reg(off)) {
@@ -461,6 +463,16 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         s->regs[off >> 2] = val;
         return;
     }
+}
+
+uint32_t ati_hd5770_reg_read(ATIHD5770State *s, uint32_t off)
+{
+    return reg_read(s, off);
+}
+
+void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
+{
+    reg_write(s, off, val);
 }
 
 /* MM_INDEX / MM_DATA reach the whole register file through 0x00/0x04 */
@@ -679,6 +691,7 @@ static void ati_hd5770_reset_hold(Object *obj, ResetType type)
     }
     s->hw_cursor_sum = 0;
     s->ih_level = false;
+    ati_hd5770_cp_reset(s);
     ati_hd5770_dce4_reset(s);
     ati_hd5770_update_irq(s);
 }
@@ -758,6 +771,7 @@ static void ati_hd5770_realize(PCIDevice *dev, Error **errp)
 
     s->cursor_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    ati_hd5770_cursor_timer, s);
+    ati_hd5770_cp_init(s);
     ati_hd5770_dce4_init(s);
 }
 
@@ -766,6 +780,7 @@ static void ati_hd5770_exit(PCIDevice *dev)
     ATIHD5770State *s = ATI_HD5770(dev);
 
     ati_hd5770_dce4_fini(s);
+    ati_hd5770_cp_fini(s);
     timer_free(s->cursor_timer);
     s->cursor_timer = NULL;
     msi_uninit(dev);
@@ -781,6 +796,49 @@ static int ati_hd5770_post_load(void *opaque, int version_id)
     ati_hd5770_update_irq(s);
     return 0;
 }
+
+static bool ati_hd5770_engines_needed(void *opaque)
+{
+    return ATI_HD5770(opaque)->accel;
+}
+
+static const VMStateDescription vmstate_ati_hd5770_stream = {
+    .name = "ati-radeon-hd5770/stream",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(base, HD5770Stream),
+        VMSTATE_UINT32(size, HD5770Stream),
+        VMSTATE_UINT32(pos, HD5770Stream),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_ati_hd5770_engines = {
+    .name = "ati-radeon-hd5770/engines",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ati_hd5770_engines_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_VARRAY_UINT32(gfx, ATIHD5770State, gfx_dwords, 0,
+                              vmstate_info_uint32, uint32_t),
+        VMSTATE_UINT32_ARRAY(pfp_ucode, ATIHD5770State, HD5770_UCODE_DWORDS),
+        VMSTATE_UINT32_ARRAY(me_ucode, ATIHD5770State, HD5770_UCODE_DWORDS),
+        VMSTATE_UINT32_ARRAY(rlc_ucode, ATIHD5770State, HD5770_UCODE_DWORDS),
+        VMSTATE_UINT32(cp_rptr, ATIHD5770State),
+        VMSTATE_UINT32(cp_skip, ATIHD5770State),
+        VMSTATE_UINT32(cp_depth, ATIHD5770State),
+        VMSTATE_STRUCT_ARRAY(cp_ib, ATIHD5770State, HD5770_CP_IB_LEVELS, 1,
+                             vmstate_ati_hd5770_stream, HD5770Stream),
+        VMSTATE_BOOL(cp_stalled, ATIHD5770State),
+        VMSTATE_UINT32(cp_load_ctl, ATIHD5770State),
+        VMSTATE_UINT32(cp_shadow_ctl, ATIHD5770State),
+        VMSTATE_UINT64_ARRAY(cp_shadow_base, ATIHD5770State, 8),
+        VMSTATE_UINT32(dma_rptr, ATIHD5770State),
+        VMSTATE_BOOL(dma_stalled, ATIHD5770State),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_ati_hd5770 = {
     .name = "ati-radeon-hd5770",
@@ -810,6 +868,10 @@ static const VMStateDescription vmstate_ati_hd5770 = {
         VMSTATE_UINT8(i2c_index, ATIHD5770State),
         VMSTATE_UINT32(i2c_status, ATIHD5770State),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ati_hd5770_engines,
+        NULL
     }
 };
 
@@ -850,8 +912,25 @@ static char *ati_hd5770_get_gaps(Object *obj, Error **errp)
                                    s->regs[i]);
         }
     }
+    if (s->accel) {
+        ati_hd5770_cp_gaps(s, out);
+    }
     if (!out->len) {
         g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
+/* `cp-stats` property: command processor, DMA and GART counters */
+static char *ati_hd5770_get_cp_stats(Object *obj, Error **errp)
+{
+    ATIHD5770State *s = ATI_HD5770(obj);
+    GString *out = g_string_new(NULL);
+
+    if (!s->accel) {
+        g_string_append(out, "accel off");
+    } else {
+        ati_hd5770_cp_stats(s, out);
     }
     return g_string_free(out, FALSE);
 }
@@ -962,6 +1041,8 @@ static void ati_hd5770_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     object_class_property_add_str(klass, "gaps", ati_hd5770_get_gaps, NULL);
+    object_class_property_add_str(klass, "cp-stats", ati_hd5770_get_cp_stats,
+                                  NULL);
     object_class_property_add_str(klass, "atom-calls",
                                   ati_hd5770_get_atom_calls, NULL);
     object_class_property_add_str(klass, "scanout", ati_hd5770_get_scanout,
