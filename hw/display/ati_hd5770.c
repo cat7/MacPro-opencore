@@ -356,7 +356,12 @@ static uint32_t reg_read(ATIHD5770State *s, uint32_t off)
             val = s->vram_mb;
             break;
         case EG_CONFIG_APER_SIZE:
-            val = s->aper_mb * MiB;
+            /*
+             * In MB. Zero with accel off, as before the aperture is set
+             * up: Apple's accelerator then cannot place its reserved FB
+             * blocks, its CAIL initialisation fails and it declines.
+             */
+            val = s->accel ? s->aper_mb : 0;
             break;
         case EG_CONFIG_FB_OFFSET:
             val = 0;
@@ -824,6 +829,7 @@ static const Property ati_hd5770_properties[] = {
     DEFINE_PROP_UINT32("aper-mb", ATIHD5770State, aper_mb, 256),
     DEFINE_PROP_BOOL("bar64", ATIHD5770State, bar64, false),
     DEFINE_PROP_BOOL("msi", ATIHD5770State, msi, true),
+    DEFINE_PROP_BOOL("accel", ATIHD5770State, accel, false),
     DEFINE_PROP_UINT32("device-id", ATIHD5770State, device_id,
                        PCI_DEVICE_ID_ATI_JUNIPER_XT),
     DEFINE_PROP_UINT32("subsys-vendor-id", ATIHD5770State, subsys_vendor_id,

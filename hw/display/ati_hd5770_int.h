@@ -5,7 +5,9 @@
  * option ROM, the memory controller's FB window and HDP, the interrupt
  * handler ring, and the DCE 4 display engine (six CRTCs, graphics
  * surface, cursor, LUT, hot plug, DDC). No command processor, GART or 3D:
- * their status registers read idle.
+ * their status registers read idle. With accel off the chip reports no
+ * aperture, so Apple's accelerator declines at start and the framebuffer
+ * driver runs alone.
  *
  * Everything runs on the BQL.
  *
@@ -72,6 +74,7 @@ struct ATIHD5770State {
     uint32_t aper_mb;
     bool bar64;
     bool msi;
+    bool accel;                 /* let the accelerator start */
     uint32_t device_id;
     uint32_t subsys_vendor_id;
     uint32_t subsys_id;
