@@ -667,6 +667,16 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         apic_base.Reg64 = cpu_get_apic_base(X86_CPU(cpu)->apic_state);
         whpx_set_reg(cpu, WHvX64RegisterApicBase, apic_base);
     }
+
+    if (level == WHPX_LEVEL_RESET_STATE && whpx_irqchip_in_kernel()) {
+        WHV_REGISTER_VALUE reg = {};
+
+        /* nothing pending; an AP waits for its SIPI */
+        whpx_set_reg(cpu, WHvRegisterPendingInterruption, reg);
+        whpx_set_reg(cpu, WHvRegisterInterruptState, reg);
+        reg.InternalActivity.StartupSuspend = !cpu_is_bsp(x86_cpu);
+        whpx_set_reg(cpu, WHvRegisterInternalActivityState, reg);
+    }
 }
 
 /* MTRR MSRs: deftype, 11 fixed ranges, MSR_MTRRcap_VCNT base/mask pairs */
