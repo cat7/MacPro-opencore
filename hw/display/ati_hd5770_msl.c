@@ -1,0 +1,1090 @@
+/*
+ * ATI Radeon HD 5770 (Juniper) pixel shader IR to Metal Shading Language.
+ *
+ * hd5770_msl_lib is the shared part: the layouts of the per-draw data
+ * (GDraw, GTex, GTri, the same in ati_hd5770_mtl.m) and, as functions,
+ * what the CPU path computes per pixel -- ALU opcodes (eval(), post()),
+ * texture and vertex fetches, edge functions and interpolation, the
+ * alpha test, blending and packing through the tiled address. Fast math
+ * and contraction are off; where the CPU path's compiler fuses a
+ * multiply and an add on AArch64 (a * b + c, a * b - c * d), the text
+ * names the fma().
+ *
+ * hd5770_msl_program() adds one compute kernel per program, hd_main:
+ * thread (gx, gy) is pixel (x0 + gx, y0 + gy) of triangle t; it runs
+ * the coverage test, the clip rectangles, the program and the output
+ * stage. Buffers: 0 VRAM, 1 GDraw, 2 GTri, 3 bound constants (uint),
+ * 4 staging bytes (vertex buffers, constant file), 5 GTex[], 6 the
+ * triangle's inputs (ninputs x 3 vertices x 4 floats).
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "ati_hd5770_gpu.h"
+
+const char hd5770_msl_lib[] =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"#pragma METAL fp math_mode(safe)\n"
+"#pragma METAL fp contract(off)\n"
+"\n"
+"/* layouts shared with ati_hd5770_mtl.m */\n"
+"struct GSurf {\n"
+"    uint voff, mode, bpe, row_bytes, mt_per_row, tile_bytes, mt_bytes;\n"
+"    uint pipes, banks, bankw, bankh, pib;\n"
+"    uint mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh, fast;\n"
+"    uint eoff[64];\n"
+"};\n"
+"struct GTex {\n"
+"    GSurf s;\n"
+"    uint fmt, num, w, h, dim, sgn, comps, is_float, unorm8, samp0;\n"
+"    uint dst_sel[4];\n"
+"    uint bits[4];\n"
+"    float border[4];\n"
+"};\n"
+"struct GVb {\n"
+"    uint id, off, len, pad;\n"
+"    uint res[8];\n"
+"};\n"
+"struct GDraw {\n"
+"    GSurf rt;\n"
+"    uint rt_fmt, rt_num, rt_comps, rt_unorm8, rt_float, rt_blend, wmask, blend;\n"
+"    uint rt_bits[4];\n"
+"    uint rt_src[4];\n"
+"    float blend_const[4];\n"
+"    uint alpha_test, alpha_func;\n"
+"    float alpha_ref;\n"
+"    uint cliprule;\n"
+"    int cr[16];\n"
+"    float pix_center;\n"
+"    uint persp;\n"
+"    int pos_gpr;\n"
+"    uint ninputs, flat, cfile_off, ntex, nvb;\n"
+"    GVb vb[8];\n"
+"};\n"
+"struct GTri {\n"
+"    float x[3], y[3], w[3];\n"
+"    float area;\n"
+"    int x0, y0, x1, y1;\n"
+"};\n"
+"\n"
+"/* ---- formats ---- */\n"
+"\n"
+"constant uchar hd_fmt_bits[64][4] = {\n"
+"    {0,0,0,0}, {8,0,0,0}, {4,4,0,0}, {3,3,2,0}, {0,0,0,0}, {16,0,0,0},\n"
+"    {16,0,0,0}, {8,8,0,0}, {5,6,5,0}, {6,5,5,0}, {1,5,5,5}, {4,4,4,4},\n"
+"    {5,5,5,1}, {32,0,0,0}, {32,0,0,0}, {16,16,0,0}, {16,16,0,0},\n"
+"    {8,24,0,0}, {0,0,0,0}, {24,8,0,0}, {0,0,0,0}, {10,11,11,0},\n"
+"    {0,0,0,0}, {11,11,10,0}, {0,0,0,0}, {2,10,10,10}, {8,8,8,8},\n"
+"    {10,10,10,2}, {0,0,0,0}, {32,32,0,0}, {32,32,0,0}, {16,16,16,16},\n"
+"    {16,16,16,16}, {0,0,0,0}, {32,32,32,32}, {32,32,32,32},\n"
+"    {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0},\n"
+"    {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0}, {0,0,0,0},\n"
+"    {32,32,32,0},\n"
+"};\n"
+"\n"
+"static uint hd_fmt_bytes(uint fmt)\n"
+"{\n"
+"    switch (fmt) {\n"
+"    case 0x01: case 0x02: case 0x03: return 1;\n"
+"    case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a:\n"
+"    case 0x0b: case 0x0c: return 2;\n"
+"    case 0x0d: case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x13:\n"
+"    case 0x15: case 0x17: case 0x19: case 0x1a: case 0x1b: return 4;\n"
+"    case 0x1d: case 0x1e: case 0x1f: case 0x20: return 8;\n"
+"    case 0x30: return 12;\n"
+"    case 0x22: case 0x23: return 16;\n"
+"    default: return 0;\n"
+"    }\n"
+"}\n"
+"\n"
+"static bool hd_fmt_float(uint fmt)\n"
+"{\n"
+"    return fmt == 0x06 || fmt == 0x0e || fmt == 0x10 || fmt == 0x1e ||\n"
+"           fmt == 0x20 || fmt == 0x23 || fmt == 0x30;\n"
+"}\n"
+"\n"
+"static uint hd_rd(device const uchar *p, uint off, uint n)\n"
+"{\n"
+"    uint v = 0;\n"
+"\n"
+"    if (n == 4 && !(off & 3)) {\n"
+"        return *(device const uint *)(p + off);\n"
+"    }\n"
+"    for (uint i = 0; i < n; i++) {\n"
+"        v |= (uint)p[off + i] << (8 * i);\n"
+"    }\n"
+"    return v;\n"
+"}\n"
+"\n"
+"static void hd_unpack(uint fmt, device const uchar *p, uint off, thread uint *c)\n"
+"{\n"
+"    uint n = hd_fmt_bytes(fmt), sh = 0;\n"
+"    ulong v;\n"
+"\n"
+"    c[0] = c[1] = c[2] = c[3] = 0;\n"
+"    if (n > 8) {\n"
+"        for (uint i = 0; i < 4 && fmt < 64 && hd_fmt_bits[fmt][i]; i++) {\n"
+"            c[i] = hd_rd(p, off + 4 * i, 4);\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    if (n == 8) {\n"
+"        v = (ulong)hd_rd(p, off, 4) | (ulong)hd_rd(p, off + 4, 4) << 32;\n"
+"    } else {\n"
+"        v = hd_rd(p, off, n);\n"
+"    }\n"
+"    for (uint i = 0; i < 4 && fmt < 64 && hd_fmt_bits[fmt][i]; i++) {\n"
+"        uint b = hd_fmt_bits[fmt][i];\n"
+"\n"
+"        c[i] = (uint)((v >> sh) & (b == 32 ? 0xffffffffull : (1ull << b) - 1));\n"
+"        sh += b;\n"
+"    }\n"
+"}\n"
+"\n"
+"static float hd_half(uint h)\n"
+"{\n"
+"    return float(as_type<half>((ushort)h));\n"
+"}\n"
+"\n"
+"/* comp_value() */\n"
+"static uint hd_comp(uint c, uint bits, bool is_float, bool is_signed, uint num)\n"
+"{\n"
+"    if (is_float) {\n"
+"        return bits == 16 ? as_type<uint>(hd_half(c)) : c;\n"
+"    }\n"
+"    if (is_signed && bits < 32 && ((c >> (bits - 1)) & 1)) {\n"
+"        c |= ~((1u << bits) - 1);\n"
+"    }\n"
+"    switch (num) {\n"
+"    case 0:\n"
+"        if (bits == 32) {\n"
+"            return as_type<uint>(is_signed ? (float)(int)c / 2147483647.0f\n"
+"                                           : (float)c / 4294967295.0f);\n"
+"        } else if (is_signed) {\n"
+"            return as_type<uint>(max((float)(int)c /\n"
+"                                     (float)((1u << (bits - 1)) - 1), -1.0f));\n"
+"        }\n"
+"        return as_type<uint>((float)c / (float)((1u << bits) - 1));\n"
+"    case 1:\n"
+"        return c;\n"
+"    default:\n"
+"        return as_type<uint>(is_signed ? (float)(int)c : (float)c);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- surfaces ---- */\n"
+"\n"
+"static uint hd_pipe(uint tx, uint ty, uint pipes)\n"
+"{\n"
+"    switch (pipes) {\n"
+"    case 2:\n"
+"        return (tx & 1) ^ (ty & 1);\n"
+"    case 4:\n"
+"        return ((tx & 1) ^ ((ty >> 1) & 1)) | (((tx >> 1) & 1) ^ (ty & 1)) << 1;\n"
+"    case 8:\n"
+"        return ((tx & 1) ^ ((ty >> 2) & 1)) |\n"
+"               (((tx >> 1) & 1) ^ ((ty >> 1) & 1) ^ ((ty >> 2) & 1)) << 1 |\n"
+"               (((tx >> 2) & 1) ^ (ty & 1)) << 2;\n"
+"    default:\n"
+"        return 0;\n"
+"    }\n"
+"}\n"
+"\n"
+"static uint hd_bank(uint tx, uint ty, uint banks)\n"
+"{\n"
+"    uint x3 = tx & 1, x4 = (tx >> 1) & 1, x5 = (tx >> 2) & 1, x6 = (tx >> 3) & 1;\n"
+"    uint y3 = ty & 1, y4 = (ty >> 1) & 1, y5 = (ty >> 2) & 1, y6 = (ty >> 3) & 1;\n"
+"\n"
+"    switch (banks) {\n"
+"    case 16:\n"
+"        return (x3 ^ y6) | (x4 ^ y5 ^ y6) << 1 | (x5 ^ y4) << 2 | (x6 ^ y3) << 3;\n"
+"    case 8:\n"
+"        return (x3 ^ y5) | (x4 ^ y4 ^ y5) << 1 | (x5 ^ y3) << 2;\n"
+"    case 4:\n"
+"        return (x3 ^ y4) | (x4 ^ y3) << 1;\n"
+"    case 2:\n"
+"        return x3 ^ y3;\n"
+"    default:\n"
+"        return 0;\n"
+"    }\n"
+"}\n"
+"\n"
+"/* hd5770_surf_offset_fast(): VRAM offset of element (x, y) */\n"
+"static uint hd_addr(device const GSurf &s, uint x, uint y)\n"
+"{\n"
+"    uint tx = x >> 3, ty = y >> 3, total, pipe, bank, t;\n"
+"\n"
+"    if (s.mode < 2) {\n"
+"        return s.voff + y * s.row_bytes + x * s.bpe;\n"
+"    }\n"
+"    if (s.mode == 2) {\n"
+"        t = (ty * s.mt_per_row + tx) * s.tile_bytes;\n"
+"    } else {\n"
+"        total = ((ty >> (s.mt_h_sh - 3)) * s.mt_per_row + (tx >> (s.mt_w_sh - 3))) *\n"
+"                s.mt_bytes +\n"
+"                (((ty & (s.bankh - 1)) << s.bankw_sh) +\n"
+"                 ((tx >> s.pipes_sh) & (s.bankw - 1))) * s.tile_bytes;\n"
+"        pipe = hd_pipe(tx, ty, s.pipes);\n"
+"        bank = hd_bank(tx >> (s.bankw_sh + s.pipes_sh), ty >> s.bankh_sh,\n"
+"                       s.banks) & (s.banks - 1);\n"
+"        t = (total & (s.pib - 1)) | pipe << s.pib_sh |\n"
+"            bank << (s.pib_sh + s.pipes_sh) | (total >> s.pib_sh) << s.hi_sh;\n"
+"    }\n"
+"    return s.voff + t + s.eoff[(y & 7) * 8 + (x & 7)];\n"
+"}\n"
+"\n"
+"/* ---- ALU: eval() and post() ---- */\n"
+"\n"
+"static float hd_mul(float a, float b)\n"
+"{\n"
+"    if (a == 0.0f || b == 0.0f) {\n"
+"        return 0.0f;\n"
+"    }\n"
+"    return a * b;\n"
+"}\n"
+"\n"
+"static float hd_max9(float a, float b)\n"
+"{\n"
+"    return a >= b ? a : (isnan(b) ? a : b);\n"
+"}\n"
+"\n"
+"static float hd_min9(float a, float b)\n"
+"{\n"
+"    return a < b ? a : (isnan(b) ? a : b);\n"
+"}\n"
+"\n"
+"static float hd_cl01(float v)\n"
+"{\n"
+"    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : (isnan(v) ? 0.0f : v));\n"
+"}\n"
+"\n"
+"#define F(x) as_type<float>(x)\n"
+"#define U(x) as_type<uint>(x)\n"
+"#define I(x) as_type<int>(x)\n"
+"\n"
+"/* mods: bit k neg of source k, bit 4 + k abs */\n"
+"static float hd_fmod(uint mods, uint k, uint v)\n"
+"{\n"
+"    float f = F(v);\n"
+"\n"
+"    if ((mods >> (4 + k)) & 1) {\n"
+"        f = fabs(f);\n"
+"    }\n"
+"    if ((mods >> k) & 1) {\n"
+"        f = -f;\n"
+"    }\n"
+"    return f;\n"
+"}\n"
+"\n"
+"static int hd_f2i(float a)\n"
+"{\n"
+"    return isnan(a) ? 0 : (a >= 2147483647.0f ? 2147483647 :\n"
+"           (a <= -2147483648.0f ? (int)0x80000000 : (int)a));\n"
+"}\n"
+"\n"
+"static uint hd_eval(uint op, uint mods, uint s0, uint s1, uint s2,\n"
+"                    thread bool &kill)\n"
+"{\n"
+"    float a = 0, b = 0, c = 0;\n"
+"\n"
+"    if (op & 0x800) {\n"
+"        a = F(s0);\n"
+"        b = F(s1);\n"
+"        c = F(s2);\n"
+"        if (mods & 1) {\n"
+"            a = -a;\n"
+"        }\n"
+"        if (mods & 2) {\n"
+"            b = -b;\n"
+"        }\n"
+"        if (mods & 4) {\n"
+"            c = -c;\n"
+"        }\n"
+"        switch (op & 0x1f) {\n"
+"        case 0x14: return U(hd_mul(a, b) + c);\n"
+"        case 0x15: return U((hd_mul(a, b) + c) * 2.0f);\n"
+"        case 0x16: return U((hd_mul(a, b) + c) * 4.0f);\n"
+"        case 0x17: return U((hd_mul(a, b) + c) * 0.5f);\n"
+"        case 0x18: return U(fma(a, b, c));\n"
+"        case 0x07: return U(fma(a, b, c));\n"
+"        case 0x19: return a == 0.0f ? ((mods & 2) ? U(b) : s1) : ((mods & 4) ? U(c) : s2);\n"
+"        case 0x1a: return a > 0.0f ? ((mods & 2) ? U(b) : s1) : ((mods & 4) ? U(c) : s2);\n"
+"        case 0x1b: return a >= 0.0f ? ((mods & 2) ? U(b) : s1) : ((mods & 4) ? U(c) : s2);\n"
+"        case 0x1c: return I(s0) == 0 ? s1 : s2;\n"
+"        case 0x1d: return I(s0) > 0 ? s1 : s2;\n"
+"        case 0x1e: return I(s0) >= 0 ? s1 : s2;\n"
+"        case 0x04: {\n"
+"            uint off = s1 & 31, w = s2 & 31;\n"
+"            return w ? (s0 >> off) & ((1u << w) - 1) : 0;\n"
+"        }\n"
+"        case 0x05: {\n"
+"            uint off = s1 & 31, w = s2 & 31;\n"
+"            return w ? U((int)(s0 << (32 - off - w)) >> (32 - w)) : 0;\n"
+"        }\n"
+"        case 0x06: return (s0 & s1) | (~s0 & s2);\n"
+"        default: return 0;\n"
+"        }\n"
+"    }\n"
+"    a = hd_fmod(mods, 0, s0);\n"
+"    b = hd_fmod(mods, 1, s1);\n"
+"    switch (op) {\n"
+"    case 0x00: return U(a + b);\n"
+"    case 0x01: return U(hd_mul(a, b));\n"
+"    case 0x02: return U(a * b);\n"
+"    case 0x03: return U(hd_max9(a, b));\n"
+"    case 0x04: return U(hd_min9(a, b));\n"
+"    case 0x05: return U(fmax(a, b));\n"
+"    case 0x06: return U(fmin(a, b));\n"
+"    case 0x08: return U(a == b ? 1.0f : 0.0f);\n"
+"    case 0x09: return U(a > b ? 1.0f : 0.0f);\n"
+"    case 0x0a: return U(a >= b ? 1.0f : 0.0f);\n"
+"    case 0x0b: return U(a != b ? 1.0f : 0.0f);\n"
+"    case 0x0c: return a == b ? ~0u : 0;\n"
+"    case 0x0d: return a > b ? ~0u : 0;\n"
+"    case 0x0e: return a >= b ? ~0u : 0;\n"
+"    case 0x0f: return a != b ? ~0u : 0;\n"
+"    case 0x10: return U(a - floor(a));\n"
+"    case 0x11: return U(trunc(a));\n"
+"    case 0x12: return U(ceil(a));\n"
+"    case 0x13: return U(rint(a));\n"
+"    case 0x14: return U(floor(a));\n"
+"    case 0x15: return U(I(s0) >> (s1 & 31));\n"
+"    case 0x16: return s0 >> (s1 & 31);\n"
+"    case 0x17: return s0 << (s1 & 31);\n"
+"    case 0x19: return (mods & 0x11) ? U(a) : s0;\n"
+"    case 0x1a: return 0;\n"
+"    case 0x2c: kill = a == b; return U(kill ? 1.0f : 0.0f);\n"
+"    case 0x2d: kill = a > b; return U(kill ? 1.0f : 0.0f);\n"
+"    case 0x2e: kill = a >= b; return U(kill ? 1.0f : 0.0f);\n"
+"    case 0x2f: kill = a != b; return U(kill ? 1.0f : 0.0f);\n"
+"    case 0x40: kill = s0 > s1; return kill;\n"
+"    case 0x41: kill = s0 >= s1; return kill;\n"
+"    case 0x46: kill = I(s0) == I(s1); return kill;\n"
+"    case 0x47: kill = I(s0) > I(s1); return kill;\n"
+"    case 0x48: kill = I(s0) >= I(s1); return kill;\n"
+"    case 0x49: kill = I(s0) != I(s1); return kill;\n"
+"    case 0x30: return s0 & s1;\n"
+"    case 0x31: return s0 | s1;\n"
+"    case 0x32: return s0 ^ s1;\n"
+"    case 0x33: return ~s0;\n"
+"    case 0x34: return s0 + s1;\n"
+"    case 0x35: return s0 - s1;\n"
+"    case 0x36: return I(s0) > I(s1) ? s0 : s1;\n"
+"    case 0x37: return I(s0) < I(s1) ? s0 : s1;\n"
+"    case 0x38: return s0 > s1 ? s0 : s1;\n"
+"    case 0x39: return s0 < s1 ? s0 : s1;\n"
+"    case 0x3a: return I(s0) == I(s1) ? ~0u : 0;\n"
+"    case 0x3b: return I(s0) > I(s1) ? ~0u : 0;\n"
+"    case 0x3c: return I(s0) >= I(s1) ? ~0u : 0;\n"
+"    case 0x3d: return I(s0) != I(s1) ? ~0u : 0;\n"
+"    case 0x3e: return s0 > s1 ? ~0u : 0;\n"
+"    case 0x3f: return s0 >= s1 ? ~0u : 0;\n"
+"    case 0x50: return U(hd_f2i(trunc(a)));\n"
+"    case 0xb1: return U(hd_f2i(floor(a)));\n"
+"    case 0xb0: return U(hd_f2i(floor(a + 0.5f)));\n"
+"    case 0x9a: return isnan(a) || a <= 0.0f ? 0 :\n"
+"                      (a >= 4294967295.0f ? 0xffffffffu : (uint)trunc(a));\n"
+"    case 0x9b: return U((float)I(s0));\n"
+"    case 0x9c: return U((float)s0);\n"
+"    case 0x81: return U(exp2(a));\n"
+"    case 0x82: return U(a == 0.0f ? -FLT_MAX : log2(a));\n"
+"    case 0x83: return U(log2(a));\n"
+"    case 0x84: return U(a == 0.0f ? FLT_MAX : 1.0f / a);\n"
+"    case 0x85: return U(a == 0.0f ? 0.0f : 1.0f / a);\n"
+"    case 0x86: return U(1.0f / a);\n"
+"    case 0x87: return U(a == 0.0f ? FLT_MAX : 1.0f / sqrt(a));\n"
+"    case 0x88: return U(a == 0.0f ? 0.0f : 1.0f / sqrt(a));\n"
+"    case 0x89: return U(1.0f / sqrt(a));\n"
+"    case 0x8a: return U(sqrt(a));\n"
+"    case 0x8d: return U(sin(a * 2.0f * 3.14159265358979f));\n"
+"    case 0x8e: return U(cos(a * 2.0f * 3.14159265358979f));\n"
+"    case 0x8f: case 0x91: return s0 * s1;\n"
+"    case 0x90: return (uint)(((long)I(s0) * I(s1)) >> 32);\n"
+"    case 0x92: return (uint)(((ulong)s0 * s1) >> 32);\n"
+"    case 0xcc: return s0;\n"
+"    default: return 0;\n"
+"    }\n"
+"}\n"
+"\n"
+"static bool hd_isfloat(uint op, uint mods, bool clamp, uint omod)\n"
+"{\n"
+"    if (op & 0x800) {\n"
+"        return (op & 0x1f) >= 0x07 && (op & 0x1f) <= 0x1b;\n"
+"    }\n"
+"    switch (op) {\n"
+"    case 0x15: case 0x16: case 0x17: case 0x30: case 0x31: case 0x32:\n"
+"    case 0x33: case 0x34: case 0x35: case 0x36: case 0x37: case 0x38:\n"
+"    case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: case 0x3e:\n"
+"    case 0x3f: case 0x50: case 0x9a: case 0xb0: case 0xb1: case 0x8f:\n"
+"    case 0x90: case 0x91: case 0x92: case 0xcc: case 0x0c: case 0x0d:\n"
+"    case 0x0e: case 0x0f: case 0x42: case 0x43: case 0x44: case 0x45:\n"
+"    case 0x40: case 0x41: case 0x46: case 0x47: case 0x48: case 0x49:\n"
+"        return false;\n"
+"    case 0x19:\n"
+"        return omod || clamp || (mods & 0x11);\n"
+"    default:\n"
+"        return true;\n"
+"    }\n"
+"}\n"
+"\n"
+"static uint hd_post(uint op, uint mods, bool clamp, uint omod, uint v)\n"
+"{\n"
+"    float f;\n"
+"\n"
+"    if (!hd_isfloat(op, mods, clamp, omod)) {\n"
+"        return v;\n"
+"    }\n"
+"    f = F(v);\n"
+"    if (omod == 1) {\n"
+"        f *= 2.0f;\n"
+"    } else if (omod == 2) {\n"
+"        f *= 4.0f;\n"
+"    } else if (omod == 3) {\n"
+"        f *= 0.5f;\n"
+"    }\n"
+"    if (clamp) {\n"
+"        f = hd_cl01(f);\n"
+"    }\n"
+"    return U(f);\n"
+"}\n"
+"\n"
+"/* ---- fetches ---- */\n"
+"\n"
+"static bool hd_wrap(thread int &c, int size, uint mode)\n"
+"{\n"
+"    int v = c;\n"
+"\n"
+"    switch (mode) {\n"
+"    case 0:\n"
+"        v %= size;\n"
+"        if (v < 0) {\n"
+"            v += size;\n"
+"        }\n"
+"        break;\n"
+"    case 1: {\n"
+"        int p = v % (2 * size);\n"
+"\n"
+"        if (p < 0) {\n"
+"            p += 2 * size;\n"
+"        }\n"
+"        v = p < size ? p : 2 * size - 1 - p;\n"
+"        break;\n"
+"    }\n"
+"    case 2: case 3: case 5: case 7:\n"
+"        if (mode != 2) {\n"
+"            v = v < 0 ? -v - 1 : v;\n"
+"        }\n"
+"        v = max(0, min(v, size - 1));\n"
+"        break;\n"
+"    default:\n"
+"        if (v < 0 || v >= size) {\n"
+"            return false;\n"
+"        }\n"
+"        break;\n"
+"    }\n"
+"    c = v;\n"
+"    return true;\n"
+"}\n"
+"\n"
+"static void hd_texel(device const uchar *vram, device const GTex &t, int x, int y,\n"
+"                     thread uint *out)\n"
+"{\n"
+"    uint off = hd_addr(t.s, x, y), v[6], c[4];\n"
+"\n"
+"    if (t.unorm8) {\n"
+"        uint e = hd_rd(vram, off, 4);\n"
+"\n"
+"        for (uint k = 0; k < 4; k++) {\n"
+"            v[k] = U((float)((e >> (8 * k)) & 0xff) / 255.0f);\n"
+"        }\n"
+"    } else {\n"
+"        hd_unpack(t.fmt, vram, off, c);\n"
+"        for (uint k = 0; k < 4; k++) {\n"
+"            if (k < t.comps) {\n"
+"                v[k] = hd_comp(c[k], t.bits[k], t.is_float, (t.sgn >> k) & 1, t.num);\n"
+"            } else {\n"
+"                v[k] = U(k == 3 ? 1.0f : 0.0f);\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"    v[4] = U(0.0f);\n"
+"    v[5] = U(1.0f);\n"
+"    for (uint k = 0; k < 4; k++) {\n"
+"        uint s = t.dst_sel[k];\n"
+"\n"
+"        out[k] = s < 6 ? v[s] : v[4];\n"
+"    }\n"
+"}\n"
+"\n"
+"static void hd_point(device const uchar *vram, device const GTex &t, int x, int y,\n"
+"                     thread uint *out)\n"
+"{\n"
+"    if (!hd_wrap(x, t.w, t.samp0 & 7) || !hd_wrap(y, t.h, (t.samp0 >> 3) & 7)) {\n"
+"        for (uint k = 0; k < 4; k++) {\n"
+"            out[k] = U(t.border[k]);\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    hd_texel(vram, t, x, y, out);\n"
+"}\n"
+"\n"
+"static int hd_floori(float f)\n"
+"{\n"
+"    return isnan(f) ? 0 : (int)clamp(floor(f), -2147483648.0f, 2147483520.0f);\n"
+"}\n"
+"\n"
+"/* tfetch_stage() for the pixel shader */\n"
+"static void hd_tfetch(device const uchar *vram, device const GTex &t, uint w0,\n"
+"                      uint w1, uint w2, thread const uint *c, thread uint *v)\n"
+"{\n"
+"    uint op = w0 & 0x1f;\n"
+"    int ox = ((int)(w2 << 27)) >> 27, oy = ((int)(w2 << 22)) >> 27;\n"
+"    float u, vv;\n"
+"\n"
+"    v[0] = v[1] = v[2] = v[3] = U(0.0f);\n"
+"    if (op == 0x03) {\n"
+"        int x = I(c[0]) + ox / 2, y = I(c[1]) + oy / 2;\n"
+"\n"
+"        if (x >= 0 && y >= 0 && x < (int)t.w && y < (int)t.h) {\n"
+"            hd_texel(vram, t, x, y, v);\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    u = F(c[0]);\n"
+"    vv = F(c[1]);\n"
+"    if ((w1 >> 28) & 1) {\n"
+"        u *= t.w;\n"
+"    }\n"
+"    if ((w1 >> 29) & 1) {\n"
+"        vv *= t.h;\n"
+"    }\n"
+"    u = fma((float)ox, 0.5f, u);\n"
+"    vv = fma((float)oy, 0.5f, vv);\n"
+"    if (t.dim == 0) {\n"
+"        vv = 0.5f;\n"
+"    }\n"
+"    if (((t.samp0 >> 9) & 1) == 0 && ((t.samp0 >> 11) & 1) == 0) {\n"
+"        hd_point(vram, t, hd_floori(u), hd_floori(vv), v);\n"
+"        return;\n"
+"    }\n"
+"    {\n"
+"        float fx = u - 0.5f, fy = vv - 0.5f;\n"
+"        int x0 = hd_floori(fx), y0 = hd_floori(fy);\n"
+"        float ax = fx - x0, ay = fy - y0;\n"
+"        uint t00[4], t10[4], t01[4], t11[4];\n"
+"\n"
+"        hd_point(vram, t, x0, y0, t00);\n"
+"        hd_point(vram, t, x0 + 1, y0, t10);\n"
+"        hd_point(vram, t, x0, y0 + 1, t01);\n"
+"        hd_point(vram, t, x0 + 1, y0 + 1, t11);\n"
+"        for (uint k = 0; k < 4; k++) {\n"
+"            float top = fma(F(t10[k]) - F(t00[k]), ax, F(t00[k]));\n"
+"            float bot = fma(F(t11[k]) - F(t01[k]), ax, F(t01[k]));\n"
+"\n"
+"            v[k] = U(fma(bot - top, ay, top));\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* vfetch_stage() for the pixel shader */\n"
+"static void hd_vfetch(device const GDraw &u, device const uchar *st, uint w0,\n"
+"                      uint w1, uint w2, uint index, thread uint *v)\n"
+"{\n"
+"    uint bid = (w0 >> 8) & 0xff, off = w2 & 0xffff, fmt, num, sgn, n, k;\n"
+"    uint c[4];\n"
+"\n"
+"    if (bid == 128) {\n"
+"        uint e = index + off / 16;\n"
+"        device const uint *cf = (device const uint *)(st + u.cfile_off);\n"
+"\n"
+"        for (k = 0; k < 4; k++) {\n"
+"            v[k] = e < 256 ? cf[e * 4 + k] : 0;\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    v[0] = v[1] = v[2] = U(0.0f);\n"
+"    v[3] = U(1.0f);\n"
+"    for (k = 0; k < u.nvb && u.vb[k].id != bid; k++) {\n"
+"    }\n"
+"    if (k == u.nvb) {\n"
+"        return;\n"
+"    }\n"
+"    device const GVb &b = u.vb[k];\n"
+"    uint size = b.res[1] + 1, stride = (b.res[2] >> 8) & 0x7ff;\n"
+"    if ((w1 >> 21) & 1) {\n"
+"        fmt = (b.res[2] >> 20) & 0x3f;\n"
+"        num = (b.res[2] >> 26) & 3;\n"
+"        sgn = (b.res[2] >> 28) & 1;\n"
+"    } else {\n"
+"        fmt = (w1 >> 22) & 0x3f;\n"
+"        num = (w1 >> 28) & 3;\n"
+"        sgn = (w1 >> 30) & 1;\n"
+"    }\n"
+"    n = hd_fmt_bytes(fmt);\n"
+"    ulong at = (ulong)index * stride + off;\n"
+"    if (at + n > size || at + n > b.len) {\n"
+"        v[0] = v[1] = v[2] = 0;\n"
+"        return;\n"
+"    }\n"
+"    hd_unpack(fmt, st, b.off + (uint)at, c);\n"
+"    for (k = 0; k < 4 && hd_fmt_bits[fmt][k]; k++) {\n"
+"        v[k] = hd_comp(c[k], hd_fmt_bits[fmt][k], hd_fmt_float(fmt), sgn, num);\n"
+"    }\n"
+"}\n"
+"\n"
+"/* ---- rasterisation ---- */\n"
+"\n"
+"static float hd_edge(float ax, float ay, float bx, float by, float px, float py)\n"
+"{\n"
+"    if (ax > bx || (ax == bx && ay > by)) {\n"
+"        return -fma(ax - bx, py - by, -((ay - by) * (px - bx)));\n"
+"    }\n"
+"    return fma(bx - ax, py - ay, -((by - ay) * (px - ax)));\n"
+"}\n"
+"\n"
+"static bool hd_owns(float ax, float ay, float bx, float by)\n"
+"{\n"
+"    return (ay == by && bx < ax) || by < ay;\n"
+"}\n"
+"\n"
+"/* interp() */\n"
+"static float hd_interp(device const GDraw &u, device const GTri &t,\n"
+"                       device const float *prm, uint p, uint chan, bool flat,\n"
+"                       float b0, float b1, float b2, float pw)\n"
+"{\n"
+"    float a, b, c;\n"
+"\n"
+"    if (p >= u.ninputs) {\n"
+"        return 0.0f;\n"
+"    }\n"
+"    a = prm[p * 12 + chan];\n"
+"    if (flat || ((u.flat >> p) & 1)) {\n"
+"        return a;\n"
+"    }\n"
+"    b = prm[p * 12 + 4 + chan];\n"
+"    c = prm[p * 12 + 8 + chan];\n"
+"    if (u.persp) {\n"
+"        return fma(c * t.w[2], b2, fma(a * t.w[0], b0, (b * t.w[1]) * b1)) * pw;\n"
+"    }\n"
+"    return fma(c, b2, fma(a, b0, b * b1));\n"
+"}\n"
+"\n"
+"/* ---- output: alpha_pass(), put_pixel() ---- */\n"
+"\n"
+"static bool hd_alpha(device const GDraw &u, float a)\n"
+"{\n"
+"    float r = u.alpha_ref;\n"
+"\n"
+"    switch (u.alpha_func) {\n"
+"    case 0: return false;\n"
+"    case 1: return a < r;\n"
+"    case 2: return a == r;\n"
+"    case 3: return a <= r;\n"
+"    case 4: return a > r;\n"
+"    case 5: return a != r;\n"
+"    case 6: return a >= r;\n"
+"    default: return true;\n"
+"    }\n"
+"}\n"
+"\n"
+"static float hd_bfactor(uint f, thread const float *src, thread const float *dst,\n"
+"                        device const float *cst, uint ch)\n"
+"{\n"
+"    switch (f) {\n"
+"    case 0: return 0.0f;\n"
+"    case 1: return 1.0f;\n"
+"    case 2: return src[ch];\n"
+"    case 3: return 1.0f - src[ch];\n"
+"    case 4: return src[3];\n"
+"    case 5: return 1.0f - src[3];\n"
+"    case 6: return dst[3];\n"
+"    case 7: return 1.0f - dst[3];\n"
+"    case 8: return dst[ch];\n"
+"    case 9: return 1.0f - dst[ch];\n"
+"    case 10: return ch == 3 ? 1.0f : min(src[3], 1.0f - dst[3]);\n"
+"    case 13: return cst[ch];\n"
+"    case 14: return 1.0f - cst[ch];\n"
+"    case 19: return cst[3];\n"
+"    case 20: return 1.0f - cst[3];\n"
+"    default: return 0.0f;\n"
+"    }\n"
+"}\n"
+"\n"
+"static float hd_combine(uint fn, float s, float sf, float dv, float df)\n"
+"{\n"
+"    switch (fn) {\n"
+"    case 0: return fma(s, sf, dv * df);\n"
+"    case 1: return fma(s, sf, -(dv * df));\n"
+"    case 2: return min(s, dv);\n"
+"    case 3: return max(s, dv);\n"
+"    case 4: return fma(dv, df, -(s * sf));\n"
+"    default: return s;\n"
+"    }\n"
+"}\n"
+"\n"
+"static void hd_pack_store(device uchar *vram, uint off, uint fmt, thread const uint *c)\n"
+"{\n"
+"    uint n = hd_fmt_bytes(fmt), sh = 0;\n"
+"    ulong v = 0;\n"
+"\n"
+"    if (n > 8) {\n"
+"        for (uint i = 0; i < 4 && hd_fmt_bits[fmt][i]; i++) {\n"
+"            *(device uint *)(vram + off + 4 * i) = c[i];\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    for (uint i = 0; i < 4 && hd_fmt_bits[fmt][i]; i++) {\n"
+"        uint b = hd_fmt_bits[fmt][i];\n"
+"        ulong m = b == 32 ? 0xffffffffull : (1ull << b) - 1;\n"
+"\n"
+"        v |= ((ulong)c[i] & m) << sh;\n"
+"        sh += b;\n"
+"    }\n"
+"    switch (n) {\n"
+"    case 1: vram[off] = (uchar)v; break;\n"
+"    case 2: *(device ushort *)(vram + off) = (ushort)v; break;\n"
+"    case 4: *(device uint *)(vram + off) = (uint)v; break;\n"
+"    case 8:\n"
+"        *(device uint *)(vram + off) = (uint)v;\n"
+"        *(device uint *)(vram + off + 4) = (uint)(v >> 32);\n"
+"        break;\n"
+"    default: break;\n"
+"    }\n"
+"}\n"
+"\n"
+"static void hd_put(device uchar *vram, device const GDraw &u, int x, int y,\n"
+"                   thread const uint *col)\n"
+"{\n"
+"    uint off = hd_addr(u.rt, x, y), c[4] = { 0, 0, 0, 0 }, old[4];\n"
+"    uint n = u.rt_comps;\n"
+"    float src[4], dst[4];\n"
+"\n"
+"    hd_unpack(u.rt_fmt, vram, off, old);\n"
+"    if (u.rt_num == 4 || u.rt_float) {\n"
+"        for (uint i = 0; i < n; i++) {\n"
+"            uint s = u.rt_src[i];\n"
+"\n"
+"            c[i] = (u.wmask >> s) & 1 ? col[s] : old[i];\n"
+"        }\n"
+"        hd_pack_store(vram, off, u.rt_fmt, c);\n"
+"        return;\n"
+"    }\n"
+"    for (uint i = 0; i < 4; i++) {\n"
+"        src[i] = F(col[i]);\n"
+"        if (isnan(src[i])) {\n"
+"            src[i] = 0.0f;\n"
+"        }\n"
+"        dst[i] = i == 3 ? 1.0f : 0.0f;\n"
+"    }\n"
+"    for (uint i = 0; i < n; i++) {\n"
+"        dst[u.rt_src[i]] = (float)old[i] / (float)((1u << u.rt_bits[i]) - 1);\n"
+"    }\n"
+"    if ((u.blend & (1u << 30)) && u.rt_blend) {\n"
+"        uint csrc = u.blend & 0x1f, cfn = (u.blend >> 5) & 7;\n"
+"        uint cdst = (u.blend >> 8) & 0x1f;\n"
+"        uint asrc = csrc, afn = cfn, adst = cdst;\n"
+"        float out[4], sc[4];\n"
+"\n"
+"        if ((u.blend >> 29) & 1) {\n"
+"            asrc = (u.blend >> 16) & 0x1f;\n"
+"            afn = (u.blend >> 21) & 7;\n"
+"            adst = (u.blend >> 24) & 0x1f;\n"
+"        }\n"
+"        for (uint i = 0; i < 4; i++) {\n"
+"            sc[i] = min(max(src[i], 0.0f), 1.0f);\n"
+"        }\n"
+"        for (uint i = 0; i < 4; i++) {\n"
+"            uint fs = i == 3 ? asrc : csrc, fd = i == 3 ? adst : cdst;\n"
+"            uint fn = i == 3 ? afn : cfn;\n"
+"\n"
+"            out[i] = hd_combine(fn, sc[i],\n"
+"                                hd_bfactor(fs, sc, dst, u.blend_const, i), dst[i],\n"
+"                                hd_bfactor(fd, sc, dst, u.blend_const, i));\n"
+"        }\n"
+"        for (uint i = 0; i < 4; i++) {\n"
+"            src[i] = out[i];\n"
+"        }\n"
+"    }\n"
+"    for (uint i = 0; i < n; i++) {\n"
+"        uint s = u.rt_src[i];\n"
+"        uint mx = (1u << u.rt_bits[i]) - 1;\n"
+"        float v = min(max(src[s], 0.0f), 1.0f);\n"
+"\n"
+"        c[i] = (u.wmask >> s) & 1 ? (uint)fma(v, (float)mx, 0.5f) : old[i];\n"
+"    }\n"
+"    hd_pack_store(vram, off, u.rt_fmt, c);\n"
+"}\n"
+"\n"
+"static bool hd_clip(device const GDraw &u, int x, int y)\n"
+"{\n"
+"    uint idx = 0;\n"
+"\n"
+"    for (uint i = 0; i < 4; i++) {\n"
+"        if (x >= u.cr[i * 4] && x < u.cr[i * 4 + 2] &&\n"
+"            y >= u.cr[i * 4 + 1] && y < u.cr[i * 4 + 3]) {\n"
+"            idx |= 1u << i;\n"
+"        }\n"
+"    }\n"
+"    return (u.cliprule >> idx) & 1;\n"
+"}\n"
+"\n";
+
+static void src_expr(GString *o, const HD5770IRSrc *s)
+{
+    switch (s->kind) {
+    case HD5770_IRS_GPR:
+        g_string_append_printf(o, "r[%u][%u]", s->idx, s->chan);
+        break;
+    case HD5770_IRS_PV:
+        g_string_append_printf(o, "pv[%u]", s->chan);
+        break;
+    case HD5770_IRS_CONST:
+        g_string_append_printf(o, "kv[%u]", s->k);
+        break;
+    default:
+        g_string_append_printf(o, "0x%08xu", s->imm);
+        break;
+    }
+}
+
+static unsigned src_mods(const HD5770IRInst *in)
+{
+    unsigned m = 0, k;
+
+    for (k = 0; k < in->nsrc; k++) {
+        m |= (in->src[k].neg ? 1u : 0) << k;
+        m |= (in->src[k].abs ? 1u : 0) << (4 + k);
+    }
+    return m;
+}
+
+static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
+{
+    unsigned i, k;
+
+    g_string_append(o, "    {\n");
+    for (i = 0; i < g->n; i++) {
+        const HD5770IRInst *in = &ir->insts[g->first + i];
+
+        if (!in->needed) {
+            continue;
+        }
+        for (k = 0; k < in->nsrc; k++) {
+            g_string_append_printf(o, "        uint s%u_%u = ", i, k);
+            src_expr(o, &in->src[k]);
+            g_string_append(o, ";\n");
+        }
+        g_string_append_printf(o, "        uint q%u = 0;\n", i);
+    }
+    if (g->dot) {
+        g_string_append(o, "        float dot = 0.0f;\n");
+    }
+    for (i = 0; i < g->n; i++) {
+        const HD5770IRInst *in = &ir->insts[g->first + i];
+        unsigned m = src_mods(in);
+
+        if (!in->needed) {
+            continue;
+        }
+        if (in->dot) {
+            g_string_append_printf(o, "        dot = dot + %s(hd_fmod(%uu, 0, s%u_0), "
+                                   "hd_fmod(%uu, 1, s%u_1));\n",
+                                   in->op == 0xbe ? "hd_mul" : "hd_mulieee",
+                                   m, i, m, i);
+        } else if (in->interp) {
+            g_string_append_printf(o, "        q%u = U(hd_interp(u, t, prm, %u, %u, "
+                                   "%s, b0, b1, b2, pw));\n", i, in->prm,
+                                   in->dst_chan, in->flat ? "true" : "false");
+        } else if (in->max4) {
+            continue;
+        } else {
+            g_string_append_printf(o, "        { bool k = false; q%u = hd_eval(0x%xu, "
+                                   "%uu", i, in->op, m);
+            for (k = 0; k < 3; k++) {
+                if (k < in->nsrc) {
+                    g_string_append_printf(o, ", s%u_%u", i, k);
+                } else {
+                    g_string_append(o, ", 0u");
+                }
+            }
+            g_string_append(o, ", k); if (k) { killed = true; } }\n");
+        }
+    }
+    if (g->dot) {
+        for (i = 0; i < g->n; i++) {
+            if (ir->insts[g->first + i].dot && ir->insts[g->first + i].needed) {
+                g_string_append_printf(o, "        q%u = U(dot);\n", i);
+            }
+        }
+    }
+    if (g->max4) {
+        g_string_append(o, "        { float m = -FLT_MAX;\n");
+        for (i = 0; i < g->n; i++) {
+            const HD5770IRInst *in = &ir->insts[g->first + i];
+
+            if (in->max4) {
+                g_string_append_printf(o, "          m = hd_max9(m, hd_fmod(%uu, 0, s%u_0));\n",
+                                       src_mods(in), i);
+            }
+        }
+        for (i = 0; i < g->n; i++) {
+            if (ir->insts[g->first + i].max4) {
+                g_string_append_printf(o, "          q%u = U(m);\n", i);
+            }
+        }
+        g_string_append(o, "        }\n");
+    }
+    for (i = 0; i < g->n; i++) {
+        const HD5770IRInst *in = &ir->insts[g->first + i];
+
+        if (!in->needed) {
+            continue;
+        }
+        if (in->omod || in->clamp) {
+            g_string_append_printf(o, "        q%u = hd_post(0x%xu, %uu, %s, %uu, q%u);\n",
+                                   i, in->op, src_mods(in),
+                                   in->clamp ? "true" : "false", in->omod, i);
+        }
+        g_string_append_printf(o, "        pv[%u] = q%u;\n", in->slot, i);
+    }
+    for (i = 0; i < g->n; i++) {
+        const HD5770IRInst *in = &ir->insts[g->first + i];
+
+        if (in->wr) {
+            g_string_append_printf(o, "        r[%u][%u] = q%u;\n", in->dst,
+                                   in->dst_chan, i);
+        }
+    }
+    g_string_append(o, "    }\n");
+}
+
+static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
+{
+    unsigned k, unit = 0;
+
+    g_string_append(o, "    {\n        uint o[4] = { 0, 0, 0, 0 };\n");
+    if (f->kind == HD5770_IRF_VTX) {
+        g_string_append_printf(o, "        hd_vfetch(u, st, 0x%08xu, 0x%08xu, 0x%08xu, "
+                               "r[%u][%u], o);\n", f->w[0], f->w[1], f->w[2],
+                               f->src, (f->w[0] >> 24) & 3);
+    } else {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        g_string_append(o, "        uint c[4] = {");
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, " r[%u][%u]", f->src, sel);
+            } else {
+                g_string_append(o, sel == 5 ? " U(1.0f)" : " U(0.0f)");
+            }
+            g_string_append(o, k < 3 ? "," : " };\n");
+        }
+        g_string_append_printf(o, "        hd_tfetch(vram, tex[%u], 0x%08xu, 0x%08xu, "
+                               "0x%08xu, c, o);\n", unit, f->w[0], f->w[1], f->w[2]);
+    }
+    for (k = 0; k < 4; k++) {
+        unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
+
+        if (sel < 4) {
+            g_string_append_printf(o, "        r[%u][%u] = o[%u];\n", f->dst, k, sel);
+        } else if (sel == 4 || sel == 5) {
+            g_string_append_printf(o, "        r[%u][%u] = U(%s);\n", f->dst, k,
+                                   sel == 5 ? "1.0f" : "0.0f");
+        }
+    }
+    g_string_append(o, "    }\n");
+}
+
+char *hd5770_msl_program(const HD5770IR *ir)
+{
+    GString *o = g_string_new(hd5770_msl_lib);
+    unsigned i, j, k;
+
+    if (ir->grad) {
+        g_string_free(o, true);
+        return NULL;
+    }
+    g_string_append(o,
+        "static float hd_mulieee(float a, float b) { return a * b; }\n"
+        "kernel void hd_main(device uchar *vram [[buffer(0)]],\n"
+        "    device const GDraw &u [[buffer(1)]], device const GTri &t [[buffer(2)]],\n"
+        "    device const uint *kv [[buffer(3)]], device const uchar *st [[buffer(4)]],\n"
+        "    device const GTex *tex [[buffer(5)]], device const float *prm [[buffer(6)]],\n"
+        "    uint2 gid [[thread_position_in_grid]])\n"
+        "{\n"
+        "    int x = t.x0 + (int)gid.x, y = t.y0 + (int)gid.y;\n"
+        "    if (x > t.x1 || y > t.y1) {\n        return;\n    }\n"
+        "    float pc = u.pix_center, px = x + pc, py = y + pc;\n"
+        "    float w0 = hd_edge(t.x[1], t.y[1], t.x[2], t.y[2], px, py);\n"
+        "    float w1 = hd_edge(t.x[2], t.y[2], t.x[0], t.y[0], px, py);\n"
+        "    float w2 = hd_edge(t.x[0], t.y[0], t.x[1], t.y[1], px, py);\n"
+        "    if (w0 < 0 || w1 < 0 || w2 < 0) {\n        return;\n    }\n"
+        "    if ((w0 == 0 && !hd_owns(t.x[1], t.y[1], t.x[2], t.y[2])) ||\n"
+        "        (w1 == 0 && !hd_owns(t.x[2], t.y[2], t.x[0], t.y[0])) ||\n"
+        "        (w2 == 0 && !hd_owns(t.x[0], t.y[0], t.x[1], t.y[1]))) {\n"
+        "        return;\n    }\n"
+        "    if (u.cliprule != 0xffff && !hd_clip(u, x, y)) {\n        return;\n    }\n"
+        "    float b0 = w0 / t.area, b1 = w1 / t.area, b2 = w2 / t.area, pw = 0.0f;\n"
+        "    if (u.persp) {\n"
+        "        float s = fma(b2, t.w[2], fma(b0, t.w[0], b1 * t.w[1]));\n"
+        "        pw = s != 0.0f ? 1.0f / s : 0.0f;\n"
+        "    }\n");
+    g_string_append_printf(o,
+        "    uint r[%u][4];\n"
+        "    for (uint i = 0; i < %u; i++) {\n"
+        "        r[i][0] = r[i][1] = r[i][2] = r[i][3] = 0;\n"
+        "    }\n"
+        "    uint pv[5] = { 0, 0, 0, 0, 0 }, col[4] = { 0, 0, 0, 0 };\n"
+        "    bool killed = false, c0 = false;\n"
+        "    if (u.pos_gpr >= 0) {\n"
+        "        r[u.pos_gpr][0] = U(px);\n        r[u.pos_gpr][1] = U(py);\n"
+        "        r[u.pos_gpr][2] = U(0.0f);\n        r[u.pos_gpr][3] = U(1.0f);\n"
+        "    }\n"
+        "    r[%u][0] = U(b1);\n    r[%u][1] = U(b2);\n",
+        MAX(ir->ngpr, 1u), MAX(ir->ngpr, 1u), ir->map[0], ir->map[0]);
+    for (i = 0; i < ir->nops; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+
+        switch (op->kind) {
+        case HD5770_IRO_ALU:
+            for (j = 0; j < op->n; j++) {
+                emit_group(o, ir, &ir->groups[op->first + j]);
+            }
+            break;
+        case HD5770_IRO_FETCH:
+            for (j = 0; j < op->n; j++) {
+                emit_fetch(o, ir, &ir->fetches[op->first + j]);
+            }
+            break;
+        default: {
+            const HD5770IRExport *e = &ir->exports[op->first];
+
+            for (k = 0; k < 4; k++) {
+                unsigned sel = e->sel[k];
+
+                if (sel < 4) {
+                    g_string_append_printf(o, "    col[%u] = r[%u][%u];\n", k,
+                                           e->gpr, sel);
+                } else {
+                    g_string_append_printf(o, "    col[%u] = %s;\n", k,
+                                           sel == 4 ? "U(0.0f)" :
+                                           sel == 5 ? "U(1.0f)" : "0u");
+                }
+            }
+            g_string_append(o, "    c0 = true;\n");
+            break;
+        }
+        }
+    }
+    g_string_append(o,
+        "    if (killed || !c0) {\n        return;\n    }\n"
+        "    if (u.alpha_test && !hd_alpha(u, F(col[3]))) {\n        return;\n    }\n"
+        "    hd_put(vram, u, x, y, col);\n"
+        "}\n");
+    return g_string_free(o, false);
+}

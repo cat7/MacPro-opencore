@@ -232,6 +232,8 @@ struct ATIHD5770State {
     VMChangeStateEntry *eng_vmse;
     uint64_t eng_runs, eng_waits, eng_draw_ns;
     uint64_t redraws;           /* scanout conversions */
+    char *gpu_prop;             /* "gpu": off, on, verify */
+    QemuRecMutex gpu_mutex;     /* the host GPU backend */
     HD5770CPStats cp;
     HD5770Census census_cb0, census_ps, census_vs, census_prim;
     uint64_t census_ctx_writes[1024];

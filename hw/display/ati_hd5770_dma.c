@@ -228,6 +228,8 @@ void ati_hd5770_dma_run(ATIHD5770State *s)
     if (s->dma_running || !(cntl & EG_DMA_RB_ENABLE)) {
         return;
     }
+    /* copies follow the 3D engine's draws */
+    hd5770_gfx_sync(&s->gfx3d);
     s->dma_running = true;
     s->dma_stalled = false;
     bytes = 4u << MIN((cntl >> 1) & 0x1f, 22u);

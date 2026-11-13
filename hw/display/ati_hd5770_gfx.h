@@ -190,6 +190,21 @@ enum {
 #define HD5770_ALU_CONST_DWORDS 4096
 
 typedef struct HD5770ShaderCache HD5770ShaderCache;
+typedef struct HD5770Gpu HD5770Gpu;
+
+enum {
+    HD5770_GPU_OFF,             /* every draw on the CPU */
+    HD5770_GPU_ON,              /* draws the backend takes on the host GPU */
+    HD5770_GPU_VERIFY,          /* both, compared; VRAM as the CPU leaves it */
+};
+
+#define HD5770_PENDING          16
+
+typedef struct HD5770GpuStats {
+    uint64_t offered, taken, fallback[8];
+    uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
+    uint64_t syncs, touch_syncs;
+} HD5770GpuStats;
 
 typedef struct HD5770Gfx {
     const uint32_t *ctx;        /* register file from 0x28000 */
@@ -198,10 +213,27 @@ typedef struct HD5770Gfx {
     HD5770Mem mem;
     HD5770GfxStats *st;
     HD5770ShaderCache *cache;
+    /* host GPU backend (ati_hd5770_gpu.h), NULL for none */
+    HD5770Gpu *gpu;
+    int gpu_mode;
+    uint8_t *vram;              /* host memory of VRAM */
+    uint64_t vram_size;
+    /* VRAM ranges queued draws read or write, [lo, hi) */
+    uint64_t pend[HD5770_PENDING][2];
+    unsigned npend;
+    HD5770GpuStats gst;
+    /* serialises the backend between threads; recursive, may be NULL */
+    void (*lock)(struct HD5770Gfx *g, bool on);
+    void *lock_opaque;
 } HD5770Gfx;
 
 void hd5770_gfx_init(HD5770Gfx *g);
 void hd5770_gfx_fini(HD5770Gfx *g);
+/* everything the backend has queued is in VRAM */
+void hd5770_gfx_sync(HD5770Gfx *g);
+/* about to access VRAM bytes [off, off + len) on the CPU */
+void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len);
+void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out);
 /* a draw packet, b[0] its header, n dwords */
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n);
 void hd5770_gfx_stats(HD5770Gfx *g, GString *out);

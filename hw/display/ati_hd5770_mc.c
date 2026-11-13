@@ -138,6 +138,7 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
                 memset(p, 0, n);
             }
         } else if (sp.vram) {
+            hd5770_gfx_touch(&s->gfx3d, sp.addr, n);
             if (write) {
                 memcpy(vram_ptr(s) + sp.addr, p, n);
                 memory_region_set_dirty(&s->vram, sp.addr, n);

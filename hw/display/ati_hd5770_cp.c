@@ -29,8 +29,10 @@
 #include "qemu/main-loop.h"
 #include "qemu/rcu.h"
 #include "system/runstate.h"
+#include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
 #include "ati_hd5770_int.h"
+#include "ati_hd5770_gpu.h"
 #include "ati_hd5770_regs.h"
 #include "trace.h"
 
@@ -111,6 +113,25 @@ static const bool op_known[256] = {
     [OP_SET_RESOURCE_OFFSET] = true, [OP_SET_ALU_CONST_VS] = true,
     [OP_SET_ALU_CONST_DI] = true, [OP_SET_APPEND_CNT] = true,
 };
+
+/* packets that write memory or raise interrupts */
+static bool op_signals(unsigned op)
+{
+    switch (op) {
+    case OP_EVENT_WRITE:
+    case OP_EVENT_WRITE_EOP:
+    case OP_EVENT_WRITE_EOS:
+    case OP_MEM_WRITE:
+    case OP_COND_WRITE:
+    case OP_COPY_DW:
+    case OP_MEM_SEMAPHORE:
+    case OP_CP_DMA:
+    case OP_STRMOUT_BUFFER_UPDATE:
+        return true;
+    default:
+        return false;
+    }
+}
 
 /* this thread is running a command stream */
 static __thread bool cp_in_stream;
@@ -207,6 +228,7 @@ static uint32_t cp_reg_read(ATIHD5770State *s, uint32_t off)
 
 static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
 {
+    hd5770_gfx_sync(&s->gfx3d);
     if (s->regs[EG_SCRATCH_UMSK >> 2] & (1u << n)) {
         ati_hd5770_mc_wr32(s, ((uint64_t)s->regs[EG_SCRATCH_ADDR >> 2] << 8) +
                            4 * n, val);
@@ -219,6 +241,7 @@ static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
 
 static void cp_irq(ATIHD5770State *s, uint32_t stat, uint32_t src)
 {
+    hd5770_gfx_sync(&s->gfx3d);
     s->regs[EG_CP_INT_STATUS >> 2] |= stat;
     if (s->regs[EG_CP_INT_CNTL >> 2] & stat) {
         ati_hd5770_ih_push(s, src, 0);
@@ -418,6 +441,10 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         }
         ati_hd5770_mc_unmap_all(s);
         return PKT_DONE;
+    }
+    if (op_signals(op)) {
+        /* what the guest may learn from it follows the draws before it */
+        hd5770_gfx_sync(&s->gfx3d);
     }
     switch (op) {
     case OP_INDIRECT_BUFFER:
@@ -771,6 +798,8 @@ static void cp_run(ATIHD5770State *s)
             s->cp_depth = 1;
         }
     }
+    /* the engine goes idle with its draws in memory */
+    hd5770_gfx_sync(&s->gfx3d);
     if (s->cp_rptr != rptr0) {
         rptr_writeback(s);
     }
@@ -1150,6 +1179,7 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
     }
     g_string_append_c(out, '\n');
     hd5770_gfx_stats(&s->gfx3d, out);
+    hd5770_gfx_gpu_stats(&s->gfx3d, out);
     ati_hd5770_dma_stats(s, out);
 }
 
@@ -1181,6 +1211,51 @@ void ati_hd5770_cp_reset(ATIHD5770State *s)
     ati_hd5770_dma_reset(s);
 }
 
+static void gpu_lock_cb(HD5770Gfx *g, bool on)
+{
+    ATIHD5770State *s = g->lock_opaque;
+
+    if (on) {
+        qemu_rec_mutex_lock(&s->gpu_mutex);
+    } else {
+        qemu_rec_mutex_unlock(&s->gpu_mutex);
+    }
+}
+
+static void gpu_done_cb(void *opaque, uint64_t lo, uint64_t hi)
+{
+    ATIHD5770State *s = opaque;
+
+    memory_region_set_dirty(&s->vram, lo, hi - lo);
+}
+
+/* the host GPU backend gpu=on|verify names, if the host has one */
+static void gpu_open(ATIHD5770State *s)
+{
+    const char *mode = s->gpu_prop ? s->gpu_prop : "on";
+    HD5770Gpu *gp = NULL;
+    const char *err = "no host GPU backend on this host";
+
+    if (!s->accel || !strcmp(mode, "off")) {
+        return;
+    }
+#ifdef CONFIG_DARWIN
+    gp = hd5770_mtl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
+                         &err);
+#endif
+    if (!gp) {
+        warn_report("ati-hd5770: gpu=%s: %s; drawing on the CPU", mode, err);
+        return;
+    }
+    gp->done = gpu_done_cb;
+    gp->opaque = s;
+    s->gfx3d.gpu = gp;
+    s->gfx3d.vram = memory_region_get_ram_ptr(&s->vram);
+    s->gfx3d.vram_size = s->vram_size;
+    s->gfx3d.gpu_mode = !strcmp(mode, "verify") ? HD5770_GPU_VERIFY
+                                                : HD5770_GPU_ON;
+}
+
 void ati_hd5770_cp_init(ATIHD5770State *s)
 {
     s->gfx = g_new0(uint32_t, HD5770_GFX_DWORDS);
@@ -1196,6 +1271,10 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     s->gfx3d.st = s->gfx_stats;
     hd5770_gfx_init(&s->gfx3d);
     ati_hd5770_mc_gfx_init(s);
+    qemu_rec_mutex_init(&s->gpu_mutex);
+    s->gfx3d.lock = gpu_lock_cb;
+    s->gfx3d.lock_opaque = s;
+    gpu_open(s);
     if (s->accel && s->cp_thread) {
         s->eng_on = true;
         s->eng_hold = !runstate_is_running();
@@ -1223,6 +1302,11 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
         qemu_cond_destroy(&s->eng_idle_cond);
         qemu_mutex_destroy(&s->eng_lock);
         s->eng_on = false;
+    }
+    if (s->gfx3d.gpu) {
+        hd5770_gfx_sync(&s->gfx3d);
+        s->gfx3d.gpu->ops->close(s->gfx3d.gpu->b);
+        s->gfx3d.gpu = NULL;
     }
     timer_free(s->cp_timer);
     s->cp_timer = NULL;
