@@ -317,6 +317,7 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
             error_report("WHPX: failed to unmap GPA range");
             abort();
         }
+        whpx->ram_unmaps++;
         return;
     }
 

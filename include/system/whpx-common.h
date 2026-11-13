@@ -9,6 +9,9 @@ struct AccelCPUState {
     bool ready_for_pic_interrupt;
     uint64_t tpr;
     bool interruption_pending;
+    /* memory access exit last run again; ram_unmaps at that time */
+    uint64_t remap_retry_gpa;
+    uint64_t remap_retry_unmaps;
     /* Must be the last field as it may have a tail */
     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
 };

@@ -1108,11 +1108,50 @@ static int emulate_msr_instruction(CPUState *cpu,
     return 0;
 }
 
+/*
+ * A change of the memory map unmaps guest RAM from the partition and maps
+ * it again, under the BQL. A vCPU touching that RAM meanwhile exits here,
+ * not always flagged as unmapped and at times with no instruction bytes.
+ * Once the BQL is free the map is whole again, and an access the map gives
+ * to RAM runs again in the guest, unless it already did so with no unmap
+ * since. The emulator decodes only some instructions; SSE stores end in an
+ * abort there.
+ */
+static bool whpx_mmio_hit_remapped_ram(CPUState *cpu,
+                                       WHV_MEMORY_ACCESS_CONTEXT *ctx)
+{
+    AccelCPUState *vcpu = cpu->accel;
+    bool write = ctx->AccessInfo.AccessType == WHvMemoryAccessWrite;
+    MemoryRegion *mr;
+    hwaddr xlat, len = 1;
+    bool ram;
+
+    WITH_RCU_READ_LOCK_GUARD() {
+        mr = address_space_translate(&address_space_memory, ctx->Gpa, &xlat,
+                                     &len, write, MEMTXATTRS_UNSPECIFIED);
+        ram = memory_region_is_ram(mr) &&
+              !(write && (mr->readonly || mr->rom_device));
+    }
+    if (!ram) {
+        return false;
+    }
+    bql_lock();
+    ram = vcpu->remap_retry_gpa != ctx->Gpa ||
+          vcpu->remap_retry_unmaps != whpx_global.ram_unmaps;
+    vcpu->remap_retry_gpa = ram ? ctx->Gpa : -1;
+    vcpu->remap_retry_unmaps = whpx_global.ram_unmaps;
+    bql_unlock();
+    return ram;
+}
+
 static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
 {
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    if (whpx_mmio_hit_remapped_ram(cpu, ctx)) {
+        return 0;
+    }
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
     if (ret < 0) {
         error_report("failed to emulate mmio");
@@ -2856,6 +2895,7 @@ int whpx_init_vcpu(CPUState *cpu)
     }
 
     vcpu = g_new0(AccelCPUState, 1);
+    vcpu->remap_retry_gpa = -1;
 
     hr = whp_dispatch.WHvCreateVirtualProcessor(
         whpx->partition, cpu->cpu_index, 0);

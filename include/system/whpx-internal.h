@@ -51,6 +51,9 @@ struct whpx_state {
 
     bool ignore_unknown_msr;
     bool intercept_msr_gp;
+
+    /* guest RAM unmaps from the partition so far; the BQL is held */
+    uint64_t ram_unmaps;
 };
 
 extern struct whpx_state whpx_global;
