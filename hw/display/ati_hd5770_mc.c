@@ -214,3 +214,77 @@ bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         return false;
     }
 }
+
+/* ---------------------------------------------------------------- */
+/* Direct access for the 3D engine                                  */
+
+static uint8_t *gfx_map(void *opaque, uint64_t mc, uint64_t *len, bool write)
+{
+    ATIHD5770State *s = opaque;
+    MCSpan sp;
+    HD5770Map *m;
+    dma_addr_t plen;
+    void *p;
+
+    mc_resolve(s, mc, &sp);
+    if (sp.fault || !sp.len) {
+        return NULL;
+    }
+    if (sp.vram) {
+        if (sp.addr >= s->vram_size) {
+            return NULL;
+        }
+        *len = MIN(sp.len, s->vram_size - sp.addr);
+        return vram_ptr(s) + sp.addr;
+    }
+    /* system memory: one page at a time, released after the draw */
+    plen = MIN(sp.len, 0x1000 - (sp.addr & 0xfff));
+    p = pci_dma_map(PCI_DEVICE(s), sp.addr, &plen,
+                    write ? DMA_DIRECTION_FROM_DEVICE
+                          : DMA_DIRECTION_TO_DEVICE);
+    if (!p) {
+        return NULL;
+    }
+    if (s->n_maps == s->max_maps) {
+        s->max_maps = MAX(64, s->max_maps * 2);
+        s->maps = g_renew(HD5770Map, s->maps, s->max_maps);
+    }
+    m = &s->maps[s->n_maps++];
+    m->p = p;
+    m->len = plen;
+    m->write = write;
+    *len = plen;
+    return p;
+}
+
+static void gfx_dirty(void *opaque, uint64_t mc, uint64_t len)
+{
+    ATIHD5770State *s = opaque;
+    uint64_t off;
+
+    if (ati_hd5770_mc_to_vram(s, mc, &off) && off < s->vram_size) {
+        memory_region_set_dirty(&s->vram, off, MIN(len, s->vram_size - off));
+    }
+}
+
+void ati_hd5770_mc_unmap_all(ATIHD5770State *s)
+{
+    uint32_t i;
+
+    for (i = 0; i < s->n_maps; i++) {
+        HD5770Map *m = &s->maps[i];
+
+        pci_dma_unmap(PCI_DEVICE(s), m->p, m->len,
+                      m->write ? DMA_DIRECTION_FROM_DEVICE
+                               : DMA_DIRECTION_TO_DEVICE,
+                      m->write ? m->len : 0);
+    }
+    s->n_maps = 0;
+}
+
+void ati_hd5770_mc_gfx_init(ATIHD5770State *s)
+{
+    s->gfx3d.mem.opaque = s;
+    s->gfx3d.mem.map = gfx_map;
+    s->gfx3d.mem.dirty = gfx_dirty;
+}

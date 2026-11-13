@@ -836,7 +836,7 @@ static const VMStateDescription vmstate_ati_hd5770_stream = {
 
 static const VMStateDescription vmstate_ati_hd5770_engines = {
     .name = "ati-radeon-hd5770/engines",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .needed = ati_hd5770_engines_needed,
     .fields = (const VMStateField[]) {
@@ -856,6 +856,8 @@ static const VMStateDescription vmstate_ati_hd5770_engines = {
         VMSTATE_UINT64_ARRAY(cp_shadow_base, ATIHD5770State, 8),
         VMSTATE_UINT32(dma_rptr, ATIHD5770State),
         VMSTATE_BOOL(dma_stalled, ATIHD5770State),
+        VMSTATE_VARRAY_UINT32(alu_const, ATIHD5770State, alu_const_dwords, 2,
+                              vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };

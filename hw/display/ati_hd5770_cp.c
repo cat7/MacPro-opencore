@@ -12,7 +12,8 @@
  * source 181 when CP_INT_CNTL enables time stamp interrupts. A
  * WAIT_REG_MEM or a semaphore wait whose condition is false stalls the
  * CP at that packet (GRBM_STATUS busy) and a timer polls it again.
- * Draws and dispatches are counted, nothing is rendered.
+ * Draws go to the 3D engine (ati_hd5770_draw.c) at once; SET_ALU_CONST
+ * fills the DX9 constant file the shaders read as constant buffer 0.
  *
  * Packets and registers the model does not act on are counted in the
  * `gaps` property; counters and a census of the state WindowServer
@@ -70,8 +71,8 @@ enum {
 
 /*
  * Register classes of SET_* (0x68 + i) and LOAD_* (0x60 + i): byte base
- * of the class, and its bit in CONTEXT_CONTROL. ALU constants have no
- * register file on Evergreen.
+ * of the class, and its bit in CONTEXT_CONTROL. ALU constants go to the
+ * constant file instead.
  */
 static const uint32_t class_base[8] = {
     EG_CONFIG_REG_FIRST, EG_CONTEXT_REG_FIRST, 0, EG_BOOL_CONST_FIRST,
@@ -293,6 +294,18 @@ static void set_regs(ATIHD5770State *s, unsigned cls, const uint32_t *b,
     uint64_t shadow = s->cp_shadow_base[cls];
     bool shadowing = (s->cp_shadow_ctl & (1u << cls)) && shadow;
 
+    if (cls == 2) {
+        /* the DX9 constant file the CP keeps: PS 0-1023, VS 1024-2047 */
+        for (i = 2; i < n; i++) {
+            uint32_t idx = (b[1] & 0xffff) + (i - 2);
+
+            if (idx < HD5770_ALU_CONST_DWORDS) {
+                s->alu_const[idx] = b[i];
+            }
+        }
+        s->cp.set_regs += n - 2;
+        return;
+    }
     if (!base || n < 2) {
         return;
     }
@@ -385,6 +398,8 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         s->cp.draws++;
         ati_hd5770_census_add(&s->census_prim,
                               s->regs[EG_VGT_PRIMITIVE_TYPE >> 2] & 0x3f);
+        hd5770_gfx_draw(&s->gfx3d, b, n);
+        ati_hd5770_mc_unmap_all(s);
         return PKT_DONE;
     }
     switch (op) {
@@ -929,6 +944,7 @@ void ati_hd5770_cp_gaps(ATIHD5770State *s, GString *out)
                                out->len ? "\n" : "", s->mc.gart_invalid,
                                s->mc.fault_reads, s->mc.fault_writes);
     }
+    hd5770_gfx_gaps(&s->gfx3d, out);
     if (s->dma.sub_gap) {
         g_string_append_printf(out, "%sDMA packets not modelled %" PRIu64,
                                out->len ? "\n" : "", s->dma.sub_gap);
@@ -1002,6 +1018,7 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         }
     }
     g_string_append_c(out, '\n');
+    hd5770_gfx_stats(&s->gfx3d, out);
     ati_hd5770_dma_stats(s, out);
 }
 
@@ -1024,6 +1041,7 @@ void ati_hd5770_cp_reset(ATIHD5770State *s)
     s->cp_load_ctl = 0;
     s->cp_shadow_ctl = 0;
     memset(s->cp_shadow_base, 0, sizeof(s->cp_shadow_base));
+    memset(s->alu_const, 0, HD5770_ALU_CONST_DWORDS * 4);
     ati_hd5770_dma_reset(s);
 }
 
@@ -1033,6 +1051,15 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     s->gfx_dwords = HD5770_GFX_DWORDS;
     s->cp_pkt = g_new0(uint32_t, HD5770_CP_MAX_PKT);
     s->cp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cp_timer_cb, s);
+    s->alu_const = g_new0(uint32_t, HD5770_ALU_CONST_DWORDS);
+    s->alu_const_dwords = HD5770_ALU_CONST_DWORDS;
+    s->gfx_stats = g_new0(HD5770GfxStats, 1);
+    s->gfx3d.ctx = s->gfx;
+    s->gfx3d.cfg = s->regs;
+    s->gfx3d.alu = s->alu_const;
+    s->gfx3d.st = s->gfx_stats;
+    hd5770_gfx_init(&s->gfx3d);
+    ati_hd5770_mc_gfx_init(s);
 }
 
 void ati_hd5770_cp_fini(ATIHD5770State *s)
@@ -1043,4 +1070,8 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
     s->gfx = NULL;
     g_free(s->cp_pkt);
     s->cp_pkt = NULL;
+    hd5770_gfx_fini(&s->gfx3d);
+    g_free(s->gfx_stats);
+    g_free(s->alu_const);
+    g_free(s->maps);
 }

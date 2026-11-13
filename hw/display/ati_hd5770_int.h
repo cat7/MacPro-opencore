@@ -11,9 +11,9 @@
  * With accel on: VM context 0 (GART) translation and its TLB invalidate
  * handshake (ati_hd5770_mc.c), the command processor with its ring,
  * indirect buffers, register file and fences (ati_hd5770_cp.c), and the
- * asynchronous DMA engine (ati_hd5770_dma.c). Draws are parsed and
- * counted, nothing is rendered. The display path detiles a tiled
- * scanout surface (ati_hd5770_surf.c).
+ * asynchronous DMA engine (ati_hd5770_dma.c). Draws run on the CPU
+ * (ati_hd5770_draw.c, _sh.c, _surf.c) into VRAM and system memory; the
+ * display path detiles a tiled scanout surface.
  *
  * Everything runs on the BQL.
  *
@@ -100,6 +100,13 @@ typedef struct HD5770DMAStats {
     uint64_t kicks, packets, cmd[16], fences, traps, traps_masked;
     uint64_t write_dw, copy_bytes, fill_bytes, sub_gap, ibs, stalls;
 } HD5770DMAStats;
+
+/* a host mapping of guest memory held for the duration of a draw */
+typedef struct HD5770Map {
+    void *p;
+    dma_addr_t len;
+    bool write;
+} HD5770Map;
 
 typedef struct HD5770MCStats {
     uint64_t gart, gart_invalid, tlb_inval, fault_reads, fault_writes;
@@ -221,6 +228,14 @@ struct ATIHD5770State {
     HD5770DMAStats dma;
 
     HD5770MCStats mc;
+
+    /* 3D engine (accel on) */
+    HD5770Gfx gfx3d;
+    HD5770GfxStats *gfx_stats;
+    uint32_t *alu_const;        /* SET_ALU_CONST file, PS then VS */
+    uint32_t alu_const_dwords;
+    HD5770Map *maps;
+    uint32_t n_maps, max_maps;
 };
 
 /* ati_hd5770.c */
@@ -253,6 +268,8 @@ uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
 void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);
 bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+void ati_hd5770_mc_gfx_init(ATIHD5770State *s);
+void ati_hd5770_mc_unmap_all(ATIHD5770State *s);
 
 /* ati_hd5770_cp.c */
 void ati_hd5770_cp_init(ATIHD5770State *s);
