@@ -983,6 +983,10 @@ static bool rt_setup(Draw *d)
         return false;
     }
     d->rt.base = (uint64_t)CTX(g, base) << 8;
+    if (((info >> 8) & 0xf) == HD5770_ARRAY_LINEAR_GENERAL) {
+        /* CB_COLOR0_VIEW.SLICE_START[7:0]: the address's low byte */
+        d->rt.base |= CTX(g, base + 0xc) & 0xff;
+    }
     d->rt.pitch = ((pitch & 0x7ff) + 1) * 8;
     d->rt.height = ((slice & 0x3fffff) + 1) * 64 / d->rt.pitch;
     d->rt.bpe = d->rt_bpe;
