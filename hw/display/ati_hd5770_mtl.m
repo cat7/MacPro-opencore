@@ -748,6 +748,8 @@ static bool mtl_ram(void *opaque, uint8_t *host, uint64_t size)
 
 static const HD5770GpuOps mtl_ops = {
     .name = "metal",
+    /* the CPU finishes these sooner than a round trip */
+    .min_pixels = 1024,
     .draw = mtl_draw,
     .sync = mtl_sync,
     .stats = mtl_stats,

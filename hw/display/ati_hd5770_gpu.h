@@ -132,6 +132,8 @@ typedef struct HD5770GpuOps {
     void (*close)(void *b);
     /* host memory of guest RAM for surfaces of space 1; false: none */
     bool (*ram)(void *b, uint8_t *host, uint64_t size);
+    /* draws covering fewer pixels stay on the CPU; 0: all are offered */
+    unsigned min_pixels;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {

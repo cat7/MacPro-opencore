@@ -1697,13 +1697,6 @@ enum {
     GFB_PROG, GFB_SMALL, GFB_RT, GFB_TEX, GFB_VB, GFB_BACKEND,
 };
 
-/*
- * Draws covering fewer pixels than this stay on the CPU: the lanes finish
- * them sooner than a round trip to the GPU, which a fence would then wait
- * for.
- */
-#define GPU_MIN_PIXELS          1024
-
 /* texture unit u of a request: the CPU path's Tex, in VRAM */
 static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
                     HD5770GpuTex *gt)
@@ -1900,7 +1893,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         area += (uint64_t)(q->tri[i].x1 - q->tri[i].x0 + 1) *
                 (q->tri[i].y1 - q->tri[i].y0 + 1);
     }
-    if (area < GPU_MIN_PIXELS && g->gpu_mode == HD5770_GPU_ON) {
+    if (area < g->gpu->ops->min_pixels && g->gpu_mode == HD5770_GPU_ON) {
         g->gst.fallback[GFB_SMALL]++;
         goto out;
     }
