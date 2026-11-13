@@ -1690,8 +1690,15 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
 }
 
 enum {
-    GFB_PROG, GFB_GRAD, GFB_RT, GFB_TEX, GFB_VB, GFB_BACKEND,
+    GFB_PROG, GFB_SMALL, GFB_RT, GFB_TEX, GFB_VB, GFB_BACKEND,
 };
+
+/*
+ * Draws covering fewer pixels than this stay on the CPU: the lanes finish
+ * them sooner than a round trip to the GPU, which a fence would then wait
+ * for.
+ */
+#define GPU_MIN_PIXELS          1024
 
 /* texture unit u of a request: the CPU path's Tex, in VRAM */
 static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
@@ -1811,7 +1818,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     HD5770Gfx *g = d->g;
     const HD5770IR *ir;
     HD5770GpuDraw *q;
-    uint64_t rt_off, lo = 0, hi = 0;
+    uint64_t rt_off, lo = 0, hi = 0, area = 0;
     uint8_t *pre = NULL;
     unsigned i;
     int y0 = INT_MAX, y1 = -1;
@@ -1886,6 +1893,12 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     for (i = 0; i < q->ntri; i++) {
         y0 = MIN(y0, q->tri[i].y0);
         y1 = MAX(y1, q->tri[i].y1);
+        area += (uint64_t)(q->tri[i].x1 - q->tri[i].x0 + 1) *
+                (q->tri[i].y1 - q->tri[i].y0 + 1);
+    }
+    if (area < GPU_MIN_PIXELS && g->gpu_mode == HD5770_GPU_ON) {
+        g->gst.fallback[GFB_SMALL]++;
+        goto out;
     }
     if (y1 >= y0 && !q->rt.space) {
         hd5770_surf_rows(&d->rt, y0, y1 + 1, &lo, &hi);
@@ -1913,6 +1926,8 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     }
     g->ram_pend |= q->rt.space;
     for (i = 0; i < q->ntex; i++) {
+        /* guest RAM the GPU reads is not tracked by range */
+        g->ram_pend |= q->tex[i].surf.space;
         if (!q->tex[i].surf.space) {
             pend_add(g, q->tex[i].surf.voff,
                      q->tex[i].surf.voff + hd5770_surf_size(&q->tex[i].surf.s));
@@ -2140,7 +2155,14 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     taken = gpu_draw(d, vb, nv, prim, t);
     gpu_lock(g, false);
     if (!taken) {
-        hd5770_gfx_sync(g);
+        uint64_t off;
+
+        /* the CPU writes the target: after queued draws that touch it */
+        if (vram_off(g, d->rt.base, hd5770_surf_size(&d->rt), &off)) {
+            hd5770_gfx_touch(g, off, hd5770_surf_size(&d->rt));
+        } else if (g->ram_pend) {
+            hd5770_gfx_sync(g);
+        }
         assemble(d, vb, nv, prim, t, raster_tri);
         if (d->ok && d->g->mem.dirty) {
             d->g->mem.dirty(d->g->mem.opaque, d->rt.base,
@@ -2313,13 +2335,13 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
     }
     g_string_append_printf(out,
         "gpu: %s offered %" PRIu64 " taken %" PRIu64 " fallback: program %"
-        PRIu64 " gradients %" PRIu64 " target %" PRIu64 " texture %" PRIu64
+        PRIu64 " small %" PRIu64 " target %" PRIu64 " texture %" PRIu64
         " vertex buffer %" PRIu64 " backend %" PRIu64 "\n"
         "gpu: syncs %" PRIu64 " (on access %" PRIu64 ") verified %" PRIu64
         " differing draws %" PRIu64 " bytes %" PRIu64 " (>1: %" PRIu64
         ") max %" PRIu64 "\n",
         g->gpu_mode == HD5770_GPU_VERIFY ? "verify" : "on", t->offered,
-        t->taken, t->fallback[GFB_PROG], t->fallback[GFB_GRAD],
+        t->taken, t->fallback[GFB_PROG], t->fallback[GFB_SMALL],
         t->fallback[GFB_RT], t->fallback[GFB_TEX], t->fallback[GFB_VB],
         t->fallback[GFB_BACKEND], t->syncs, t->touch_syncs, t->verified,
         t->vdiff_draws, t->vdiff_bytes, t->vdiff_big, t->vmax);

@@ -12,13 +12,15 @@
  *
  * hd5770_msl_program() adds one compute kernel per program, hd_main:
  * threadgroup g of 64 threads covers tile g of the dispatch, a block of
- * a triangle's box; thread l is its pixel (x + l % w, y + l / w). The
+ * the box of a triangle, or of the two halves of a rectangle or quad
+ * (they share no pixel); thread l is its pixel (x + l % w, y + l / w). The
  * thread runs the coverage test, the clip rectangles, the program and
  * the output stage. Buffers: 0 VRAM, 1 staging bytes, 3 guest RAM (for
  * surfaces outside VRAM, through their page tables), 2 tiles: eight
  * words each, the staging offsets of the GDraw, the GTri, the
  * triangle's inputs (ninputs x 3 vertices x 4 floats), the GTex array
- * and the bound constants, then x, y, w.
+ * and the bound constants, then x, y, and w | second half << 8 | the
+ * inputs' stride in vec4 << 16; a second half's GTri is 64 bytes on.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -1069,6 +1071,19 @@ char *hd5770_msl_program(const HD5770IR *ir)
 
     g_string_append(o,
         "static float hd_mulieee(float a, float b) { return a * b; }\n"
+        "/* raster_tri(): pixel (x, y) of the triangle's box and covered */\n"
+        "static bool hd_cover(device const GTri &t, int x, int y, float px, float py,\n"
+        "                     thread float &w0, thread float &w1, thread float &w2)\n"
+        "{\n"
+        "    if (x < t.x0 || x > t.x1 || y < t.y0 || y > t.y1) {\n        return false;\n    }\n"
+        "    w0 = hd_edge(t.x[1], t.y[1], t.x[2], t.y[2], px, py);\n"
+        "    w1 = hd_edge(t.x[2], t.y[2], t.x[0], t.y[0], px, py);\n"
+        "    w2 = hd_edge(t.x[0], t.y[0], t.x[1], t.y[1], px, py);\n"
+        "    if (w0 < 0 || w1 < 0 || w2 < 0) {\n        return false;\n    }\n"
+        "    return !((w0 == 0 && !hd_owns(t.x[1], t.y[1], t.x[2], t.y[2])) ||\n"
+        "             (w1 == 0 && !hd_owns(t.x[2], t.y[2], t.x[0], t.y[0])) ||\n"
+        "             (w2 == 0 && !hd_owns(t.x[0], t.y[0], t.x[1], t.y[1])));\n"
+        "}\n"
         "kernel void hd_main(device uchar *vram [[buffer(0)]],\n"
         "    device const uchar *st [[buffer(1)]], device const uint *tiles [[buffer(2)]],\n"
         "    device uchar *ram [[buffer(3)]],\n"
@@ -1077,22 +1092,23 @@ char *hd5770_msl_program(const HD5770IR *ir)
         "{\n"
         "    device const uint *te = tiles + tg * 8;\n"
         "    device const GDraw &u = *(device const GDraw *)(st + te[0]);\n"
-        "    device const GTri &t = *(device const GTri *)(st + te[1]);\n"
+        "    device const GTri *tp = (device const GTri *)(st + te[1]);\n"
         "    device const float *prm = (device const float *)(st + te[2]);\n"
         "    device const GTex *tex = (device const GTex *)(st + te[3]);\n"
         "    device const uint *kv = (device const uint *)(st + te[4]);\n"
-        "    uint sw = te[7];\n"
+        "    uint sw = te[7] & 0xff;\n"
         "    int x = (int)te[5] + (int)(l % sw), y = (int)te[6] + (int)(l / sw);\n"
-        "    if (x > t.x1 || y > t.y1) {\n        return;\n    }\n"
         "    float pc = u.pix_center, px = x + pc, py = y + pc;\n"
-        "    float w0 = hd_edge(t.x[1], t.y[1], t.x[2], t.y[2], px, py);\n"
-        "    float w1 = hd_edge(t.x[2], t.y[2], t.x[0], t.y[0], px, py);\n"
-        "    float w2 = hd_edge(t.x[0], t.y[0], t.x[1], t.y[1], px, py);\n"
-        "    if (w0 < 0 || w1 < 0 || w2 < 0) {\n        return;\n    }\n"
-        "    if ((w0 == 0 && !hd_owns(t.x[1], t.y[1], t.x[2], t.y[2])) ||\n"
-        "        (w1 == 0 && !hd_owns(t.x[2], t.y[2], t.x[0], t.y[0])) ||\n"
-        "        (w2 == 0 && !hd_owns(t.x[0], t.y[0], t.x[1], t.y[1]))) {\n"
-        "        return;\n    }\n"
+        "    float w0, w1, w2;\n"
+        "    bool in = hd_cover(*tp, x, y, px, py, w0, w1, w2);\n"
+        "    if (!in && (te[7] & 0x100)) {\n"
+        "        /* the other half of the primitive; they share no pixel */\n"
+        "        tp = (device const GTri *)(st + te[1] + 64);\n"
+        "        prm += (te[7] >> 16) * 4;\n"
+        "        in = hd_cover(*tp, x, y, px, py, w0, w1, w2);\n"
+        "    }\n"
+        "    if (!in) {\n        return;\n    }\n"
+        "    device const GTri &t = *tp;\n"
         "    if (u.cliprule != 0xffff && !hd_clip(u, x, y)) {\n        return;\n    }\n"
         "    uint col[4] = { 0, 0, 0, 0 };\n"
         "    bool killed = false, c0 = false;\n");

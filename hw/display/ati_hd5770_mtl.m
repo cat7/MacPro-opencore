@@ -585,56 +585,75 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             m->bpso = p->pso;
         }
         for (i = 0; i < d->ntri; i++) {
-            const HD5770GpuTri *t = &d->tri[i];
-            GTri *gt;
-            unsigned tw, th;
-            int x, y;
+            const HD5770GpuTri *t = &d->tri[i], *pt[2] = { t, NULL };
+            size_t ps = ROUND_UP(MAX(prm_tri, 16), 16);
+            unsigned tw, th, n = 1, q;
+            int x, y, bx0, by0, bx1, by1;
 
             if (t->x1 < t->x0 || t->y1 < t->y0) {
                 continue;
             }
-            {
+            /* the two halves of a rectangle or quad share one set of tiles */
+            if (i + 1 < d->ntri && d->tri[i + 1].prim == t->prim &&
+                d->tri[i + 1].x1 >= d->tri[i + 1].x0 &&
+                d->tri[i + 1].y1 >= d->tri[i + 1].y0) {
+                pt[1] = &d->tri[i + 1];
+                n = 2;
+            }
+            o_tri = mtl_take(m, 64 * n);
+            o_prm = mtl_take(m, ps * n);
+            bx0 = t->x0;
+            by0 = t->y0;
+            bx1 = t->x1;
+            by1 = t->y1;
+            for (q = 0; q < n; q++) {
+                const HD5770GpuTri *u = pt[q];
+                GTri *gt = (GTri *)(st + o_tri + 64 * q);
                 uint64_t lo, hi;
 
                 if (d->rt.space) {
                     lo = MTL_RAM_RANGE;
                     hi = MTL_RAM_RANGE + 1;
                 } else {
-                    hd5770_surf_rows(&d->rt.s, t->y0, t->y1 + 1, &lo, &hi);
+                    hd5770_surf_rows(&d->rt.s, u->y0, u->y1 + 1, &lo, &hi);
                     lo = lo - d->rt.s.base + d->rt.voff;
                     hi = hi - d->rt.s.base + d->rt.voff;
                 }
-                mtl_hazard(m, d, t, lo, hi, first);
+                mtl_hazard(m, d, u, lo, hi, first);
                 first = false;
+                memcpy(gt->x, u->x, sizeof(gt->x));
+                memcpy(gt->y, u->y, sizeof(gt->y));
+                memcpy(gt->w, u->w, sizeof(gt->w));
+                gt->area = u->area;
+                gt->x0 = u->x0;
+                gt->y0 = u->y0;
+                gt->x1 = u->x1;
+                gt->y1 = u->y1;
+                memcpy(st + o_prm + ps * q,
+                       d->prm + (size_t)(i + q) * d->ninputs * 12, prm_tri);
+                bx0 = MIN(bx0, u->x0);
+                by0 = MIN(by0, u->y0);
+                bx1 = MAX(bx1, u->x1);
+                by1 = MAX(by1, u->y1);
+                m->tris++;
             }
-            o_tri = mtl_take(m, sizeof(GTri));
-            gt = (GTri *)(st + o_tri);
-            memcpy(gt->x, t->x, sizeof(gt->x));
-            memcpy(gt->y, t->y, sizeof(gt->y));
-            memcpy(gt->w, t->w, sizeof(gt->w));
-            gt->area = t->area;
-            gt->x0 = t->x0;
-            gt->y0 = t->y0;
-            gt->x1 = t->x1;
-            gt->y1 = t->y1;
-            o_prm = mtl_take(m, MAX(prm_tri, 16));
-            memcpy(st + o_prm, d->prm + (size_t)i * d->ninputs * 12, prm_tri);
             /* tiles of 64 x 1 for thin boxes, up to 8 x 8 */
-            th = t->y1 - t->y0 + 1;
+            th = by1 - by0 + 1;
             th = th >= 8 ? 8 : th >= 4 ? 4 : th >= 2 ? 2 : 1;
             tw = MTL_TILE / th;
-            for (y = t->y0; y <= t->y1; y += th) {
-                for (x = t->x0; x <= t->x1; x += tw) {
+            for (y = by0; y <= by1; y += th) {
+                for (x = bx0; x <= bx1; x += tw) {
                     uint32_t te[8] = {
-                        o_draw, o_tri, o_prm, o_tex, o_kv, x, y, tw,
+                        o_draw, o_tri, o_prm, o_tex, o_kv, x, y,
+                        tw | (n - 1) << 8 | (uint32_t)(ps / 16) << 16,
                     };
 
                     g_array_append_vals(m->tiles, te, 8);
                 }
             }
-            miny = MIN(miny, t->y0);
-            maxy = MAX(maxy, t->y1);
-            m->tris++;
+            miny = MIN(miny, by0);
+            maxy = MAX(maxy, by1);
+            i += n - 1;
         }
     }
     if (maxy >= miny && d->rt.space) {
