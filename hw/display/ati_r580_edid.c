@@ -5,16 +5,17 @@
  * 16:10 sizes only in an Established Timings III descriptor, which Mac OS X
  * 10.6 ignores, times them for 75 Hz with normal blanking (pixel clocks
  * the ATI driver rejects for large modes) and serves a single 128-byte
- * block.  This builder makes an EDID 1.3 base block plus a CEA-861
- * extension in which every mode is a detailed timing with CVT reduced
- * blanking at the `refresh` rate, lowered per size as far as it needs
- * to stay within dual-link DVI, plus the preferred size at 60 Hz:
+ * block.  This builder makes an EDID 1.3 base block plus a VESA video
+ * timing block extension (Mac OS X 10.5 takes a monitor with a CEA-861
+ * extension for a television) in which every mode is a detailed timing
+ * with CVT reduced blanking at the `refresh` rate, lowered per size as
+ * far as it needs to stay within dual-link DVI, plus the preferred size
+ * at 60 Hz:
  *
  *   base:      preferred mode and one more as DTDs, range limits, monitor
  *              name; established 640x480/800x600/1024x768; 8 standard
  *              timings
- *   extension: a video capability block and up to 6 more DTDs (the large
- *              16:10 and 16:9 sizes)
+ *   extension: up to 6 more DTDs (the large 16:10 and 16:9 sizes)
  *
  * Modes larger than xmax x ymax are left out.
  *
@@ -298,17 +299,13 @@ void ati_r580_edid_build(uint8_t edid[ATI_R580_EDID_SIZE], uint32_t prefx,
     b[126] = 1;             /* one extension */
     checksum(b);
 
-    /* --- CEA-861 extension: a video capability block, then DTDs --- */
-    x[0] = 0x02;
-    x[1] = 3;
-    x[2] = 7;               /* DTDs start after the 3-byte VCDB */
-    x[3] = 0x80;            /* IT formats underscanned (a PC monitor) */
-    x[4] = (7 << 5) | 2;    /* extended tag block, 2 bytes */
-    x[5] = 0x00;            /* video capability data block */
-    x[6] = 0x4a;            /* RGB quantization selectable, IT and CE underscanned */
+    /* --- VTB extension: DTDs only, no CVT or standard timings --- */
+    x[0] = 0x10;
+    x[1] = 1;
     for (i = 0; k < n && i < 6; i++, k++) {
-        put_dtd(x + 7 + 18 * i, &list[k], wmm);
+        put_dtd(x + 5 + 18 * i, &list[k], wmm);
     }
+    x[2] = i;
     checksum(x);
 }
 
