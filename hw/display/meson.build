@@ -101,7 +101,8 @@ endif
 # the monitor EDID of the ATI cards
 system_ss.add(when: 'CONFIG_ATI_R580_EDID', if_true: files('ati_r580_edid.c'))
 
-system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5770_dce4.c', 'ati_hd5770_atom.c'))
+system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5770_dce4.c', 'ati_hd5770_atom.c',
+                                                        'ati_hd5770_mc.c'))
 
 # the HD 5770's synthetic AtomBIOS option ROM
 if have_system and config_all_devices.has_key('CONFIG_ATI_HD5770')

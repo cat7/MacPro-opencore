@@ -1,13 +1,15 @@
 /*
  * QEMU ATI Radeon HD 5770 (Juniper) emulation: internal interface.
  *
- * Milestone 1 of the card: PCI identity, synthetic AtomBIOS + UEFI GOP
- * option ROM, the memory controller's FB window and HDP, the interrupt
- * handler ring, and the DCE 4 display engine (six CRTCs, graphics
- * surface, cursor, LUT, hot plug, DDC). No command processor, GART or 3D:
- * their status registers read idle. With accel off the chip reports no
- * aperture, so Apple's accelerator declines at start and the framebuffer
- * driver runs alone.
+ * PCI identity, synthetic AtomBIOS + UEFI GOP option ROM, the memory
+ * controller's FB window and HDP, the interrupt handler ring, and the
+ * DCE 4 display engine (six CRTCs, graphics surface, cursor, LUT, hot
+ * plug, DDC). With accel off the chip reports no aperture, so Apple's
+ * accelerator declines at start and the framebuffer driver runs alone;
+ * the engine registers are then plain storage and read idle.
+ *
+ * With accel on: VM context 0 (GART) translation and its TLB invalidate
+ * handshake (ati_hd5770_mc.c).
  *
  * Everything runs on the BQL.
  *
@@ -53,6 +55,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIHD5770State, ATI_HD5770)
 /* IH source ids (Evergreen) */
 #define HD5770_IH_SRC_D1                1   /* D1..D6 = 1..6, data 0 vblank 1 vline */
 #define HD5770_IH_SRC_HPD               42  /* data = HPD pin - 1 */
+
+typedef struct HD5770MCStats {
+    uint64_t gart, gart_invalid, tlb_inval, fault_reads, fault_writes;
+} HD5770MCStats;
 
 typedef struct ATIHD5770Mode {
     uint32_t width, height, bpp, pitch;
@@ -137,6 +143,8 @@ struct ATIHD5770State {
     uint32_t unk_rd[ATI_HD5770_NUM_REGS];
     uint32_t unk_wr[ATI_HD5770_NUM_REGS];
     uint32_t atom_calls[128];
+
+    HD5770MCStats mc;
 };
 
 /* ati_hd5770.c */
@@ -157,6 +165,16 @@ void ati_hd5770_dce4_cursor_apply(ATIHD5770State *s);
 const uint8_t (*ati_hd5770_dce4_lut(ATIHD5770State *s))[3];
 void ati_hd5770_dce4_set_pixclk(ATIHD5770State *s, unsigned crtc,
                                 uint32_t clk_10khz);
+
+/* ati_hd5770_mc.c */
+void ati_hd5770_mc_read(ATIHD5770State *s, uint64_t mc, void *buf,
+                        unsigned len);
+void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
+                         unsigned len);
+uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
+void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
+void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);
+bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 
 /* ati_hd5770_atom.c */
 bool ati_hd5770_atom_write(ATIHD5770State *s, uint32_t off, uint32_t val);

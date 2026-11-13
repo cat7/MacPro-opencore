@@ -49,21 +49,6 @@ bool ati_hd5770_mc_to_vram(ATIHD5770State *s, uint64_t mc, uint64_t *off)
     return true;
 }
 
-/* a write by the chip: VRAM inside the FB window, else system memory */
-static void mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
-                     unsigned len)
-{
-    uint64_t off;
-
-    if (ati_hd5770_mc_to_vram(s, mc, &off) && off + len <= s->vram_size) {
-        memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off, buf,
-               len);
-        memory_region_set_dirty(&s->vram, off, len);
-        return;
-    }
-    pci_dma_write(PCI_DEVICE(s), mc, buf, len);
-}
-
 /* ---------------------------------------------------------------- */
 /* Interrupt handler ring                                           */
 
@@ -128,7 +113,8 @@ void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data)
     stl_le_p(v + 4, src_data & 0xfffffff);
     stl_le_p(v + 8, 0);
     stl_le_p(v + 12, 0);
-    mc_write(s, ((uint64_t)s->regs[EG_IH_RB_BASE >> 2] << 8) + wptr, v, 16);
+    ati_hd5770_mc_write(s, ((uint64_t)s->regs[EG_IH_RB_BASE >> 2] << 8) + wptr,
+                        v, 16);
     s->regs[EG_IH_RB_WPTR >> 2] = next |
         (s->regs[EG_IH_RB_WPTR >> 2] & EG_IH_RB_WPTR_OVERFLOW);
     if (cntl & EG_IH_WPTR_WRITEBACK_ENABLE) {
@@ -137,7 +123,7 @@ void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data)
                       << 32) | (s->regs[EG_IH_RB_WPTR_ADDR_LO >> 2] & ~3u);
 
         stl_le_p(w, s->regs[EG_IH_RB_WPTR >> 2]);
-        mc_write(s, a, w, 4);
+        ati_hd5770_mc_write(s, a, w, 4);
     }
     trace_ati_hd5770_ih_push(src_id, src_data, wptr);
     if (msi_enabled(PCI_DEVICE(s)) && s->ih_level) {
@@ -396,6 +382,9 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     trace_ati_hd5770_reg_write(off, val);
     note_unknown(s, off, true, val);
     if (ati_hd5770_atom_write(s, off, val)) {
+        return;
+    }
+    if (s->accel && ati_hd5770_mc_reg_write(s, off, val)) {
         return;
     }
     if (display_reg(off)) {

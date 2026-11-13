@@ -226,4 +226,19 @@
 #define EG_DIG_BLOCK_FIRST              0x7000
 #define EG_DIG_BLOCK_END                0x7400
 
+/* memory controller: VM contexts, system aperture */
+#define EG_VM_CONTEXT0_CNTL             0x1410
+#define EG_VM_ENABLE_CONTEXT            (1u << 0)
+#define EG_VM_CONTEXT0_REQUEST_RESPONSE 0x1470
+#define EG_VM_CONTEXT1_REQUEST_RESPONSE 0x1474
+#define EG_VM_REQUEST_TYPE_MASK         0x0000000f
+#define EG_VM_RESPONSE_SHIFT            4
+#define EG_VM_RESPONSE_MASK             0x000000f0
+#define EG_VM_CONTEXT0_PAGE_TABLE_BASE  0x153c
+#define EG_VM_CONTEXT0_PAGE_TABLE_START 0x155c
+#define EG_VM_CONTEXT0_PAGE_TABLE_END   0x157c
+#define EG_PTE_VALID                    (1ull << 0)
+#define EG_PTE_SYSTEM                   (1ull << 1)
+#define EG_PTE_ADDR_MASK                0x000000fffffff000ull
+
 #endif

@@ -243,6 +243,9 @@ ati_hd5770_cursor(int on, int x, int y, uint32_t w, uint32_t h, uint64_t off) "o
 ati_hd5770_surface(uint32_t w, uint32_t h, uint32_t bpp, uint32_t pitch, uint64_t off) "%ux%u bpp=%u pitch=%u fb 0x%" PRIx64
 ati_hd5770_smc_msg(uint32_t msg) "SMC message 0x%02x"
 ati_hd5770_atom_call(uint32_t table, uint32_t ndw, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3) "table %u (%u dwords) 0x%08x 0x%08x 0x%08x 0x%08x"
+ati_hd5770_gart_fault(uint64_t mc, uint64_t pte) "MC 0x%" PRIx64 " PTE 0x%" PRIx64
+ati_hd5770_tlb_invalidate(uint32_t off, uint32_t val) "0x%04x <- 0x%08x"
+ati_hd5770_vm_setup(uint32_t off, uint32_t val) "0x%04x <- 0x%08x"
 
 # hw/display/ati_r580.c (Radeon X1900 XT / R580)
 ati_r580_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64" %s -> 0x%"PRIx64
