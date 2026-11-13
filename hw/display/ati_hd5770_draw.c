@@ -1631,6 +1631,7 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
         gt.w[q] = v[q]->w;
     }
     gt.area = area;
+    gt.prim = d->st->prims;
     g_array_append_val(d->gtri, gt);
     for (p = 0; p < d->gnin; p++) {
         int src = d->ps_src[p];

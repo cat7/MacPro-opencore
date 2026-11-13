@@ -11,11 +11,13 @@
  * names the fma().
  *
  * hd5770_msl_program() adds one compute kernel per program, hd_main:
- * thread (gx, gy) is pixel (x0 + gx, y0 + gy) of triangle t; it runs
- * the coverage test, the clip rectangles, the program and the output
- * stage. Buffers: 0 VRAM, 1 GDraw, 2 GTri, 3 bound constants (uint),
- * 4 staging bytes (vertex buffers, constant file), 5 GTex[], 6 the
- * triangle's inputs (ninputs x 3 vertices x 4 floats).
+ * threadgroup g of 64 threads covers tile g of the dispatch, a block of
+ * a triangle's box; thread l is its pixel (x + l % w, y + l / w). The
+ * thread runs the coverage test, the clip rectangles, the program and
+ * the output stage. Buffers: 0 VRAM, 1 staging bytes, 2 tiles: eight
+ * words each, the staging offsets of the GDraw, the GTri, the
+ * triangle's inputs (ninputs x 3 vertices x 4 floats), the GTex array
+ * and the bound constants, then x, y, w.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -1012,12 +1014,18 @@ char *hd5770_msl_program(const HD5770IR *ir)
     g_string_append(o,
         "static float hd_mulieee(float a, float b) { return a * b; }\n"
         "kernel void hd_main(device uchar *vram [[buffer(0)]],\n"
-        "    device const GDraw &u [[buffer(1)]], device const GTri &t [[buffer(2)]],\n"
-        "    device const uint *kv [[buffer(3)]], device const uchar *st [[buffer(4)]],\n"
-        "    device const GTex *tex [[buffer(5)]], device const float *prm [[buffer(6)]],\n"
-        "    uint2 gid [[thread_position_in_grid]])\n"
+        "    device const uchar *st [[buffer(1)]], device const uint *tiles [[buffer(2)]],\n"
+        "    uint tg [[threadgroup_position_in_grid]],\n"
+        "    uint l [[thread_index_in_threadgroup]])\n"
         "{\n"
-        "    int x = t.x0 + (int)gid.x, y = t.y0 + (int)gid.y;\n"
+        "    device const uint *te = tiles + tg * 8;\n"
+        "    device const GDraw &u = *(device const GDraw *)(st + te[0]);\n"
+        "    device const GTri &t = *(device const GTri *)(st + te[1]);\n"
+        "    device const float *prm = (device const float *)(st + te[2]);\n"
+        "    device const GTex *tex = (device const GTex *)(st + te[3]);\n"
+        "    device const uint *kv = (device const uint *)(st + te[4]);\n"
+        "    uint sw = te[7];\n"
+        "    int x = (int)te[5] + (int)(l % sw), y = (int)te[6] + (int)(l / sw);\n"
         "    if (x > t.x1 || y > t.y1) {\n        return;\n    }\n"
         "    float pc = u.pix_center, px = x + pc, py = y + pc;\n"
         "    float w0 = hd_edge(t.x[1], t.y[1], t.x[2], t.y[2], px, py);\n"

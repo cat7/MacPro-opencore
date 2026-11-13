@@ -5,8 +5,11 @@
  * region is wrapped as one shared buffer, the kernels read textures and
  * read-modify-write render targets in it at their tiled addresses, and
  * nothing is copied back. A draw is one compute dispatch per triangle,
- * in order, each thread one pixel of the triangle's box running the
- * program translated by ati_hd5770_msl.c. Per-draw data goes to a
+ * each thread one pixel of the triangle's box running the program
+ * translated by ati_hd5770_msl.c. Dispatches run concurrently; a memory
+ * barrier goes before one that writes pixels an earlier one wrote (the
+ * two triangles of one primitive never do), or bytes an earlier one read,
+ * or that reads bytes an earlier one wrote. Per-draw data goes to a
  * staging buffer that is reused once sync() has waited for the GPU.
  * Programs are compiled on first use and kept by the hash of their
  * words.
@@ -16,12 +19,15 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
+#include "qemu/atomic.h"
 #import <Metal/Metal.h>
 #include "ati_hd5770_gpu.h"
 
 #define MTL_STAGING     (64 * 1024 * 1024)
 #define MTL_ALIGN       256
-#define MTL_COMMIT_AT   64      /* draws per command buffer */
+#define MTL_COMMIT_AT   256     /* draws per command buffer */
+#define MTL_TILE        64      /* threads per tile */
+#define MTL_ACC         128     /* accesses tracked between barriers */
 
 /* the layouts of hd5770_msl_lib */
 typedef struct GSurf {
@@ -74,6 +80,15 @@ QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 106);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 228);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 14);
 
+/* a pixel box one dispatch wrote, or bytes it read */
+typedef struct MtlAcc {
+    uint64_t lo, hi;            /* VRAM bytes */
+    uint32_t voff, mode, row_bytes, bpe;
+    int32_t x0, y0, x1, y1;
+    uint64_t draw;
+    uint32_t prim;
+} MtlAcc;
+
 typedef struct MtlProg {
     id<MTLComputePipelineState> pso;    /* nil: not translatable */
 } MtlProg;
@@ -95,8 +110,15 @@ typedef struct HD5770Mtl {
     unsigned pending;
     GHashTable *progs;
     GArray *ranges;             /* uint64_t pairs, VRAM written */
+    MtlAcc wr[MTL_ACC], rd[MTL_ACC];
+    unsigned nwr, nrd;
+    uint64_t barriers, dispatches;
+    /* the batch: tiles of consecutive triangles run by one dispatch */
+    id<MTLComputePipelineState> bpso;
+    GArray *tiles;              /* uint32_t x 8 per tile */
     uint64_t draws, tris, declined[MTL_NO_REASONS], syncs, commits;
     uint64_t compiles, compile_ns, wait_ns, encode_ns;
+    uint64_t gpu_ns;            /* atomic: command buffers on the GPU */
 } HD5770Mtl;
 
 static void mtl_exact_math(MTLCompileOptions *o)
@@ -172,14 +194,39 @@ static size_t mtl_take(HD5770Mtl *m, size_t len)
     return o;
 }
 
+/* the batch as one dispatch */
+static void mtl_flush(HD5770Mtl *m)
+{
+    size_t o, len = m->tiles->len * sizeof(uint32_t);
+
+    if (!len) {
+        return;
+    }
+    o = mtl_take(m, len);
+    memcpy((uint8_t *)m->st.contents + o, m->tiles->data, len);
+    [m->enc setComputePipelineState:m->bpso];
+    [m->enc setBuffer:m->vram offset:0 atIndex:0];
+    [m->enc setBuffer:m->st offset:0 atIndex:1];
+    [m->enc setBuffer:m->st offset:o atIndex:2];
+    [m->enc dispatchThreadgroups:MTLSizeMake(m->tiles->len / 8, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(MTL_TILE, 1, 1)];
+    g_array_set_size(m->tiles, 0);
+    m->dispatches++;
+}
+
 static void mtl_end(HD5770Mtl *m)
 {
     if (m->enc) {
+        mtl_flush(m);
         [m->enc endEncoding];
         [m->enc release];
         m->enc = nil;
     }
     if (m->cb) {
+        [m->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            qatomic_add(&m->gpu_ns,
+                        (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9));
+        }];
         [m->cb commit];
         [m->last release];
         m->last = m->cb;
@@ -260,6 +307,77 @@ static void mtl_range(HD5770Mtl *m, uint64_t lo, uint64_t hi)
     g_array_append_val(m->ranges, hi);
 }
 
+static bool mtl_overlap(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1)
+{
+    return a0 < b1 && b0 < a1;
+}
+
+/*
+ * A barrier before a dispatch writing box (x0, y0)-(x1, y1) of the target,
+ * bytes [lo, hi), if an earlier one since the last barrier conflicts.
+ * reads: the draw's textures, checked once per draw (first).
+ */
+static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
+                       const HD5770GpuTri *t, uint64_t lo, uint64_t hi,
+                       bool first)
+{
+    const HD5770GpuSurf *rt = &d->rt;
+    bool bar = m->nwr >= MTL_ACC || m->nrd + d->ntex > MTL_ACC;
+    unsigned i, k;
+    /*
+     * The pixels the triangle can cover: centres within its vertices'
+     * extent, widened by far more than the edge functions' rounding.
+     */
+    float pc = d->pix_center, mg = 1.0f / 16;
+    int32_t x0 = ceilf(MIN(t->x[0], MIN(t->x[1], t->x[2])) - pc - mg);
+    int32_t x1 = floorf(MAX(t->x[0], MAX(t->x[1], t->x[2])) - pc + mg);
+    int32_t y0 = ceilf(MIN(t->y[0], MIN(t->y[1], t->y[2])) - pc - mg);
+    int32_t y1 = floorf(MAX(t->y[0], MAX(t->y[1], t->y[2])) - pc + mg);
+
+    for (i = 0; !bar && i < m->nwr; i++) {
+        const MtlAcc *a = &m->wr[i];
+
+        if (a->voff == rt->voff && a->mode == rt->s.mode &&
+            a->row_bytes == rt->s.row_bytes && a->bpe == rt->s.bpe) {
+            bar = a->x0 <= x1 && x0 <= a->x1 && a->y0 <= y1 &&
+                  y0 <= a->y1 && !(a->draw == m->draws && a->prim == t->prim);
+        } else {
+            bar = mtl_overlap(a->lo, a->hi, lo, hi);
+        }
+        for (k = 0; first && !bar && k < d->ntex; k++) {
+            const HD5770GpuSurf *ts = &d->tex[k].surf;
+
+            bar = mtl_overlap(a->lo, a->hi, ts->voff,
+                              ts->voff + hd5770_surf_size(&ts->s));
+        }
+    }
+    for (i = 0; !bar && i < m->nrd; i++) {
+        bar = mtl_overlap(m->rd[i].lo, m->rd[i].hi, lo, hi);
+    }
+    if (bar) {
+        mtl_flush(m);
+        [m->enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        m->nwr = m->nrd = 0;
+        m->barriers++;
+    }
+    if (first || bar) {
+        for (k = 0; k < d->ntex; k++) {
+            const HD5770GpuSurf *ts = &d->tex[k].surf;
+
+            m->rd[m->nrd].lo = ts->voff;
+            m->rd[m->nrd].hi = ts->voff + hd5770_surf_size(&ts->s);
+            m->nrd++;
+        }
+    }
+    m->wr[m->nwr] = (MtlAcc) {
+        .lo = lo, .hi = hi, .voff = rt->voff, .mode = rt->s.mode,
+        .row_bytes = rt->s.row_bytes, .bpe = rt->s.bpe,
+        .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1,
+        .draw = m->draws, .prim = t->prim,
+    };
+    m->nwr++;
+}
+
 static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
 {
     HD5770Mtl *m = opaque;
@@ -271,6 +389,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     int64_t t0;
     int miny = INT_MAX, maxy = -1;
     unsigned i, k;
+    bool first = true;
 
     if (!p->pso) {
         m->declined[MTL_NO_PROG]++;
@@ -284,6 +403,17 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     need = sizeof(GDraw) + sizeof(GTex) * HD5770_GPU_TEX + 4096 +
            d->ntri * (sizeof(GTri) + prm_tri + 2 * MTL_ALIGN) +
            (d->ir->nconsts + 1) * 4 + 8 * MTL_ALIGN;
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+
+        if (t->x1 >= t->x0 && t->y1 >= t->y0) {
+            /* tiles of at least 8 pixels each way, or a row of 64 */
+            need += 32 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
+                    ((size_t)(t->y1 - t->y0) / 1 + 2);
+        }
+    }
+    /* the batch's tiles go to staging when it is dispatched */
+    need += m->tiles->len * sizeof(uint32_t);
     for (i = 0; i < d->nvb; i++) {
         need += d->vb[i].len + MTL_ALIGN;
     }
@@ -369,22 +499,30 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             m->cb = [[m->q commandBuffer] retain];
         }
         if (!m->enc) {
-            m->enc = [[m->cb computeCommandEncoder] retain];
+            m->enc = [[m->cb computeCommandEncoderWithDispatchType:
+                       MTLDispatchTypeConcurrent] retain];
+            m->nwr = m->nrd = 0;
         }
-        [m->enc setComputePipelineState:p->pso];
-        [m->enc setBuffer:m->vram offset:0 atIndex:0];
-        [m->enc setBuffer:m->st offset:o_draw atIndex:1];
-        [m->enc setBuffer:m->st offset:o_kv atIndex:3];
-        [m->enc setBuffer:m->st offset:0 atIndex:4];
-        [m->enc setBuffer:m->st offset:o_tex atIndex:5];
+        if (m->bpso != p->pso) {
+            mtl_flush(m);
+            m->bpso = p->pso;
+        }
         for (i = 0; i < d->ntri; i++) {
             const HD5770GpuTri *t = &d->tri[i];
             GTri *gt;
-            unsigned w = t->x1 - t->x0 + 1, h = t->y1 - t->y0 + 1;
-            NSUInteger tw, th, mx = p->pso.maxTotalThreadsPerThreadgroup;
+            unsigned tw, th;
+            int x, y;
 
             if (t->x1 < t->x0 || t->y1 < t->y0) {
                 continue;
+            }
+            {
+                uint64_t lo, hi;
+
+                hd5770_surf_rows(&d->rt.s, t->y0, t->y1 + 1, &lo, &hi);
+                mtl_hazard(m, d, t, lo - d->rt.s.base + d->rt.voff,
+                           hi - d->rt.s.base + d->rt.voff, first);
+                first = false;
             }
             o_tri = mtl_take(m, sizeof(GTri));
             gt = (GTri *)(st + o_tri);
@@ -398,13 +536,19 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             gt->y1 = t->y1;
             o_prm = mtl_take(m, MAX(prm_tri, 16));
             memcpy(st + o_prm, d->prm + (size_t)i * d->ninputs * 12, prm_tri);
-            tw = MIN(w, h == 1 ? 256u : 16u);
-            th = MIN(h, MAX(1u, (unsigned)(mx / tw)));
-            th = MIN(th, 16u);
-            [m->enc setBuffer:m->st offset:o_tri atIndex:2];
-            [m->enc setBuffer:m->st offset:o_prm atIndex:6];
-            [m->enc dispatchThreads:MTLSizeMake(w, h, 1)
-              threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+            /* tiles of 64 x 1 for thin boxes, up to 8 x 8 */
+            th = t->y1 - t->y0 + 1;
+            th = th >= 8 ? 8 : th >= 4 ? 4 : th >= 2 ? 2 : 1;
+            tw = MTL_TILE / th;
+            for (y = t->y0; y <= t->y1; y += th) {
+                for (x = t->x0; x <= t->x1; x += tw) {
+                    uint32_t te[8] = {
+                        o_draw, o_tri, o_prm, o_tex, o_kv, x, y, tw,
+                    };
+
+                    g_array_append_vals(m->tiles, te, 8);
+                }
+            }
             miny = MIN(miny, t->y0);
             maxy = MAX(maxy, t->y1);
             m->tris++;
@@ -434,12 +578,16 @@ static void mtl_stats(void *opaque, GString *out)
 
     g_string_append_printf(out,
         "metal: %s draws %" PRIu64 " triangles %" PRIu64 " declined: program %"
-        PRIu64 " room %" PRIu64 " surface %" PRIu64 "\n"
-        "metal: syncs %" PRIu64 " commits %" PRIu64 " wait ms %" PRIu64
-        " encode ms %" PRIu64 " programs %u compiled %" PRIu64 " in ms %"
-        PRIu64 "\n", [[m->dev name] UTF8String], m->draws, m->tris,
+        PRIu64 " room %" PRIu64 " surface %" PRIu64 "\n",
+        [[m->dev name] UTF8String], m->draws, m->tris,
         m->declined[MTL_NO_PROG], m->declined[MTL_NO_ROOM],
-        m->declined[MTL_NO_SURF], m->syncs, m->commits, m->wait_ns / 1000000,
+        m->declined[MTL_NO_SURF]);
+    g_string_append_printf(out,
+        "metal: syncs %" PRIu64 " commits %" PRIu64 " dispatches %" PRIu64
+        " barriers %" PRIu64 " gpu ms %" PRIu64 " wait ms %" PRIu64
+        " encode ms %" PRIu64 " programs %u compiled %" PRIu64 " in ms %"
+        PRIu64 "\n", m->syncs, m->commits, m->dispatches, m->barriers,
+        qatomic_read(&m->gpu_ns) / 1000000, m->wait_ns / 1000000,
         m->encode_ns / 1000000, g_hash_table_size(m->progs), m->compiles,
         m->compile_ns / 1000000);
 }
@@ -460,6 +608,7 @@ static void mtl_close(void *opaque)
     @autoreleasepool {
         g_hash_table_destroy(m->progs);
         g_array_free(m->ranges, true);
+        g_array_free(m->tiles, true);
         [m->st release];
         [m->vram release];
         [m->q release];
@@ -521,6 +670,7 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
     m->progs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                      mtl_prog_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));
+    m->tiles = g_array_new(false, false, sizeof(uint32_t));
     m->pub.ops = &mtl_ops;
     m->pub.b = m;
     return &m->pub;

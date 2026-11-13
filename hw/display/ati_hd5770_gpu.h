@@ -75,6 +75,7 @@ typedef struct HD5770GpuTri {
     float x[3], y[3], w[3];     /* window position, 1/w */
     float area;
     int32_t x0, y0, x1, y1;     /* pixels to visit, inclusive */
+    uint32_t prim;              /* triangles of one primitive share no pixel */
 } HD5770GpuTri;
 
 typedef struct HD5770GpuDraw {
