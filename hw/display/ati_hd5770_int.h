@@ -234,6 +234,7 @@ struct ATIHD5770State {
     uint64_t redraws;           /* scanout conversions */
     char *gpu_prop;             /* "gpu": off, on, verify */
     QemuRecMutex gpu_mutex;     /* the host GPU backend */
+    struct RAMBlock *gpu_ram;   /* guest RAM the backend draws into */
     HD5770CPStats cp;
     HD5770Census census_cb0, census_ps, census_vs, census_prim;
     uint64_t census_ctx_writes[1024];

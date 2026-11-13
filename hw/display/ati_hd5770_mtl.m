@@ -35,6 +35,7 @@ typedef struct GSurf {
     uint32_t pipes, banks, bankw, bankh, pib;
     uint32_t mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh;
     uint32_t fast;
+    uint32_t space, pt_off, pg0;
     uint32_t eoff[64];
 } GSurf;
 
@@ -75,33 +76,37 @@ typedef struct GTri {
     int32_t x0, y0, x1, y1;
 } GTri;
 
-QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 84);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 106);
-QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 228);
+QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 109);
+QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 231);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 14);
 
 /* a pixel box one dispatch wrote, or bytes it read */
 typedef struct MtlAcc {
     uint64_t lo, hi;            /* VRAM bytes */
-    uint32_t voff, mode, row_bytes, bpe;
+    uint64_t voff;
+    uint32_t mode, row_bytes, bpe;
     int32_t x0, y0, x1, y1;
     uint64_t draw;
     uint32_t prim;
 } MtlAcc;
 
 typedef struct MtlProg {
-    id<MTLComputePipelineState> pso;    /* nil: not translatable */
+    id<MTLComputePipelineState> pso;    /* valid once ready */
+    int state;                          /* atomic: MTL_P_* */
 } MtlProg;
 
+enum { MTL_P_BUILDING, MTL_P_READY, MTL_P_FAILED };
+
 enum {
-    MTL_NO_PROG, MTL_NO_ROOM, MTL_NO_SURF, MTL_NO_REASONS,
+    MTL_NO_PROG, MTL_NO_ROOM, MTL_NO_SURF, MTL_BUILDING, MTL_NO_REASONS,
 };
 
 typedef struct HD5770Mtl {
     HD5770Gpu pub;
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
-    id<MTLBuffer> vram, st;
+    id<MTLBuffer> vram, st, ram;
     uint8_t *vram_host;
     uint64_t vram_size;
     id<MTLCommandBuffer> cb, last;
@@ -110,15 +115,17 @@ typedef struct HD5770Mtl {
     unsigned pending;
     GHashTable *progs;
     GArray *ranges;             /* uint64_t pairs, VRAM written */
+    GArray *ram_ranges;         /* the same in guest RAM */
     MtlAcc wr[MTL_ACC], rd[MTL_ACC];
     unsigned nwr, nrd;
-    uint64_t barriers, dispatches;
+    uint64_t barriers, dispatches, threads;
     /* the batch: tiles of consecutive triangles run by one dispatch */
     id<MTLComputePipelineState> bpso;
     GArray *tiles;              /* uint32_t x 8 per tile */
     uint64_t draws, tris, declined[MTL_NO_REASONS], syncs, commits;
     uint64_t compiles, compile_ns, wait_ns, encode_ns;
     uint64_t gpu_ns;            /* atomic: command buffers on the GPU */
+    int building;               /* atomic: programs being compiled */
 } HD5770Mtl;
 
 static void mtl_exact_math(MTLCompileOptions *o)
@@ -139,10 +146,14 @@ static void mtl_exact_math(MTLCompileOptions *o)
 #pragma clang diagnostic pop
 }
 
+/*
+ * The program of an IR, compiled in the background on first use: until
+ * it is ready the device draws on the CPU.
+ */
 static MtlProg *mtl_prog(HD5770Mtl *m, const HD5770IR *ir)
 {
     MtlProg *p = g_hash_table_lookup(m->progs, &ir->hash);
-    int64_t t0;
+    uint64_t hash = ir->hash;
     char *src;
 
     if (p) {
@@ -152,37 +163,50 @@ static MtlProg *mtl_prog(HD5770Mtl *m, const HD5770IR *ir)
     g_hash_table_insert(m->progs, g_memdup2(&ir->hash, sizeof(ir->hash)), p);
     src = hd5770_msl_program(ir);
     if (!src) {
+        p->state = MTL_P_FAILED;
         return p;
     }
-    t0 = get_clock();
+    m->compiles++;
+    qatomic_inc(&m->building);
     @autoreleasepool {
         MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
-        NSError *e = nil;
-        id<MTLLibrary> lib;
+        id<MTLDevice> dev = m->dev;
+        int64_t t0 = get_clock();
 
         mtl_exact_math(opt);
-        lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
-                                   options:opt error:&e];
-        [opt release];
-        if (lib) {
+        [dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                          options:opt
+                completionHandler:^(id<MTLLibrary> lib, NSError *e) {
             id<MTLFunction> fn = [lib newFunctionWithName:@"hd_main"];
+            void (^done)(id<MTLComputePipelineState>, NSError *) =
+                ^(id<MTLComputePipelineState> pso, NSError *pe) {
+                NSError *r = pe ? pe : e;
+
+                if (pso) {
+                    p->pso = [pso retain];
+                } else {
+                    fprintf(stderr, "ati-hd5770: Metal program %016" PRIx64
+                            " not built: %s\n", hash,
+                            r ? [[r localizedDescription] UTF8String] : "?");
+                }
+                qatomic_add(&m->compile_ns, get_clock() - t0);
+                qatomic_store_release(&p->state,
+                                      pso ? MTL_P_READY : MTL_P_FAILED);
+                qatomic_dec(&m->building);
+            };
 
             if (fn) {
-                p->pso = [m->dev newComputePipelineStateWithFunction:fn
-                                                               error:&e];
+                /* the pipeline too is built off this (the compiler's) queue */
+                [dev newComputePipelineStateWithFunction:fn
+                                       completionHandler:done];
                 [fn release];
+            } else {
+                done(nil, nil);
             }
-            [lib release];
-        }
-        if (!p->pso) {
-            fprintf(stderr, "ati-hd5770: Metal program %016" PRIx64
-                    " not built: %s\n", ir->hash,
-                    e ? [[e localizedDescription] UTF8String] : "?");
-        }
+        }];
+        [opt release];
     }
     g_free(src);
-    m->compiles++;
-    m->compile_ns += get_clock() - t0;
     return p;
 }
 
@@ -208,8 +232,10 @@ static void mtl_flush(HD5770Mtl *m)
     [m->enc setBuffer:m->vram offset:0 atIndex:0];
     [m->enc setBuffer:m->st offset:0 atIndex:1];
     [m->enc setBuffer:m->st offset:o atIndex:2];
+    [m->enc setBuffer:m->ram ? m->ram : m->st offset:0 atIndex:3];
     [m->enc dispatchThreadgroups:MTLSizeMake(m->tiles->len / 8, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(MTL_TILE, 1, 1)];
+    m->threads += (uint64_t)m->tiles->len / 8 * MTL_TILE;
     g_array_set_size(m->tiles, 0);
     m->dispatches++;
 }
@@ -259,14 +285,30 @@ static void mtl_sync(void *opaque)
                     g_array_index(m->ranges, uint64_t, i + 1));
     }
     g_array_set_size(m->ranges, 0);
+    for (i = 0; i + 1 < m->ram_ranges->len; i += 2) {
+        if (m->pub.done_ram) {
+            m->pub.done_ram(m->pub.opaque,
+                            g_array_index(m->ram_ranges, uint64_t, i),
+                            g_array_index(m->ram_ranges, uint64_t, i + 1));
+        }
+    }
+    g_array_set_size(m->ram_ranges, 0);
 }
 
-static void mtl_surf(GSurf *g, const HD5770GpuSurf *s)
+static void mtl_surf(HD5770Mtl *m, GSurf *g, const HD5770GpuSurf *s)
 {
     const HD5770Surf *f = &s->s;
 
     memset(g, 0, sizeof(*g));
     g->voff = s->voff;
+    if (s->space) {
+        size_t o = mtl_take(m, s->npages * 4);
+
+        memcpy((uint8_t *)m->st.contents + o, s->pages, s->npages * 4);
+        g->space = 1;
+        g->pt_off = o;
+        g->pg0 = s->pg0;
+    }
     g->mode = f->mode;
     g->bpe = f->bpe;
     g->row_bytes = f->row_bytes;
@@ -291,25 +333,46 @@ static void mtl_surf(GSurf *g, const HD5770GpuSurf *s)
     }
 }
 
-static void mtl_range(HD5770Mtl *m, uint64_t lo, uint64_t hi)
+static void mtl_range(GArray *a, uint64_t lo, uint64_t hi)
 {
-    guint n = m->ranges->len;
+    guint n = a->len;
 
-    if (n && g_array_index(m->ranges, uint64_t, n - 2) <= hi &&
-        lo <= g_array_index(m->ranges, uint64_t, n - 1)) {
-        g_array_index(m->ranges, uint64_t, n - 2) =
-            MIN(lo, g_array_index(m->ranges, uint64_t, n - 2));
-        g_array_index(m->ranges, uint64_t, n - 1) =
-            MAX(hi, g_array_index(m->ranges, uint64_t, n - 1));
+    if (n && g_array_index(a, uint64_t, n - 2) <= hi &&
+        lo <= g_array_index(a, uint64_t, n - 1)) {
+        g_array_index(a, uint64_t, n - 2) =
+            MIN(lo, g_array_index(a, uint64_t, n - 2));
+        g_array_index(a, uint64_t, n - 1) =
+            MAX(hi, g_array_index(a, uint64_t, n - 1));
         return;
     }
-    g_array_append_val(m->ranges, lo);
-    g_array_append_val(m->ranges, hi);
+    g_array_append_val(a, lo);
+    g_array_append_val(a, hi);
 }
 
 static bool mtl_overlap(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1)
 {
     return a0 < b1 && b0 < a1;
+}
+
+/*
+ * Hazard ranges: VRAM bytes; all of guest RAM as one range above them
+ * (surfaces there are scattered pages), and a key per surface.
+ */
+#define MTL_RAM_RANGE   (1ull << 40)
+
+static uint64_t mtl_key(const HD5770GpuSurf *s)
+{
+    return s->space ? MTL_RAM_RANGE + s->pages[0] : s->voff;
+}
+
+static uint64_t mtl_lo(const HD5770GpuSurf *s)
+{
+    return s->space ? MTL_RAM_RANGE : s->voff;
+}
+
+static uint64_t mtl_hi(const HD5770GpuSurf *s)
+{
+    return s->space ? MTL_RAM_RANGE + 1 : s->voff + hd5770_surf_size(&s->s);
 }
 
 /*
@@ -337,7 +400,7 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
     for (i = 0; !bar && i < m->nwr; i++) {
         const MtlAcc *a = &m->wr[i];
 
-        if (a->voff == rt->voff && a->mode == rt->s.mode &&
+        if (a->voff == mtl_key(rt) && a->mode == rt->s.mode &&
             a->row_bytes == rt->s.row_bytes && a->bpe == rt->s.bpe) {
             bar = a->x0 <= x1 && x0 <= a->x1 && a->y0 <= y1 &&
                   y0 <= a->y1 && !(a->draw == m->draws && a->prim == t->prim);
@@ -347,8 +410,7 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
         for (k = 0; first && !bar && k < d->ntex; k++) {
             const HD5770GpuSurf *ts = &d->tex[k].surf;
 
-            bar = mtl_overlap(a->lo, a->hi, ts->voff,
-                              ts->voff + hd5770_surf_size(&ts->s));
+            bar = mtl_overlap(a->lo, a->hi, mtl_lo(ts), mtl_hi(ts));
         }
     }
     for (i = 0; !bar && i < m->nrd; i++) {
@@ -364,13 +426,13 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
         for (k = 0; k < d->ntex; k++) {
             const HD5770GpuSurf *ts = &d->tex[k].surf;
 
-            m->rd[m->nrd].lo = ts->voff;
-            m->rd[m->nrd].hi = ts->voff + hd5770_surf_size(&ts->s);
+            m->rd[m->nrd].lo = mtl_lo(ts);
+            m->rd[m->nrd].hi = mtl_hi(ts);
             m->nrd++;
         }
     }
     m->wr[m->nwr] = (MtlAcc) {
-        .lo = lo, .hi = hi, .voff = rt->voff, .mode = rt->s.mode,
+        .lo = lo, .hi = hi, .voff = mtl_key(rt), .mode = rt->s.mode,
         .row_bytes = rt->s.row_bytes, .bpe = rt->s.bpe,
         .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1,
         .draw = m->draws, .prim = t->prim,
@@ -391,12 +453,19 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     unsigned i, k;
     bool first = true;
 
-    if (!p->pso) {
+    switch (qatomic_load_acquire(&p->state)) {
+    case MTL_P_BUILDING:
+        m->declined[MTL_BUILDING]++;
+        return false;
+    case MTL_P_FAILED:
         m->declined[MTL_NO_PROG]++;
         return false;
+    default:
+        break;
     }
-    if (d->rt.voff + hd5770_surf_size(&d->rt.s) > m->vram_size ||
-        !d->rt.s.fast) {
+    if ((!d->rt.space &&
+         d->rt.voff + hd5770_surf_size(&d->rt.s) > m->vram_size) ||
+        (d->rt.space && !m->ram) || !d->rt.s.fast) {
         m->declined[MTL_NO_SURF]++;
         return false;
     }
@@ -416,6 +485,14 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     need += m->tiles->len * sizeof(uint32_t);
     for (i = 0; i < d->nvb; i++) {
         need += d->vb[i].len + MTL_ALIGN;
+    }
+    need += (d->rt.npages + 1) * 4 + MTL_ALIGN;
+    for (i = 0; i < d->ntex; i++) {
+        if (d->tex[i].surf.space && !m->ram) {
+            m->declined[MTL_NO_SURF]++;
+            return false;
+        }
+        need += (d->tex[i].surf.npages + 1) * 4 + MTL_ALIGN;
     }
     if (need > MTL_STAGING) {
         m->declined[MTL_NO_ROOM]++;
@@ -440,7 +517,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
 
     u = (GDraw *)(st + o_draw);
     memset(u, 0, sizeof(*u));
-    mtl_surf(&u->rt, &d->rt);
+    mtl_surf(m, &u->rt, &d->rt);
     u->rt_fmt = d->rt_fmt;
     u->rt_num = d->rt_num;
     u->rt_comps = d->rt_comps;
@@ -476,7 +553,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         const HD5770GpuTex *t = &d->tex[i];
         GTex *g = (GTex *)(st + o_tex) + i;
 
-        mtl_surf(&g->s, &t->surf);
+        mtl_surf(m, &g->s, &t->surf);
         g->fmt = t->fmt;
         g->num = t->num;
         g->w = t->w;
@@ -519,9 +596,15 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             {
                 uint64_t lo, hi;
 
-                hd5770_surf_rows(&d->rt.s, t->y0, t->y1 + 1, &lo, &hi);
-                mtl_hazard(m, d, t, lo - d->rt.s.base + d->rt.voff,
-                           hi - d->rt.s.base + d->rt.voff, first);
+                if (d->rt.space) {
+                    lo = MTL_RAM_RANGE;
+                    hi = MTL_RAM_RANGE + 1;
+                } else {
+                    hd5770_surf_rows(&d->rt.s, t->y0, t->y1 + 1, &lo, &hi);
+                    lo = lo - d->rt.s.base + d->rt.voff;
+                    hi = hi - d->rt.s.base + d->rt.voff;
+                }
+                mtl_hazard(m, d, t, lo, hi, first);
                 first = false;
             }
             o_tri = mtl_take(m, sizeof(GTri));
@@ -554,13 +637,17 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             m->tris++;
         }
     }
-    if (maxy >= miny) {
+    if (maxy >= miny && d->rt.space) {
+        for (i = 0; i < d->rt.npages; i++) {
+            mtl_range(m->ram_ranges, d->rt.pages[i], d->rt.pages[i] + 4096);
+        }
+    } else if (maxy >= miny) {
         uint64_t lo, hi;
 
         hd5770_surf_rows(&d->rt.s, miny, maxy + 1, &lo, &hi);
         lo = lo - d->rt.s.base + d->rt.voff;
         hi = hi - d->rt.s.base + d->rt.voff;
-        mtl_range(m, lo, MIN(hi, m->vram_size));
+        mtl_range(m->ranges, lo, MIN(hi, m->vram_size));
     }
     m->draws++;
     m->encode_ns += get_clock() - t0;
@@ -578,18 +665,19 @@ static void mtl_stats(void *opaque, GString *out)
 
     g_string_append_printf(out,
         "metal: %s draws %" PRIu64 " triangles %" PRIu64 " declined: program %"
-        PRIu64 " room %" PRIu64 " surface %" PRIu64 "\n",
-        [[m->dev name] UTF8String], m->draws, m->tris,
-        m->declined[MTL_NO_PROG], m->declined[MTL_NO_ROOM],
-        m->declined[MTL_NO_SURF]);
+        PRIu64 " compiling %" PRIu64 " room %" PRIu64 " surface %" PRIu64
+        "\n", [[m->dev name] UTF8String], m->draws, m->tris,
+        m->declined[MTL_NO_PROG], m->declined[MTL_BUILDING],
+        m->declined[MTL_NO_ROOM], m->declined[MTL_NO_SURF]);
     g_string_append_printf(out,
         "metal: syncs %" PRIu64 " commits %" PRIu64 " dispatches %" PRIu64
-        " barriers %" PRIu64 " gpu ms %" PRIu64 " wait ms %" PRIu64
+        " threads %" PRIu64 " barriers %" PRIu64 " gpu ms %" PRIu64 " wait ms %" PRIu64
         " encode ms %" PRIu64 " programs %u compiled %" PRIu64 " in ms %"
-        PRIu64 "\n", m->syncs, m->commits, m->dispatches, m->barriers,
+        PRIu64 "\n", m->syncs, m->commits, m->dispatches, m->threads,
+        m->barriers,
         qatomic_read(&m->gpu_ns) / 1000000, m->wait_ns / 1000000,
         m->encode_ns / 1000000, g_hash_table_size(m->progs), m->compiles,
-        m->compile_ns / 1000000);
+        qatomic_read(&m->compile_ns) / 1000000);
 }
 
 static void mtl_prog_free(gpointer p)
@@ -605,10 +693,15 @@ static void mtl_close(void *opaque)
     HD5770Mtl *m = opaque;
 
     mtl_sync(m);
+    while (qatomic_read(&m->building)) {
+        g_usleep(1000);
+    }
     @autoreleasepool {
         g_hash_table_destroy(m->progs);
         g_array_free(m->ranges, true);
         g_array_free(m->tiles, true);
+        g_array_free(m->ram_ranges, true);
+        [m->ram release];
         [m->st release];
         [m->vram release];
         [m->q release];
@@ -617,12 +710,30 @@ static void mtl_close(void *opaque)
     g_free(m);
 }
 
+static bool mtl_ram(void *opaque, uint8_t *host, uint64_t size)
+{
+    HD5770Mtl *m = opaque;
+    size_t page = getpagesize();
+
+    if (m->ram || (uintptr_t)host % page || size % page ||
+        size > m->dev.maxBufferLength) {
+        return false;
+    }
+    @autoreleasepool {
+        m->ram = [m->dev newBufferWithBytesNoCopy:host length:size
+                                          options:MTLResourceStorageModeShared
+                                      deallocator:nil];
+    }
+    return m->ram != nil;
+}
+
 static const HD5770GpuOps mtl_ops = {
     .name = "metal",
     .draw = mtl_draw,
     .sync = mtl_sync,
     .stats = mtl_stats,
     .close = mtl_close,
+    .ram = mtl_ram,
 };
 
 HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
@@ -671,6 +782,7 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
                                      mtl_prog_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));
     m->tiles = g_array_new(false, false, sizeof(uint32_t));
+    m->ram_ranges = g_array_new(false, false, sizeof(uint64_t));
     m->pub.ops = &mtl_ops;
     m->pub.b = m;
     return &m->pub;

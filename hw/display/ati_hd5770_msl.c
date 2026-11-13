@@ -14,7 +14,8 @@
  * threadgroup g of 64 threads covers tile g of the dispatch, a block of
  * a triangle's box; thread l is its pixel (x + l % w, y + l / w). The
  * thread runs the coverage test, the clip rectangles, the program and
- * the output stage. Buffers: 0 VRAM, 1 staging bytes, 2 tiles: eight
+ * the output stage. Buffers: 0 VRAM, 1 staging bytes, 3 guest RAM (for
+ * surfaces outside VRAM, through their page tables), 2 tiles: eight
  * words each, the staging offsets of the GDraw, the GTri, the
  * triangle's inputs (ninputs x 3 vertices x 4 floats), the GTex array
  * and the bound constants, then x, y, w.
@@ -36,6 +37,7 @@ const char hd5770_msl_lib[] =
 "    uint voff, mode, bpe, row_bytes, mt_per_row, tile_bytes, mt_bytes;\n"
 "    uint pipes, banks, bankw, bankh, pib;\n"
 "    uint mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh, fast;\n"
+"    uint space, pt_off, pg0;\n"
 "    uint eoff[64];\n"
 "};\n"
 "struct GTex {\n"
@@ -86,7 +88,7 @@ const char hd5770_msl_lib[] =
 "    {32,32,32,0},\n"
 "};\n"
 "\n"
-"static uint hd_fmt_bytes(uint fmt)\n"
+"static __attribute__((always_inline)) uint hd_fmt_bytes(uint fmt)\n"
 "{\n"
 "    switch (fmt) {\n"
 "    case 0x01: case 0x02: case 0x03: return 1;\n"
@@ -101,13 +103,13 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static bool hd_fmt_float(uint fmt)\n"
+"static __attribute__((always_inline)) bool hd_fmt_float(uint fmt)\n"
 "{\n"
 "    return fmt == 0x06 || fmt == 0x0e || fmt == 0x10 || fmt == 0x1e ||\n"
 "           fmt == 0x20 || fmt == 0x23 || fmt == 0x30;\n"
 "}\n"
 "\n"
-"static uint hd_rd(device const uchar *p, uint off, uint n)\n"
+"static __attribute__((always_inline)) uint hd_rd(device const uchar *p, uint off, uint n)\n"
 "{\n"
 "    uint v = 0;\n"
 "\n"
@@ -120,7 +122,7 @@ const char hd5770_msl_lib[] =
 "    return v;\n"
 "}\n"
 "\n"
-"static void hd_unpack(uint fmt, device const uchar *p, uint off, thread uint *c)\n"
+"static __attribute__((always_inline)) void hd_unpack(uint fmt, device const uchar *p, uint off, thread uint *c)\n"
 "{\n"
 "    uint n = hd_fmt_bytes(fmt), sh = 0;\n"
 "    ulong v;\n"
@@ -145,13 +147,13 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static float hd_half(uint h)\n"
+"static __attribute__((always_inline)) float hd_half(uint h)\n"
 "{\n"
 "    return float(as_type<half>((ushort)h));\n"
 "}\n"
 "\n"
 "/* comp_value() */\n"
-"static uint hd_comp(uint c, uint bits, bool is_float, bool is_signed, uint num)\n"
+"static __attribute__((always_inline)) uint hd_comp(uint c, uint bits, bool is_float, bool is_signed, uint num)\n"
 "{\n"
 "    if (is_float) {\n"
 "        return bits == 16 ? as_type<uint>(hd_half(c)) : c;\n"
@@ -178,7 +180,7 @@ const char hd5770_msl_lib[] =
 "\n"
 "/* ---- surfaces ---- */\n"
 "\n"
-"static uint hd_pipe(uint tx, uint ty, uint pipes)\n"
+"static __attribute__((always_inline)) uint hd_pipe(uint tx, uint ty, uint pipes)\n"
 "{\n"
 "    switch (pipes) {\n"
 "    case 2:\n"
@@ -194,7 +196,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static uint hd_bank(uint tx, uint ty, uint banks)\n"
+"static __attribute__((always_inline)) uint hd_bank(uint tx, uint ty, uint banks)\n"
 "{\n"
 "    uint x3 = tx & 1, x4 = (tx >> 1) & 1, x5 = (tx >> 2) & 1, x6 = (tx >> 3) & 1;\n"
 "    uint y3 = ty & 1, y4 = (ty >> 1) & 1, y5 = (ty >> 2) & 1, y6 = (ty >> 3) & 1;\n"
@@ -213,13 +215,13 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"/* hd5770_surf_offset_fast(): VRAM offset of element (x, y) */\n"
-"static uint hd_addr(device const GSurf &s, uint x, uint y)\n"
+"/* hd5770_surf_offset_fast(): offset of element (x, y) */\n"
+"static __attribute__((always_inline)) uint hd_addr(device const GSurf &s, uint x, uint y)\n"
 "{\n"
 "    uint tx = x >> 3, ty = y >> 3, total, pipe, bank, t;\n"
 "\n"
 "    if (s.mode < 2) {\n"
-"        return s.voff + y * s.row_bytes + x * s.bpe;\n"
+"        return y * s.row_bytes + x * s.bpe;\n"
 "    }\n"
 "    if (s.mode == 2) {\n"
 "        t = (ty * s.mt_per_row + tx) * s.tile_bytes;\n"
@@ -234,12 +236,26 @@ const char hd5770_msl_lib[] =
 "        t = (total & (s.pib - 1)) | pipe << s.pib_sh |\n"
 "            bank << (s.pib_sh + s.pipes_sh) | (total >> s.pib_sh) << s.hi_sh;\n"
 "    }\n"
-"    return s.voff + t + s.eoff[(y & 7) * 8 + (x & 7)];\n"
+"    return t + s.eoff[(y & 7) * 8 + (x & 7)];\n"
+"}\n"
+"\n"
+"/* the byte at surface offset o: in VRAM, or through the page table in RAM */\n"
+"static __attribute__((always_inline)) device uchar *hd_at(device const GSurf &s, uint o,\n"
+"                                                         device uchar *vram, device uchar *ram,\n"
+"                                                         device const uchar *st)\n"
+"{\n"
+"    if (s.space) {\n"
+"        uint q = s.pg0 + o;\n"
+"        device const uint *pt = (device const uint *)(st + s.pt_off);\n"
+"\n"
+"        return ram + pt[q >> 12] + (q & 4095);\n"
+"    }\n"
+"    return vram + s.voff + o;\n"
 "}\n"
 "\n"
 "/* ---- ALU: eval() and post() ---- */\n"
 "\n"
-"static float hd_mul(float a, float b)\n"
+"static __attribute__((always_inline)) float hd_mul(float a, float b)\n"
 "{\n"
 "    if (a == 0.0f || b == 0.0f) {\n"
 "        return 0.0f;\n"
@@ -247,17 +263,17 @@ const char hd5770_msl_lib[] =
 "    return a * b;\n"
 "}\n"
 "\n"
-"static float hd_max9(float a, float b)\n"
+"static __attribute__((always_inline)) float hd_max9(float a, float b)\n"
 "{\n"
 "    return a >= b ? a : (isnan(b) ? a : b);\n"
 "}\n"
 "\n"
-"static float hd_min9(float a, float b)\n"
+"static __attribute__((always_inline)) float hd_min9(float a, float b)\n"
 "{\n"
 "    return a < b ? a : (isnan(b) ? a : b);\n"
 "}\n"
 "\n"
-"static float hd_cl01(float v)\n"
+"static __attribute__((always_inline)) float hd_cl01(float v)\n"
 "{\n"
 "    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : (isnan(v) ? 0.0f : v));\n"
 "}\n"
@@ -267,7 +283,7 @@ const char hd5770_msl_lib[] =
 "#define I(x) as_type<int>(x)\n"
 "\n"
 "/* mods: bit k neg of source k, bit 4 + k abs */\n"
-"static float hd_fmod(uint mods, uint k, uint v)\n"
+"static __attribute__((always_inline)) float hd_fmod(uint mods, uint k, uint v)\n"
 "{\n"
 "    float f = F(v);\n"
 "\n"
@@ -280,13 +296,13 @@ const char hd5770_msl_lib[] =
 "    return f;\n"
 "}\n"
 "\n"
-"static int hd_f2i(float a)\n"
+"static __attribute__((always_inline)) int hd_f2i(float a)\n"
 "{\n"
 "    return isnan(a) ? 0 : (a >= 2147483647.0f ? 2147483647 :\n"
 "           (a <= -2147483648.0f ? (int)0x80000000 : (int)a));\n"
 "}\n"
 "\n"
-"static uint hd_eval(uint op, uint mods, uint s0, uint s1, uint s2,\n"
+"static __attribute__((always_inline)) uint hd_eval(uint op, uint mods, uint s0, uint s1, uint s2,\n"
 "                    thread bool &kill)\n"
 "{\n"
 "    float a = 0, b = 0, c = 0;\n"
@@ -410,7 +426,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static bool hd_isfloat(uint op, uint mods, bool clamp, uint omod)\n"
+"static __attribute__((always_inline)) bool hd_isfloat(uint op, uint mods, bool clamp, uint omod)\n"
 "{\n"
 "    if (op & 0x800) {\n"
 "        return (op & 0x1f) >= 0x07 && (op & 0x1f) <= 0x1b;\n"
@@ -431,7 +447,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static uint hd_post(uint op, uint mods, bool clamp, uint omod, uint v)\n"
+"static __attribute__((always_inline)) uint hd_post(uint op, uint mods, bool clamp, uint omod, uint v)\n"
 "{\n"
 "    float f;\n"
 "\n"
@@ -454,7 +470,7 @@ const char hd5770_msl_lib[] =
 "\n"
 "/* ---- fetches ---- */\n"
 "\n"
-"static bool hd_wrap(thread int &c, int size, uint mode)\n"
+"static __attribute__((always_inline)) bool hd_wrap(thread int &c, int size, uint mode)\n"
 "{\n"
 "    int v = c;\n"
 "\n"
@@ -490,19 +506,21 @@ const char hd5770_msl_lib[] =
 "    return true;\n"
 "}\n"
 "\n"
-"static void hd_texel(device const uchar *vram, device const GTex &t, int x, int y,\n"
+"static __attribute__((always_inline)) void hd_texel(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                     device const GTex &t, int x, int y,\n"
 "                     thread uint *out)\n"
 "{\n"
-"    uint off = hd_addr(t.s, x, y), v[6], c[4];\n"
+"    device uchar *p = hd_at(t.s, hd_addr(t.s, x, y), vram, ram, st);\n"
+"    uint v[6], c[4];\n"
 "\n"
 "    if (t.unorm8) {\n"
-"        uint e = hd_rd(vram, off, 4);\n"
+"        uint e = hd_rd(p, 0, 4);\n"
 "\n"
 "        for (uint k = 0; k < 4; k++) {\n"
 "            v[k] = U((float)((e >> (8 * k)) & 0xff) / 255.0f);\n"
 "        }\n"
 "    } else {\n"
-"        hd_unpack(t.fmt, vram, off, c);\n"
+"        hd_unpack(t.fmt, p, 0, c);\n"
 "        for (uint k = 0; k < 4; k++) {\n"
 "            if (k < t.comps) {\n"
 "                v[k] = hd_comp(c[k], t.bits[k], t.is_float, (t.sgn >> k) & 1, t.num);\n"
@@ -520,7 +538,8 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static void hd_point(device const uchar *vram, device const GTex &t, int x, int y,\n"
+"static __attribute__((always_inline)) void hd_point(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                     device const GTex &t, int x, int y,\n"
 "                     thread uint *out)\n"
 "{\n"
 "    if (!hd_wrap(x, t.w, t.samp0 & 7) || !hd_wrap(y, t.h, (t.samp0 >> 3) & 7)) {\n"
@@ -529,16 +548,17 @@ const char hd5770_msl_lib[] =
 "        }\n"
 "        return;\n"
 "    }\n"
-"    hd_texel(vram, t, x, y, out);\n"
+"    hd_texel(vram, ram, st, t, x, y, out);\n"
 "}\n"
 "\n"
-"static int hd_floori(float f)\n"
+"static __attribute__((always_inline)) int hd_floori(float f)\n"
 "{\n"
 "    return isnan(f) ? 0 : (int)clamp(floor(f), -2147483648.0f, 2147483520.0f);\n"
 "}\n"
 "\n"
 "/* tfetch_stage() for the pixel shader */\n"
-"static void hd_tfetch(device const uchar *vram, device const GTex &t, uint w0,\n"
+"static __attribute__((always_inline)) void hd_tfetch(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                      device const GTex &t, uint w0,\n"
 "                      uint w1, uint w2, thread const uint *c, thread uint *v)\n"
 "{\n"
 "    uint op = w0 & 0x1f;\n"
@@ -550,7 +570,7 @@ const char hd5770_msl_lib[] =
 "        int x = I(c[0]) + ox / 2, y = I(c[1]) + oy / 2;\n"
 "\n"
 "        if (x >= 0 && y >= 0 && x < (int)t.w && y < (int)t.h) {\n"
-"            hd_texel(vram, t, x, y, v);\n"
+"            hd_texel(vram, ram, st, t, x, y, v);\n"
 "        }\n"
 "        return;\n"
 "    }\n"
@@ -568,7 +588,7 @@ const char hd5770_msl_lib[] =
 "        vv = 0.5f;\n"
 "    }\n"
 "    if (((t.samp0 >> 9) & 1) == 0 && ((t.samp0 >> 11) & 1) == 0) {\n"
-"        hd_point(vram, t, hd_floori(u), hd_floori(vv), v);\n"
+"        hd_point(vram, ram, st, t, hd_floori(u), hd_floori(vv), v);\n"
 "        return;\n"
 "    }\n"
 "    {\n"
@@ -577,10 +597,10 @@ const char hd5770_msl_lib[] =
 "        float ax = fx - x0, ay = fy - y0;\n"
 "        uint t00[4], t10[4], t01[4], t11[4];\n"
 "\n"
-"        hd_point(vram, t, x0, y0, t00);\n"
-"        hd_point(vram, t, x0 + 1, y0, t10);\n"
-"        hd_point(vram, t, x0, y0 + 1, t01);\n"
-"        hd_point(vram, t, x0 + 1, y0 + 1, t11);\n"
+"        hd_point(vram, ram, st, t, x0, y0, t00);\n"
+"        hd_point(vram, ram, st, t, x0 + 1, y0, t10);\n"
+"        hd_point(vram, ram, st, t, x0, y0 + 1, t01);\n"
+"        hd_point(vram, ram, st, t, x0 + 1, y0 + 1, t11);\n"
 "        for (uint k = 0; k < 4; k++) {\n"
 "            float top = fma(F(t10[k]) - F(t00[k]), ax, F(t00[k]));\n"
 "            float bot = fma(F(t11[k]) - F(t01[k]), ax, F(t01[k]));\n"
@@ -591,7 +611,7 @@ const char hd5770_msl_lib[] =
 "}\n"
 "\n"
 "/* vfetch_stage() for the pixel shader */\n"
-"static void hd_vfetch(device const GDraw &u, device const uchar *st, uint w0,\n"
+"static __attribute__((always_inline)) void hd_vfetch(device const GDraw &u, device const uchar *st, uint w0,\n"
 "                      uint w1, uint w2, uint index, thread uint *v)\n"
 "{\n"
 "    uint bid = (w0 >> 8) & 0xff, off = w2 & 0xffff, fmt, num, sgn, n, k;\n"
@@ -638,7 +658,7 @@ const char hd5770_msl_lib[] =
 "\n"
 "/* ---- rasterisation ---- */\n"
 "\n"
-"static float hd_edge(float ax, float ay, float bx, float by, float px, float py)\n"
+"static __attribute__((always_inline)) float hd_edge(float ax, float ay, float bx, float by, float px, float py)\n"
 "{\n"
 "    if (ax > bx || (ax == bx && ay > by)) {\n"
 "        return -fma(ax - bx, py - by, -((ay - by) * (px - bx)));\n"
@@ -646,13 +666,13 @@ const char hd5770_msl_lib[] =
 "    return fma(bx - ax, py - ay, -((by - ay) * (px - ax)));\n"
 "}\n"
 "\n"
-"static bool hd_owns(float ax, float ay, float bx, float by)\n"
+"static __attribute__((always_inline)) bool hd_owns(float ax, float ay, float bx, float by)\n"
 "{\n"
 "    return (ay == by && bx < ax) || by < ay;\n"
 "}\n"
 "\n"
 "/* interp() */\n"
-"static float hd_interp(device const GDraw &u, device const GTri &t,\n"
+"static __attribute__((always_inline)) float hd_interp(device const GDraw &u, device const GTri &t,\n"
 "                       device const float *prm, uint p, uint chan, bool flat,\n"
 "                       float b0, float b1, float b2, float pw)\n"
 "{\n"
@@ -675,7 +695,7 @@ const char hd5770_msl_lib[] =
 "\n"
 "/* ---- output: alpha_pass(), put_pixel() ---- */\n"
 "\n"
-"static bool hd_alpha(device const GDraw &u, float a)\n"
+"static __attribute__((always_inline)) bool hd_alpha(device const GDraw &u, float a)\n"
 "{\n"
 "    float r = u.alpha_ref;\n"
 "\n"
@@ -691,7 +711,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static float hd_bfactor(uint f, thread const float *src, thread const float *dst,\n"
+"static __attribute__((always_inline)) float hd_bfactor(uint f, thread const float *src, thread const float *dst,\n"
 "                        device const float *cst, uint ch)\n"
 "{\n"
 "    switch (f) {\n"
@@ -714,7 +734,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static float hd_combine(uint fn, float s, float sf, float dv, float df)\n"
+"static __attribute__((always_inline)) float hd_combine(uint fn, float s, float sf, float dv, float df)\n"
 "{\n"
 "    switch (fn) {\n"
 "    case 0: return fma(s, sf, dv * df);\n"
@@ -726,7 +746,7 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static void hd_pack_store(device uchar *vram, uint off, uint fmt, thread const uint *c)\n"
+"static __attribute__((always_inline)) void hd_pack_store(device uchar *vram, uint off, uint fmt, thread const uint *c)\n"
 "{\n"
 "    uint n = hd_fmt_bytes(fmt), sh = 0;\n"
 "    ulong v = 0;\n"
@@ -756,21 +776,32 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static void hd_put(device uchar *vram, device const GDraw &u, int x, int y,\n"
+"static __attribute__((always_inline)) void hd_put(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                   device const GDraw &u, int x, int y,\n"
 "                   thread const uint *col)\n"
 "{\n"
-"    uint off = hd_addr(u.rt, x, y), c[4] = { 0, 0, 0, 0 }, old[4];\n"
+"    device uchar *p = hd_at(u.rt, hd_addr(u.rt, x, y), vram, ram, st);\n"
+"    uint c[4] = { 0, 0, 0, 0 }, old[4];\n"
 "    uint n = u.rt_comps;\n"
 "    float src[4], dst[4];\n"
 "\n"
-"    hd_unpack(u.rt_fmt, vram, off, old);\n"
+"    if (u.rt_unorm8) {\n"
+"        uint e = *(device const uint *)p;\n"
+"\n"
+"        old[0] = e & 0xff;\n"
+"        old[1] = (e >> 8) & 0xff;\n"
+"        old[2] = (e >> 16) & 0xff;\n"
+"        old[3] = e >> 24;\n"
+"    } else {\n"
+"        hd_unpack(u.rt_fmt, p, 0, old);\n"
+"    }\n"
 "    if (u.rt_num == 4 || u.rt_float) {\n"
 "        for (uint i = 0; i < n; i++) {\n"
 "            uint s = u.rt_src[i];\n"
 "\n"
 "            c[i] = (u.wmask >> s) & 1 ? col[s] : old[i];\n"
 "        }\n"
-"        hd_pack_store(vram, off, u.rt_fmt, c);\n"
+"        hd_pack_store(p, 0, u.rt_fmt, c);\n"
 "        return;\n"
 "    }\n"
 "    for (uint i = 0; i < 4; i++) {\n"
@@ -816,10 +847,15 @@ const char hd5770_msl_lib[] =
 "\n"
 "        c[i] = (u.wmask >> s) & 1 ? (uint)fma(v, (float)mx, 0.5f) : old[i];\n"
 "    }\n"
-"    hd_pack_store(vram, off, u.rt_fmt, c);\n"
+"    if (u.rt_unorm8) {\n"
+"        *(device uint *)p = (c[0] & 0xff) | (c[1] & 0xff) << 8 |\n"
+"                                       (c[2] & 0xff) << 16 | (c[3] & 0xff) << 24;\n"
+"        return;\n"
+"    }\n"
+"    hd_pack_store(p, 0, u.rt_fmt, c);\n"
 "}\n"
 "\n"
-"static bool hd_clip(device const GDraw &u, int x, int y)\n"
+"static __attribute__((always_inline)) bool hd_clip(device const GDraw &u, int x, int y)\n"
 "{\n"
 "    uint idx = 0;\n"
 "\n"
@@ -833,14 +869,18 @@ const char hd5770_msl_lib[] =
 "}\n"
 "\n";
 
-static void src_expr(GString *o, const HD5770IRSrc *s)
+/*
+ * Register set q: 0 the pixel, 1 and 2 (programs with gradients) its
+ * neighbours to the right and below, run alongside as the CPU lanes do.
+ */
+static void src_expr(GString *o, const HD5770IRSrc *s, unsigned q)
 {
     switch (s->kind) {
     case HD5770_IRS_GPR:
-        g_string_append_printf(o, "r[%u][%u]", s->idx, s->chan);
+        g_string_append_printf(o, "R%u[%u][%u]", q, s->idx, s->chan);
         break;
     case HD5770_IRS_PV:
-        g_string_append_printf(o, "pv[%u]", s->chan);
+        g_string_append_printf(o, "P%u[%u]", q, s->chan);
         break;
     case HD5770_IRS_CONST:
         g_string_append_printf(o, "kv[%u]", s->k);
@@ -862,7 +902,8 @@ static unsigned src_mods(const HD5770IRInst *in)
     return m;
 }
 
-static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
+static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
+                       unsigned q)
 {
     unsigned i, k;
 
@@ -875,7 +916,7 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
         }
         for (k = 0; k < in->nsrc; k++) {
             g_string_append_printf(o, "        uint s%u_%u = ", i, k);
-            src_expr(o, &in->src[k]);
+            src_expr(o, &in->src[k], q);
             g_string_append(o, ";\n");
         }
         g_string_append_printf(o, "        uint q%u = 0;\n", i);
@@ -897,8 +938,9 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                                    m, i, m, i);
         } else if (in->interp) {
             g_string_append_printf(o, "        q%u = U(hd_interp(u, t, prm, %u, %u, "
-                                   "%s, b0, b1, b2, pw));\n", i, in->prm,
-                                   in->dst_chan, in->flat ? "true" : "false");
+                                   "%s, B0_%u, B1_%u, B2_%u, PW_%u));\n", i,
+                                   in->prm, in->dst_chan,
+                                   in->flat ? "true" : "false", q, q, q, q);
         } else if (in->max4) {
             continue;
         } else {
@@ -911,7 +953,8 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                     g_string_append(o, ", 0u");
                 }
             }
-            g_string_append(o, ", k); if (k) { killed = true; } }\n");
+            g_string_append(o, q ? ", k); }\n"
+                                 : ", k); if (k) { killed = true; } }\n");
         }
     }
     if (g->dot) {
@@ -949,28 +992,44 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                                    i, in->op, src_mods(in),
                                    in->clamp ? "true" : "false", in->omod, i);
         }
-        g_string_append_printf(o, "        pv[%u] = q%u;\n", in->slot, i);
+        g_string_append_printf(o, "        P%u[%u] = q%u;\n", q, in->slot, i);
     }
     for (i = 0; i < g->n; i++) {
         const HD5770IRInst *in = &ir->insts[g->first + i];
 
         if (in->wr) {
-            g_string_append_printf(o, "        r[%u][%u] = q%u;\n", in->dst,
+            g_string_append_printf(o, "        R%u[%u][%u] = q%u;\n", q, in->dst,
                                    in->dst_chan, i);
         }
     }
     g_string_append(o, "    }\n");
 }
 
-static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
+static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
+                       unsigned q)
 {
     unsigned k, unit = 0;
 
     g_string_append(o, "    {\n        uint o[4] = { 0, 0, 0, 0 };\n");
-    if (f->kind == HD5770_IRF_VTX) {
+    if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
+        /* the neighbour minus this pixel; in a neighbour, itself */
+        unsigned nb = q ? q : f->kind == HD5770_IRF_GRAD_H ? 1 : 2;
+
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "        o[%u] = U(F(R%u[%u][%u]) - "
+                                       "F(R%u[%u][%u]));\n", k, nb, f->src, sel,
+                                       q, f->src, sel);
+            } else {
+                g_string_append_printf(o, "        o[%u] = U(0.0f);\n", k);
+            }
+        }
+    } else if (f->kind == HD5770_IRF_VTX) {
         g_string_append_printf(o, "        hd_vfetch(u, st, 0x%08xu, 0x%08xu, 0x%08xu, "
-                               "r[%u][%u], o);\n", f->w[0], f->w[1], f->w[2],
-                               f->src, (f->w[0] >> 24) & 3);
+                               "R%u[%u][%u], o);\n", f->w[0], f->w[1], f->w[2],
+                               q, f->src, (f->w[0] >> 24) & 3);
     } else {
         for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
             /* search */
@@ -980,23 +1039,24 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
             unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
 
             if (sel < 4) {
-                g_string_append_printf(o, " r[%u][%u]", f->src, sel);
+                g_string_append_printf(o, " R%u[%u][%u]", q, f->src, sel);
             } else {
                 g_string_append(o, sel == 5 ? " U(1.0f)" : " U(0.0f)");
             }
             g_string_append(o, k < 3 ? "," : " };\n");
         }
-        g_string_append_printf(o, "        hd_tfetch(vram, tex[%u], 0x%08xu, 0x%08xu, "
+        g_string_append_printf(o, "        hd_tfetch(vram, ram, st, tex[%u], 0x%08xu, 0x%08xu, "
                                "0x%08xu, c, o);\n", unit, f->w[0], f->w[1], f->w[2]);
     }
     for (k = 0; k < 4; k++) {
         unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
 
         if (sel < 4) {
-            g_string_append_printf(o, "        r[%u][%u] = o[%u];\n", f->dst, k, sel);
+            g_string_append_printf(o, "        R%u[%u][%u] = o[%u];\n", q, f->dst,
+                                   k, sel);
         } else if (sel == 4 || sel == 5) {
-            g_string_append_printf(o, "        r[%u][%u] = U(%s);\n", f->dst, k,
-                                   sel == 5 ? "1.0f" : "0.0f");
+            g_string_append_printf(o, "        R%u[%u][%u] = U(%s);\n", q, f->dst,
+                                   k, sel == 5 ? "1.0f" : "0.0f");
         }
     }
     g_string_append(o, "    }\n");
@@ -1005,16 +1065,13 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
 char *hd5770_msl_program(const HD5770IR *ir)
 {
     GString *o = g_string_new(hd5770_msl_lib);
-    unsigned i, j, k;
+    unsigned i, j, k, q, nq = ir->grad ? 3 : 1, ng = MAX(ir->ngpr, 1u);
 
-    if (ir->grad) {
-        g_string_free(o, true);
-        return NULL;
-    }
     g_string_append(o,
         "static float hd_mulieee(float a, float b) { return a * b; }\n"
         "kernel void hd_main(device uchar *vram [[buffer(0)]],\n"
         "    device const uchar *st [[buffer(1)]], device const uint *tiles [[buffer(2)]],\n"
+        "    device uchar *ram [[buffer(3)]],\n"
         "    uint tg [[threadgroup_position_in_grid]],\n"
         "    uint l [[thread_index_in_threadgroup]])\n"
         "{\n"
@@ -1037,36 +1094,54 @@ char *hd5770_msl_program(const HD5770IR *ir)
         "        (w2 == 0 && !hd_owns(t.x[0], t.y[0], t.x[1], t.y[1]))) {\n"
         "        return;\n    }\n"
         "    if (u.cliprule != 0xffff && !hd_clip(u, x, y)) {\n        return;\n    }\n"
-        "    float b0 = w0 / t.area, b1 = w1 / t.area, b2 = w2 / t.area, pw = 0.0f;\n"
-        "    if (u.persp) {\n"
-        "        float s = fma(b2, t.w[2], fma(b0, t.w[0], b1 * t.w[1]));\n"
-        "        pw = s != 0.0f ? 1.0f / s : 0.0f;\n"
-        "    }\n");
-    g_string_append_printf(o,
-        "    uint r[%u][4];\n"
-        "    for (uint i = 0; i < %u; i++) {\n"
-        "        r[i][0] = r[i][1] = r[i][2] = r[i][3] = 0;\n"
-        "    }\n"
-        "    uint pv[5] = { 0, 0, 0, 0, 0 }, col[4] = { 0, 0, 0, 0 };\n"
-        "    bool killed = false, c0 = false;\n"
-        "    if (u.pos_gpr >= 0) {\n"
-        "        r[u.pos_gpr][0] = U(px);\n        r[u.pos_gpr][1] = U(py);\n"
-        "        r[u.pos_gpr][2] = U(0.0f);\n        r[u.pos_gpr][3] = U(1.0f);\n"
-        "    }\n"
-        "    r[%u][0] = U(b1);\n    r[%u][1] = U(b2);\n",
-        MAX(ir->ngpr, 1u), MAX(ir->ngpr, 1u), ir->map[0], ir->map[0]);
+        "    uint col[4] = { 0, 0, 0, 0 };\n"
+        "    bool killed = false, c0 = false;\n");
+    for (q = 0; q < nq; q++) {
+        /* bary(): barycentrics at the set's pixel */
+        g_string_append_printf(o,
+            "    float PX_%u = (x + %d) + pc, PY_%u = (y + %d) + pc;\n"
+            "    float B0_%u = hd_edge(t.x[1], t.y[1], t.x[2], t.y[2], PX_%u, PY_%u) / t.area;\n"
+            "    float B1_%u = hd_edge(t.x[2], t.y[2], t.x[0], t.y[0], PX_%u, PY_%u) / t.area;\n"
+            "    float B2_%u = hd_edge(t.x[0], t.y[0], t.x[1], t.y[1], PX_%u, PY_%u) / t.area;\n"
+            "    float PW_%u = 0.0f;\n"
+            "    if (u.persp) {\n"
+            "        float s = fma(B2_%u, t.w[2], fma(B0_%u, t.w[0], B1_%u * t.w[1]));\n"
+            "        PW_%u = s != 0.0f ? 1.0f / s : 0.0f;\n"
+            "    }\n"
+            "    uint R%u[%u][4], P%u[5] = { 0, 0, 0, 0, 0 };\n"
+            "    for (uint i = 0; i < %u; i++) {\n"
+            "        R%u[i][0] = R%u[i][1] = R%u[i][2] = R%u[i][3] = 0;\n"
+            "    }\n",
+            q, q == 1, q, q == 2, q, q, q, q, q, q, q, q, q, q, q, q, q, q,
+            q, ng, q, ng, q, q, q, q);
+        /* registers are indexed by constants only, so they stay registers */
+        for (i = 0; i < ir->ngpr; i++) {
+            g_string_append_printf(o,
+                "    if (u.pos_gpr == %u) {\n"
+                "        R%u[%u][0] = U(PX_%u);\n        R%u[%u][1] = U(PY_%u);\n"
+                "        R%u[%u][2] = U(0.0f);\n        R%u[%u][3] = U(1.0f);\n"
+                "    }\n", i, q, i, q, q, i, q, q, i, q, i);
+        }
+        g_string_append_printf(o, "    R%u[%u][0] = U(B1_%u);\n"
+                               "    R%u[%u][1] = U(B2_%u);\n",
+                               q, ir->map[0], q, q, ir->map[0], q);
+    }
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
 
         switch (op->kind) {
         case HD5770_IRO_ALU:
             for (j = 0; j < op->n; j++) {
-                emit_group(o, ir, &ir->groups[op->first + j]);
+                for (q = 0; q < nq; q++) {
+                    emit_group(o, ir, &ir->groups[op->first + j], q);
+                }
             }
             break;
         case HD5770_IRO_FETCH:
             for (j = 0; j < op->n; j++) {
-                emit_fetch(o, ir, &ir->fetches[op->first + j]);
+                for (q = 0; q < nq; q++) {
+                    emit_fetch(o, ir, &ir->fetches[op->first + j], q);
+                }
             }
             break;
         default: {
@@ -1076,7 +1151,7 @@ char *hd5770_msl_program(const HD5770IR *ir)
                 unsigned sel = e->sel[k];
 
                 if (sel < 4) {
-                    g_string_append_printf(o, "    col[%u] = r[%u][%u];\n", k,
+                    g_string_append_printf(o, "    col[%u] = R0[%u][%u];\n", k,
                                            e->gpr, sel);
                 } else {
                     g_string_append_printf(o, "    col[%u] = %s;\n", k,
@@ -1092,7 +1167,7 @@ char *hd5770_msl_program(const HD5770IR *ir)
     g_string_append(o,
         "    if (killed || !c0) {\n        return;\n    }\n"
         "    if (u.alpha_test && !hd_alpha(u, F(col[3]))) {\n        return;\n    }\n"
-        "    hd_put(vram, u, x, y, col);\n"
+        "    hd_put(vram, ram, st, u, x, y, col);\n"
         "}\n");
     return g_string_free(o, false);
 }

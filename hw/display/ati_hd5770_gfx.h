@@ -218,6 +218,11 @@ typedef struct HD5770Gfx {
     int gpu_mode;
     uint8_t *vram;              /* host memory of VRAM */
     uint64_t vram_size;
+    /* guest RAM for surfaces outside VRAM: ram_for() attaches its block */
+    uint8_t *ram;
+    uint64_t ram_size;
+    bool (*ram_for)(struct HD5770Gfx *g, uint8_t *host);
+    bool ram_pend;              /* queued draws write guest RAM */
     /* VRAM ranges queued draws read or write, [lo, hi) */
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;

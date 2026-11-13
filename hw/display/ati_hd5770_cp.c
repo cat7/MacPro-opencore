@@ -30,6 +30,7 @@
 #include "qemu/rcu.h"
 #include "system/runstate.h"
 #include "qemu/error-report.h"
+#include "system/ramblock.h"
 #include "hw/pci/pci_device.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_gpu.h"
@@ -1229,6 +1230,38 @@ static void gpu_done_cb(void *opaque, uint64_t lo, uint64_t hi)
     memory_region_set_dirty(&s->vram, lo, hi - lo);
 }
 
+static void gpu_done_ram_cb(void *opaque, uint64_t lo, uint64_t hi)
+{
+    ATIHD5770State *s = opaque;
+
+    memory_region_set_dirty(s->gpu_ram->mr, lo, hi - lo);
+}
+
+/* host page p of guest RAM: its RAM block given to the backend, once */
+static bool gpu_ram_for(HD5770Gfx *g, uint8_t *p)
+{
+    ATIHD5770State *s = g->lock_opaque;
+    ram_addr_t off;
+    RAMBlock *rb;
+
+    if (g->ram && p >= g->ram && p < g->ram + g->ram_size) {
+        return true;
+    }
+    if (s->gpu_ram) {
+        return false;
+    }
+    rb = qemu_ram_block_from_host(p, false, &off);
+    if (!rb || !g->gpu->ops->ram ||
+        !g->gpu->ops->ram(g->gpu->b, qemu_ram_get_host_addr(rb),
+                          qemu_ram_get_used_length(rb))) {
+        return false;
+    }
+    s->gpu_ram = rb;
+    g->ram = qemu_ram_get_host_addr(rb);
+    g->ram_size = qemu_ram_get_used_length(rb);
+    return true;
+}
+
 /* the host GPU backend gpu=on|verify names, if the host has one */
 static void gpu_open(ATIHD5770State *s)
 {
@@ -1248,7 +1281,9 @@ static void gpu_open(ATIHD5770State *s)
         return;
     }
     gp->done = gpu_done_cb;
+    gp->done_ram = gpu_done_ram_cb;
     gp->opaque = s;
+    s->gfx3d.ram_for = gpu_ram_for;
     s->gfx3d.gpu = gp;
     s->gfx3d.vram = memory_region_get_ram_ptr(&s->vram);
     s->gfx3d.vram_size = s->vram_size;

@@ -13,7 +13,8 @@
  * one request in order where they overlap.
  *
  * MEMORY. Surfaces are addressed by their byte offset in VRAM
- * (HD5770GpuSurf.voff), through the layout of HD5770Surf. The backend
+ * (HD5770GpuSurf.voff), or page by page in guest RAM, through the layout
+ * of HD5770Surf. The backend
  * gets the host memory of VRAM when it is opened and may keep its own
  * copies (then it must keep them coherent: every byte a request reads is
  * as VRAM holds it when the request is made, given that requests queued
@@ -45,10 +46,17 @@
 #define HD5770_GPU_VB           8
 #define HD5770_GPU_INPUTS       32
 
-/* a surface in VRAM */
+/*
+ * A surface in VRAM, or (space 1) in guest RAM: pages[i] is the offset in
+ * the RAM given to ops->ram() of the 4 KiB page holding surface bytes
+ * from i * 4096 - pg0 on, pg0 being the base's offset in its page.
+ */
 typedef struct HD5770GpuSurf {
     HD5770Surf s;               /* prepared, s.fast set */
     uint64_t voff;              /* VRAM offset of s.base */
+    uint8_t space;
+    const uint32_t *pages;
+    uint32_t npages, pg0;
 } HD5770GpuSurf;
 
 /* a texture: the CPU path's Tex */
@@ -122,6 +130,8 @@ typedef struct HD5770GpuOps {
     void (*sync)(void *b);
     void (*stats)(void *b, GString *out);
     void (*close)(void *b);
+    /* host memory of guest RAM for surfaces of space 1; false: none */
+    bool (*ram)(void *b, uint8_t *host, uint64_t size);
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -130,6 +140,8 @@ typedef struct HD5770Gpu {
     /* the device's: VRAM bytes [lo, hi) were written */
     void (*done)(void *opaque, uint64_t lo, uint64_t hi);
     void *opaque;
+    /* the same for guest RAM bytes, as offsets in the RAM of ops->ram() */
+    void (*done_ram)(void *opaque, uint64_t lo, uint64_t hi);
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

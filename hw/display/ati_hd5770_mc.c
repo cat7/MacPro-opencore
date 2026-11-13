@@ -145,10 +145,17 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
             } else {
                 memcpy(p, vram_ptr(s) + sp.addr, n);
             }
-        } else if (write) {
-            pci_dma_write(PCI_DEVICE(s), sp.addr, p, n);
-        } else if (pci_dma_read(PCI_DEVICE(s), sp.addr, p, n) != MEMTX_OK) {
-            memset(p, 0, n);
+        } else {
+            if (s->gfx3d.ram_pend) {
+                /* queued draws write guest RAM */
+                hd5770_gfx_sync(&s->gfx3d);
+            }
+            if (write) {
+                pci_dma_write(PCI_DEVICE(s), sp.addr, p, n);
+            } else if (pci_dma_read(PCI_DEVICE(s), sp.addr, p, n) !=
+                       MEMTX_OK) {
+                memset(p, 0, n);
+            }
         }
         mc += n;
         p += n;
