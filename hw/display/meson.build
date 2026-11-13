@@ -108,6 +108,8 @@ system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5
 if host_os == 'darwin'
   system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_msl.c', 'ati_hd5770_mtl.m'),
                 dependency('appleframeworks', modules: ['Metal', 'Foundation'])])
+elif host_os == 'windows'
+  system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770_glsl.c'))
 endif
 
 # the HD 5770's synthetic AtomBIOS option ROM
