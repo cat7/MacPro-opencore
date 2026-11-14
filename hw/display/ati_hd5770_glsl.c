@@ -10,11 +10,14 @@
  * is fused only where the CPU path's compiler fuses it (HD_FUSED: on
  * AArch64 hosts, not on x86, whose build has no FMA).
  *
+ * Storage buffer 0 holds VRAM at VRAM offsets, then 4 KiB slots that hold
+ * the pages of surfaces in guest RAM.
+ *
  * hd5770_glsl_program() adds main(): work group g of 64 invocations is
  * tile tile0 + g, a block of a triangle's box; invocation l is its pixel
- * (x + l % w, y + l / w). Storage buffers: 0 VRAM (at VRAM offsets), 1
+ * (x + l % w, y + l / w). Storage buffers: 0 VRAM and RAM slots, 1
  * surfaces, 2 draws, 3 textures, 4 triangles, 5 words (inputs, constants,
- * the constant file, vertex buffer bytes), 6 tiles: eight words each,
+ * the constant file, vertex buffer bytes, RAM slots), 6 tiles: eight words each,
  * the draw, the triangle, its inputs' word offset, its first texture,
  * the constants' word offset, then x, y, w. A program that fetches
  * gradients runs the pixels to the right and below alongside, in
@@ -42,6 +45,7 @@ const char hd5770_glsl_lib[] =
 "    uint voff, mode, bpe, row_bytes, mt_per_row, tile_bytes, mt_bytes;\n"
 "    uint pipes, banks, bankw, bankh, pib;\n"
 "    uint mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh, fast;\n"
+"    uint space, pt, pg0;\n"
 "    uint eoff[64];\n"
 "};\n"
 "struct GTex {\n"
@@ -435,13 +439,28 @@ const char hd5770_glsl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"/* hd5770_surf_offset_fast(): VRAM offset of element (x, y) of surface si */\n"
+"/*\n"
+" * Storage buffer 0 offset of the byte at offset o of surface si: in VRAM,\n"
+" * or in guest RAM, whose pages are at voff + slot * 4096 (their slots in\n"
+" * words from pt on)\n"
+" */\n"
+"uint hd_at(uint si, uint o)\n"
+"{\n"
+"    if (surfs[si].space != 0u) {\n"
+"        uint q = surfs[si].pg0 + o;\n"
+"\n"
+"        return surfs[si].voff + words[surfs[si].pt + (q >> 12u)] * 4096u + (q & 4095u);\n"
+"    }\n"
+"    return surfs[si].voff + o;\n"
+"}\n"
+"\n"
+"/* hd5770_surf_offset_fast(): the offset of element (x, y) of surface si */\n"
 "uint hd_addr(uint si, uint x, uint y)\n"
 "{\n"
 "    uint tx = x >> 3u, ty = y >> 3u, total, pipe, bank, t;\n"
 "\n"
 "    if (surfs[si].mode < 2u) {\n"
-"        return surfs[si].voff + y * surfs[si].row_bytes + x * surfs[si].bpe;\n"
+"        return hd_at(si, y * surfs[si].row_bytes + x * surfs[si].bpe);\n"
 "    }\n"
 "    if (surfs[si].mode == 2u) {\n"
 "        t = (ty * surfs[si].mt_per_row + tx) * surfs[si].tile_bytes;\n"
@@ -459,7 +478,7 @@ const char hd5770_glsl_lib[] =
 "            bank << (surfs[si].pib_sh + surfs[si].pipes_sh) |\n"
 "            (total >> surfs[si].pib_sh) << surfs[si].hi_sh;\n"
 "    }\n"
-"    return surfs[si].voff + t + surfs[si].eoff[(y & 7u) * 8u + (x & 7u)];\n"
+"    return hd_at(si, t + surfs[si].eoff[(y & 7u) * 8u + (x & 7u)]);\n"
 "}\n"
 "\n"
 "/* ---- ALU: eval() and post() ---- */\n"
