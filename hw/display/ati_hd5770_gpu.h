@@ -214,6 +214,8 @@ HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,
 
 /* GLSL (ati_hd5770_glsl.c): a program, and the library alone */
 char *hd5770_glsl_program(const HD5770IR *ir);
+/* the same for draws whose texture units in mipmask are mipmapped */
+char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask);
 char *hd5770_glsl_lib_only(void);
 /* the tables storage buffer 7 holds; the words needed if n is too small */
 size_t hd5770_glsl_tables(uint32_t *out, size_t n);

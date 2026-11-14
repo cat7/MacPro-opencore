@@ -22,7 +22,8 @@
  *
  * Requests with depth and stencil planes are taken; the planes are
  * written surfaces like the target (checked, uploaded, read back, and in
- * the hazards).
+ * the hazards). The levels of a mipmapped texture are read surfaces like
+ * level 0.
  *
  * Triangles of consecutive draws with the same program run in one
  * dispatch, a work group per 64-pixel tile of a triangle's box; a memory
@@ -198,6 +199,10 @@ typedef struct GTex {
     uint32_t dst_sel[4];
     uint32_t bits[4];
     float border[4];
+    uint32_t mip, last_lv, mip_filter, lev;
+    float min_lod, max_lod, lod_bias;
+    uint32_t lw[16], lh[16];
+    uint32_t base_lv, levels, depth, pad;
 } GTex;
 
 typedef struct GVb {
@@ -233,7 +238,7 @@ typedef struct GTri {
 } GTri;
 
 QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 23);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 66);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 158);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
@@ -1215,18 +1220,20 @@ static void gl_sync(void *opaque)
  * (the request goes to the CPU until it is built), compiled on the GL
  * thread meanwhile if there is no compile thread.
  */
-static GlProg *gl_prog(HD5770Gl *g, const HD5770IR *ir)
+static GlProg *gl_prog(HD5770Gl *g, const HD5770IR *ir, uint32_t mipmask)
 {
-    GlProg *p = g_hash_table_lookup(g->progs, &ir->hash);
+    /* a program with mipmapped units is its own variant */
+    uint64_t hash = ir->hash ^ (mipmask * 0x9e3779b97f4a7c15ull);
+    GlProg *p = g_hash_table_lookup(g->progs, &hash);
     GlJob j = { .kind = JOB_COMPILE };
 
     if (p) {
         return p;
     }
     p = g_new0(GlProg, 1);
-    p->hash = ir->hash;
-    g_hash_table_insert(g->progs, g_memdup2(&ir->hash, sizeof(ir->hash)), p);
-    p->src = hd5770_glsl_program(ir);
+    p->hash = hash;
+    g_hash_table_insert(g->progs, g_memdup2(&hash, sizeof(hash)), p);
+    p->src = hd5770_glsl_program_mip(ir, mipmask);
     if (!p->src) {
         p->state = GLP_FAILED;
         return p;
@@ -1331,6 +1338,21 @@ static void gl_span(HD5770Gl *g, const HD5770GpuSurf *s, uint64_t *lo,
     }
 }
 
+/* the bytes a texture reads: level 0 and its mip chain */
+static void gl_tex_span(HD5770Gl *g, const HD5770GpuTex *t, uint64_t *lo,
+                        uint64_t *hi)
+{
+    uint64_t l0, h0;
+    unsigned l;
+
+    gl_span(g, &t->surf, lo, hi);
+    for (l = 1; t->mip && l <= t->last_lv; l++) {
+        gl_span(g, &t->lv[l], &l0, &h0);
+        *lo = MIN(*lo, l0);
+        *hi = MAX(*hi, h0);
+    }
+}
+
 /* where a surface starts, VRAM and guest RAM apart */
 static uint64_t gl_key(const HD5770GpuSurf *s)
 {
@@ -1404,7 +1426,7 @@ static void gl_hazard(HD5770Gl *g, const HD5770GpuDraw *d,
             }
         }
         for (k = 0; first && !bar && k < d->ntex; k++) {
-            gl_span(g, &d->tex[k].surf, &tlo, &thi);
+            gl_tex_span(g, &d->tex[k], &tlo, &thi);
             bar = gl_overlap(a->lo, a->hi, tlo, thi);
         }
     }
@@ -1421,7 +1443,7 @@ static void gl_hazard(HD5770Gl *g, const HD5770GpuDraw *d,
     }
     if (first || bar) {
         for (k = 0; k < d->ntex; k++) {
-            gl_span(g, &d->tex[k].surf, &g->rd[g->nrd].lo, &g->rd[g->nrd].hi);
+            gl_tex_span(g, &d->tex[k], &g->rd[g->nrd].lo, &g->rd[g->nrd].hi);
             g->nrd++;
         }
     }
@@ -1589,12 +1611,16 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     int miny = INT_MAX, maxy = -1;
     unsigned i, k;
     bool first = true, ram = false;
+    uint32_t mipmask = 0;
 
     if (qatomic_read(&g->dead)) {
         g->declined[GLD_DEAD]++;
         return false;
     }
-    p = gl_prog(g, d->ir);
+    for (i = 0; i < d->ntex; i++) {
+        mipmask |= (uint32_t)d->tex[i].mip << i;
+    }
+    p = gl_prog(g, d->ir, mipmask);
     switch (qatomic_load_acquire(&p->state)) {
     case GLP_QUEUED:
         g->declined[GLD_COMPILING]++;
@@ -1616,6 +1642,14 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             ts->voff + hd5770_surf_size(&ts->s) > g->vram_size) {
             g->declined[GLD_SURF]++;
             return false;
+        }
+        for (k = 1; d->tex[i].mip && k <= d->tex[i].last_lv; k++) {
+            ts = &d->tex[i].lv[k];
+            if (ts->space ||
+                ts->voff + hd5770_surf_size(&ts->s) > g->vram_size) {
+                g->declined[GLD_SURF]++;
+                return false;
+            }
         }
     }
     for (i = 0; d->db && i < 2; i++) {
@@ -1677,6 +1711,10 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             tpt[i] = gl_ram_surf(g, ts, 0, UINT32_MAX, false);
             ram = true;
         } else {
+            gl_need(g, ts->voff, ts->voff + hd5770_surf_size(&ts->s));
+        }
+        for (k = 1; d->tex[i].mip && k <= d->tex[i].last_lv; k++) {
+            ts = &d->tex[i].lv[k];
             gl_need(g, ts->voff, ts->voff + hd5770_surf_size(&ts->s));
         }
     }
@@ -1776,6 +1814,29 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             gt.dst_sel[k] = t->dst_sel[k];
             gt.bits[k] = t->bits[k];
             gt.border[k] = t->border[k];
+        }
+        gt.base_lv = t->base_lv;
+        gt.levels = t->levels;
+        gt.depth = t->depth;
+        gt.lw[0] = t->w;
+        gt.lh[0] = t->h;
+        if (t->mip) {
+            /* levels 1..last_lv in consecutive surfaces from lev */
+            for (k = 1; k <= t->last_lv; k++) {
+                uint32_t si = gl_surf(g, &t->lv[k], 0);
+
+                if (k == 1) {
+                    gt.lev = si;
+                }
+                gt.lw[k] = t->lw[k];
+                gt.lh[k] = t->lh[k];
+            }
+            gt.mip = 1;
+            gt.last_lv = t->last_lv;
+            gt.mip_filter = t->mip_filter;
+            gt.min_lod = t->min_lod;
+            gt.max_lod = t->max_lod;
+            gt.lod_bias = t->lod_bias;
         }
         g_array_append_val(g->seg->a[B_TEXS], gt);
     }
@@ -1929,6 +1990,8 @@ static const HD5770GpuOps gl_ops = {
     .close = gl_close,
     .ram = gl_ram,
     .depth = true,
+    .mipmaps = true,
+    .resinfo = true,
 };
 
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)

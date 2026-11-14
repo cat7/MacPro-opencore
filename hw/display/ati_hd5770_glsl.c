@@ -21,7 +21,9 @@
  * the draw, the triangle, its inputs' word offset, its first texture,
  * the constants' word offset, then x, y, w. A program that fetches
  * gradients runs the pixels to the right and below alongside, in
- * register sets of their own (r_1, r_2), as the CPU path's lanes do.
+ * register sets of their own (r_1, r_2), as the CPU path's lanes do; so
+ * does a program sampling mipmapped textures (hd5770_glsl_program_mip()),
+ * whose level of detail comes from the coordinates' change to them.
  * After the kill and alpha tests, hd_db() is db_test(): the depth and
  * stencil tests and updates; float targets blend unclamped and pack
  * 16-bit components as float_to_half() does.
@@ -56,6 +58,10 @@ const char hd5770_glsl_lib[] =
 "    uint dst_sel[4];\n"
 "    uint bits[4];\n"
 "    float border[4];\n"
+"    uint mip, last_lv, mip_filter, lev;\n"
+"    float min_lod, max_lod, lod_bias;\n"
+"    uint lw[16], lh[16];\n"
+"    uint base_lv, levels, depth, pad;\n"
 "};\n"
 "struct GVb {\n"
 "    uint id, off, len, pad;\n"
@@ -842,9 +848,10 @@ const char hd5770_glsl_lib[] =
 "    return true;\n"
 "}\n"
 "\n"
-"void hd_texel(uint ti, int x, int y, out uint o[4])\n"
+"/* texel (x, y) of the level whose surface is si */\n"
+"void hd_texel_s(uint ti, uint si, int x, int y, out uint o[4])\n"
 "{\n"
-"    uint off = hd_addr(texs[ti].s, uint(x), uint(y)), v[6], c[4];\n"
+"    uint off = hd_addr(si, uint(x), uint(y)), v[6], c[4];\n"
 "\n"
 "    if (texs[ti].unorm8 != 0u) {\n"
 "        uint e = hd_rd(false, off, 4u);\n"
@@ -872,16 +879,26 @@ const char hd5770_glsl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"void hd_point(uint ti, int x, int y, out uint o[4])\n"
+"void hd_texel(uint ti, int x, int y, out uint o[4])\n"
 "{\n"
-"    if (!hd_wrap(x, int(texs[ti].w), texs[ti].samp0 & 7u) ||\n"
-"        !hd_wrap(y, int(texs[ti].h), (texs[ti].samp0 >> 3u) & 7u)) {\n"
+"    hd_texel_s(ti, texs[ti].s, x, y, o);\n"
+"}\n"
+"\n"
+"void hd_point_s(uint ti, uint si, uint lw, uint lh, int x, int y, out uint o[4])\n"
+"{\n"
+"    if (!hd_wrap(x, int(lw), texs[ti].samp0 & 7u) ||\n"
+"        !hd_wrap(y, int(lh), (texs[ti].samp0 >> 3u) & 7u)) {\n"
 "        for (uint k = 0u; k < 4u; k++) {\n"
 "            o[k] = U(texs[ti].border[k]);\n"
 "        }\n"
 "        return;\n"
 "    }\n"
-"    hd_texel(ti, x, y, o);\n"
+"    hd_texel_s(ti, si, x, y, o);\n"
+"}\n"
+"\n"
+"void hd_point(uint ti, int x, int y, out uint o[4])\n"
+"{\n"
+"    hd_point_s(ti, texs[ti].s, texs[ti].w, texs[ti].h, x, y, o);\n"
 "}\n"
 "\n"
 "int hd_floori(float f)\n"
@@ -911,6 +928,16 @@ const char hd5770_glsl_lib[] =
 "    float u, vv;\n"
 "\n"
 "    v[0] = U(0.0); v[1] = U(0.0); v[2] = U(0.0); v[3] = U(0.0);\n"
+"    if (op == 0x04u) {\n"
+"        /* GET_TEXTURE_RESINFO */\n"
+"        uint lv = min(c[0] + texs[ti].base_lv, 31u);\n"
+"\n"
+"        v[0] = max(texs[ti].w >> lv, 1u);\n"
+"        v[1] = texs[ti].dim == 0u ? 1u : max(texs[ti].h >> lv, 1u);\n"
+"        v[2] = texs[ti].depth;\n"
+"        v[3] = texs[ti].levels;\n"
+"        return;\n"
+"    }\n"
 "    if (op == 0x03u) {\n"
 "        int x = I(c[0]) + hd_div2(ox), y = I(c[1]) + hd_div2(oy);\n"
 "\n"
@@ -951,6 +978,104 @@ const char hd5770_glsl_lib[] =
 "            float bot = hd_lerp(F(t01[k]), F(t11[k]), ax);\n"
 "\n"
 "            v[k] = U(hd_lerp(top, bot, ay));\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* sample_lv(): point or bilinear sample of level l at (u, vv), in its texels */\n"
+"void hd_sample_lv(uint ti, uint l, float u, float vv, bool lin, out uint v[4])\n"
+"{\n"
+"    uint si = l == 0u ? texs[ti].s : texs[ti].lev + l - 1u;\n"
+"    uint lw = texs[ti].lw[l], lh = texs[ti].lh[l];\n"
+"\n"
+"    if (!lin) {\n"
+"        hd_point_s(ti, si, lw, lh, hd_floori(u), hd_floori(vv), v);\n"
+"        return;\n"
+"    }\n"
+"    float fx = hd_fsub(u, 0.5), fy = hd_fsub(vv, 0.5);\n"
+"    int x0 = hd_floori(fx), y0 = hd_floori(fy);\n"
+"    float ax = hd_fsub(fx, float(x0)), ay = hd_fsub(fy, float(y0));\n"
+"    uint t00[4], t10[4], t01[4], t11[4];\n"
+"\n"
+"    hd_point_s(ti, si, lw, lh, x0, y0, t00);\n"
+"    hd_point_s(ti, si, lw, lh, x0 + 1, y0, t10);\n"
+"    hd_point_s(ti, si, lw, lh, x0, y0 + 1, t01);\n"
+"    hd_point_s(ti, si, lw, lh, x0 + 1, y0 + 1, t11);\n"
+"    for (uint k = 0u; k < 4u; k++) {\n"
+"        float top = hd_lerp(F(t00[k]), F(t10[k]), ax);\n"
+"        float bot = hd_lerp(F(t01[k]), F(t11[k]), ax);\n"
+"\n"
+"        v[k] = U(hd_lerp(top, bot, ay));\n"
+"    }\n"
+"}\n"
+"\n"
+"/* lod_log2(): exponent plus linear mantissa */\n"
+"float hd_lodlog2(float x)\n"
+"{\n"
+"    if (!(x > 0.0)) {\n"
+"        return -128.0;\n"
+"    }\n"
+"    uint b = U(x);\n"
+"    return hd_mad(float(b & 0x7fffffu), 1.0 / 8388608.0, float(int((b >> 23u) & 0xffu) - 127));\n"
+"}\n"
+"\n"
+"/* lv_coord() */\n"
+"float hd_lvc(float c, uint size, int o)\n"
+"{\n"
+"    return hd_mad(float(o), 0.5, hd_fmul(c, float(size)));\n"
+"}\n"
+"\n"
+"/* tfetch_stage() with derivatives dv, for a mipmapped texture */\n"
+"void hd_tfetch_d(uint ti, uint w0, uint w1, uint w2, uint c[4], float dv[8], out uint v[4])\n"
+"{\n"
+"    uint op = w0 & 0x1fu, lv;\n"
+"    int ox = int(w2 << 27u) >> 27, oy = int(w2 << 22u) >> 27;\n"
+"    float lod = 0.0, l0, f;\n"
+"    bool lin;\n"
+"    uint v1[4];\n"
+"\n"
+"    if (op == 0x03u || op == 0x04u || texs[ti].mip == 0u ||\n"
+"        ((w1 >> 28u) & 1u) == 0u || ((w1 >> 29u) & 1u) == 0u) {\n"
+"        hd_tfetch(ti, w0, w1, w2, c, v);\n"
+"        return;\n"
+"    }\n"
+"    if (op == 0x11u) {\n"
+"        lod = F(c[3]);\n"
+"    } else if (op != 0x13u) {\n"
+"        float tw = float(texs[ti].w), th = float(texs[ti].h);\n"
+"        float ax = hd_fmul(dv[0], tw), ay = hd_fmul(dv[1], th);\n"
+"        float bx = hd_fmul(dv[4], tw), by = hd_fmul(dv[5], th);\n"
+"        float a = hd_sum2(ax, ax, ay, ay), b = hd_sum2(bx, bx, by, by);\n"
+"\n"
+"        lod = hd_fmul(0.5, hd_lodlog2(hd_fmax(a, b)));\n"
+"        if (op == 0x12u) {\n"
+"            lod = hd_fadd(lod, F(c[3]));\n"
+"        }\n"
+"    }\n"
+"    lod = hd_fmin(hd_fmax(hd_fadd(lod, texs[ti].lod_bias), texs[ti].min_lod), texs[ti].max_lod);\n"
+"    if (!(lod > 0.0)) {\n"
+"        hd_sample_lv(ti, 0u, hd_lvc(F(c[0]), texs[ti].w, ox), hd_lvc(F(c[1]), texs[ti].h, oy),\n"
+"                     ((texs[ti].samp0 >> 9u) & 1u) != 0u, v);\n"
+"        return;\n"
+"    }\n"
+"    lin = ((texs[ti].samp0 >> 11u) & 1u) != 0u;\n"
+"    if (texs[ti].mip_filter == 1u) {\n"
+"        lv = min(uint(floor(hd_fadd(lod, 0.5))), texs[ti].last_lv);\n"
+"        hd_sample_lv(ti, lv, hd_lvc(F(c[0]), texs[ti].lw[lv], ox),\n"
+"                     hd_lvc(F(c[1]), texs[ti].lh[lv], oy), lin, v);\n"
+"        return;\n"
+"    }\n"
+"    l0 = floor(lod);\n"
+"    f = hd_fsub(lod, l0);\n"
+"    lv = min(uint(l0), texs[ti].last_lv);\n"
+"    hd_sample_lv(ti, lv, hd_lvc(F(c[0]), texs[ti].lw[lv], ox),\n"
+"                 hd_lvc(F(c[1]), texs[ti].lh[lv], oy), lin, v);\n"
+"    if (lv < texs[ti].last_lv) {\n"
+"        lv++;\n"
+"        hd_sample_lv(ti, lv, hd_lvc(F(c[0]), texs[ti].lw[lv], ox),\n"
+"                     hd_lvc(F(c[1]), texs[ti].lh[lv], oy), lin, v1);\n"
+"        for (uint k = 0u; k < 4u; k++) {\n"
+"            v[k] = U(hd_lerp(F(v[k]), F(v1[k]), f));\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -1501,11 +1626,37 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
 }
 
 static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
-                       unsigned q)
+                       unsigned q, uint32_t mipmask, unsigned fi)
 {
     const char *x = set_sfx[q];
     unsigned k, unit = 0;
+    bool mip = false;
 
+    if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) != 0x03 &&
+        (f->w[0] & 0x1f) != 0x04) {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        mip = (mipmask >> unit) & 1;
+    }
+    if (mip && !q) {
+        /*
+         * derivatives across the quad from the neighbour sets, read
+         * before any set's result lands; the same for all three
+         */
+        g_string_append_printf(o, "    float dv%u[8] = float[8](", fi);
+        for (k = 0; k < 8; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * (k & 3))) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "hd_fsub(F(r_%u[%u][%u]), F(r[%u][%u]))",
+                                       k < 4 ? 1 : 2, f->src, sel, f->src, sel);
+            } else {
+                g_string_append(o, "0.0");
+            }
+            g_string_append(o, k < 7 ? ", " : ");\n");
+        }
+    }
     g_string_append(o, "    {\n        uint o[4] = uint[4](0u, 0u, 0u, 0u);\n");
     if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
         /* the neighbour minus this pixel; in a neighbour, itself */
@@ -1541,8 +1692,15 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
             }
             g_string_append(o, k < 3 ? ", " : ");\n");
         }
-        g_string_append_printf(o, "        hd_tfetch(tx + %uu, 0x%08xu, 0x%08xu, "
-                               "0x%08xu, c, o);\n", unit, f->w[0], f->w[1], f->w[2]);
+        if (mip) {
+            g_string_append_printf(o, "        hd_tfetch_d(tx + %uu, 0x%08xu, 0x%08xu, "
+                                   "0x%08xu, c, dv%u, o);\n", unit, f->w[0],
+                                   f->w[1], f->w[2], fi);
+        } else {
+            g_string_append_printf(o, "        hd_tfetch(tx + %uu, 0x%08xu, 0x%08xu, "
+                                   "0x%08xu, c, o);\n", unit, f->w[0], f->w[1],
+                                   f->w[2]);
+        }
     }
     for (k = 0; k < 4; k++) {
         unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
@@ -1605,8 +1763,14 @@ char *hd5770_glsl_lib_only(void)
 
 char *hd5770_glsl_program(const HD5770IR *ir)
 {
+    return hd5770_glsl_program_mip(ir, 0);
+}
+
+char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
+{
     GString *o;
-    unsigned i, j, k, q, nq = ir->grad ? 3 : 1, ng = MAX(ir->ngpr, 1u);
+    unsigned i, j, k, q, nq = ir->grad || mipmask ? 3 : 1;
+    unsigned ng = MAX(ir->ngpr, 1u);
 
     o = g_string_new(NULL);
     emit_head(o);
@@ -1689,7 +1853,8 @@ char *hd5770_glsl_program(const HD5770IR *ir)
         case HD5770_IRO_FETCH:
             for (j = 0; j < op->n; j++) {
                 for (q = 0; q < nq; q++) {
-                    emit_fetch(o, ir, &ir->fetches[op->first + j], q);
+                    emit_fetch(o, ir, &ir->fetches[op->first + j], q, mipmask,
+                               op->first + j);
                 }
             }
             break;
