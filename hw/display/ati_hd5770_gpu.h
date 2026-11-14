@@ -84,6 +84,9 @@ typedef struct HD5770GpuTri {
     float area;
     int32_t x0, y0, x1, y1;     /* pixels to visit, inclusive */
     uint32_t prim;              /* triangles of one primitive share no pixel */
+    /* added 2026-11-14: depth and stencil */
+    float z[3];                 /* window z of the vertices */
+    uint32_t front;             /* the triangle faces front */
 } HD5770GpuTri;
 
 typedef struct HD5770GpuDraw {
@@ -122,6 +125,24 @@ typedef struct HD5770GpuDraw {
     const HD5770GpuTri *tri;
     const float *prm;
     uint32_t flat;
+
+    /*
+     * Added 2026-11-14: depth and stencil, as db_test() in
+     * ati_hd5770_draw.c. With db set, each covered pixel that survives
+     * the kill and the alpha test is tested against the depth plane zs
+     * (zfmt 1 Z_16, 2 Z_24, 3 Z_32_FLOAT, 0 none) and the stencil plane
+     * ss (has_s), with DB_DEPTH_CONTROL dctl, DB_RENDER_CONTROL rctl
+     * (clear enables), DB_STENCILREFMASK front/back srm, the clear
+     * values, the viewport depth range; the planes are updated, and the
+     * colour is written only if both tests pass. The fragment depth is
+     * z[0] * b0 + z[1] * b1 + z[2] * b2 of the triangle.
+     */
+    bool db;
+    HD5770GpuSurf zs, ss;
+    uint32_t zfmt;
+    bool has_s;
+    uint32_t dctl, rctl, srm[2], sclear;
+    float zclear, zmin, zmax;
 } HD5770GpuDraw;
 
 typedef struct HD5770GpuOps {
@@ -134,6 +155,8 @@ typedef struct HD5770GpuOps {
     bool (*ram)(void *b, uint8_t *host, uint64_t size);
     /* draws covering fewer pixels stay on the CPU; 0: all are offered */
     unsigned min_pixels;
+    /* added 2026-11-14: takes requests with db set */
+    bool depth;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {

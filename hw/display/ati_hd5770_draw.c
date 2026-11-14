@@ -2190,6 +2190,10 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
     }
     gt.area = area;
     gt.prim = d->st->prims;
+    for (q = 0; q < 3; q++) {
+        gt.z[q] = v[q]->z;
+    }
+    gt.front = d->front;
     g_array_append_val(d->gtri, gt);
     for (p = 0; p < d->gnin; p++) {
         int src = d->ps_src[p];
@@ -2315,6 +2319,8 @@ static void gpu_req_free(HD5770GpuDraw *q)
         g_free((void *)q->tex[i].surf.pages);
     }
     g_free((void *)q->rt.pages);
+    g_free((void *)q->zs.pages);
+    g_free((void *)q->ss.pages);
     g_free(q);
 }
 
@@ -2329,9 +2335,10 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     HD5770Gfx *g = d->g;
     const HD5770IR *ir;
     HD5770GpuDraw *q;
-    uint64_t rt_off, lo = 0, hi = 0, area = 0;
-    uint8_t *pre = NULL;
-    unsigned i;
+    uint64_t area = 0, rng[3][2];
+    uint8_t *pre[3] = { NULL };
+    const HD5770GpuSurf *ws[3];
+    unsigned i, nr = 0;
     int y0 = INT_MAX, y1 = -1;
     bool ok = false;
 
@@ -2339,7 +2346,8 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         return false;
     }
     g->gst.offered++;
-    if (d->db || d->resolve || !d->color) {
+    if (d->resolve || !d->color || (d->db && !g->gpu->ops->depth) ||
+        (d->db && d->zexport)) {
         g->gst.fallback[GFB_DB]++;
         return false;
     }
@@ -2365,7 +2373,26 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         g->gst.fallback[GFB_RT]++;
         goto out;
     }
-    rt_off = q->rt.voff;
+    if (d->db) {
+        /* depth and stencil planes in VRAM */
+        if ((d->zfmt && (!gpu_surf(g, &d->zs, true, &q->zs) || q->zs.space)) ||
+            (d->has_s && (!gpu_surf(g, &d->ss, true, &q->ss) ||
+                          q->ss.space))) {
+            g->gst.fallback[GFB_DB]++;
+            goto out;
+        }
+        q->db = true;
+        q->zfmt = d->zfmt;
+        q->has_s = d->has_s;
+        q->dctl = d->dctl;
+        q->rctl = d->rctl;
+        q->srm[0] = d->srm[0];
+        q->srm[1] = d->srm[1];
+        q->sclear = d->sclear;
+        q->zclear = d->zclear;
+        q->zmin = d->zmin;
+        q->zmax = d->zmax;
+    }
     q->ir = ir;
     q->kv = (const uint32_t *)d->kv;
     q->cfile = g->alu;
@@ -2427,29 +2454,46 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         g->gst.fallback[GFB_SMALL]++;
         goto out;
     }
-    if (y1 >= y0 && !q->rt.space) {
-        hd5770_surf_rows(&d->rt, y0, y1 + 1, &lo, &hi);
-        lo = lo - d->rt.base + rt_off;
-        hi = MIN(hi - d->rt.base + rt_off, g->vram_size);
+    /* the VRAM rows the draw writes: target, depth, stencil */
+    ws[0] = q->rt.space ? NULL : &q->rt;
+    ws[1] = q->db && q->zfmt ? &q->zs : NULL;
+    ws[2] = q->db && q->has_s ? &q->ss : NULL;
+    for (i = 0; i < 3 && y1 >= y0; i++) {
+        uint64_t lo, hi;
+
+        if (!ws[i]) {
+            continue;
+        }
+        hd5770_surf_rows(&ws[i]->s, y0, y1 + 1, &lo, &hi);
+        rng[nr][0] = lo - ws[i]->s.base + ws[i]->voff;
+        rng[nr][1] = MIN(hi - ws[i]->s.base + ws[i]->voff, g->vram_size);
+        if (rng[nr][1] > rng[nr][0]) {
+            nr++;
+        }
     }
     if (q->rt.space && g->gpu_mode == HD5770_GPU_VERIFY) {
         /* verified draws are the ones in VRAM */
         g->gst.fallback[GFB_RT]++;
         goto out;
     }
-    if (g->gpu_mode == HD5770_GPU_VERIFY && hi > lo) {
+    if (g->gpu_mode == HD5770_GPU_VERIFY) {
         hd5770_gfx_sync(g);
-        pre = g_memdup2(g->vram + lo, hi - lo);
+        for (i = 0; i < nr; i++) {
+            pre[i] = g_memdup2(g->vram + rng[i][0], rng[i][1] - rng[i][0]);
+        }
     }
     if (q->ntri && !g->gpu->ops->draw(g->gpu->b, q)) {
         g->gst.fallback[GFB_BACKEND]++;
-        g_free(pre);
+        for (i = 0; i < nr; i++) {
+            g_free(pre[i]);
+        }
         goto out;
     }
     ok = true;
     g->gst.taken++;
-    if (hi > lo) {
-        pend_add(g, lo, hi);
+    g->gst.taken_db += q->db;
+    for (i = 0; i < nr; i++) {
+        pend_add(g, rng[i][0], rng[i][1]);
     }
     g->ram_pend |= q->rt.space;
     for (i = 0; i < q->ntex; i++) {
@@ -2460,30 +2504,40 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
                      q->tex[i].surf.voff + hd5770_surf_size(&q->tex[i].surf.s));
         }
     }
-    if (pre) {
-        uint8_t *gpu;
-        uint64_t n = hi - lo, k, nd = 0, big = 0;
+    if (g->gpu_mode == HD5770_GPU_VERIFY && nr) {
+        uint8_t *gpu[3];
+        uint64_t k, nd = 0, big = 0;
         unsigned mx = 0;
 
         hd5770_gfx_sync(g);
-        gpu = g_memdup2(g->vram + lo, n);
-        memcpy(g->vram + lo, pre, n);
-        d->ok = true;
-        assemble(d, vb, nv, prim, t, raster_tri);
-        for (k = 0; k < n; k++) {
-            unsigned df = abs((int)gpu[k] - (int)g->vram[lo + k]);
+        for (i = 0; i < nr; i++) {
+            uint64_t n = rng[i][1] - rng[i][0];
 
-            nd += df != 0;
-            big += df > 1;
-            mx = MAX(mx, df);
+            gpu[i] = g_memdup2(g->vram + rng[i][0], n);
+            memcpy(g->vram + rng[i][0], pre[i], n);
+        }
+        d->ok = true;
+        d->span_rt.p = d->span_z.p = d->span_s.p = NULL;
+        d->span_rt.lo = d->span_rt.hi = 0;
+        d->span_z.lo = d->span_z.hi = d->span_s.lo = d->span_s.hi = 0;
+        assemble(d, vb, nv, prim, t, raster_tri);
+        for (i = 0; i < nr; i++) {
+            for (k = 0; k < rng[i][1] - rng[i][0]; k++) {
+                unsigned df = abs((int)gpu[i][k] -
+                                  (int)g->vram[rng[i][0] + k]);
+
+                nd += df != 0;
+                big += df > 1;
+                mx = MAX(mx, df);
+            }
+            g_free(gpu[i]);
+            g_free(pre[i]);
         }
         g->gst.verified++;
         g->gst.vdiff_draws += nd != 0;
         g->gst.vdiff_bytes += nd;
         g->gst.vdiff_big += big;
         g->gst.vmax = MAX(g->gst.vmax, mx);
-        g_free(gpu);
-        g_free(pre);
     }
 out:
     if (d->gtri) {
@@ -2938,7 +2992,8 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
         return;
     }
     g_string_append_printf(out,
-        "gpu: %s offered %" PRIu64 " taken %" PRIu64 " fallback: program %"
+        "gpu: %s offered %" PRIu64 " taken %" PRIu64 " (depth/stencil %" PRIu64
+        ") fallback: program %"
         PRIu64 " small %" PRIu64 " target %" PRIu64 " texture %" PRIu64
         " vertex buffer %" PRIu64 " backend %" PRIu64 " depth/resolve %"
         PRIu64 "\n"
@@ -2946,7 +3001,7 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
         " differing draws %" PRIu64 " bytes %" PRIu64 " (>1: %" PRIu64
         ") max %" PRIu64 "\n",
         g->gpu_mode == HD5770_GPU_VERIFY ? "verify" : "on", t->offered,
-        t->taken, t->fallback[GFB_PROG], t->fallback[GFB_SMALL],
+        t->taken, t->taken_db, t->fallback[GFB_PROG], t->fallback[GFB_SMALL],
         t->fallback[GFB_RT], t->fallback[GFB_TEX], t->fallback[GFB_VB],
         t->fallback[GFB_BACKEND], t->fallback[GFB_DB], t->syncs, t->touch_syncs, t->verified,
         t->vdiff_draws, t->vdiff_bytes, t->vdiff_big, t->vmax);

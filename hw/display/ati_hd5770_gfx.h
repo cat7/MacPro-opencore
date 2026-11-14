@@ -204,7 +204,7 @@ enum {
 #define HD5770_PENDING          16
 
 typedef struct HD5770GpuStats {
-    uint64_t offered, taken, fallback[8];
+    uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
     uint64_t syncs, touch_syncs;
 } HD5770GpuStats;
