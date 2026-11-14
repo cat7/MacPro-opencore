@@ -2099,8 +2099,23 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
     UINT32 reg_count = 0;
     WHV_REGISTER_VALUE reg_values[3];
     WHV_REGISTER_NAME reg_names[3];
-    int irr = apic_get_highest_priority_irr(x86_cpu->apic_state);
+    int irr;
 
+    /*
+     * With the hypervisor's APIC there is nothing to inject or register
+     * unless an interrupt is requested. Skip the BQL then: a vCPU back
+     * from an exit that did not need it must not wait for whatever the
+     * main loop holds it for, or it stops taking IPIs meanwhile.
+     */
+    if (whpx_irqchip_in_kernel() &&
+        !cpu_test_interrupt(cpu, CPU_INTERRUPT_NMI | CPU_INTERRUPT_SMI |
+                                 CPU_INTERRUPT_INIT | CPU_INTERRUPT_TPR |
+                                 CPU_INTERRUPT_HARD)) {
+        vcpu->ready_for_pic_interrupt = false;
+        return;
+    }
+
+    irr = apic_get_highest_priority_irr(x86_cpu->apic_state);
     memset(&new_int, 0, sizeof(new_int));
     memset(reg_values, 0, sizeof(reg_values));
 
