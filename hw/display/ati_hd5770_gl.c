@@ -29,6 +29,11 @@
  * a GL error or a lost context is reported once, and from then on every
  * draw is declined.
  *
+ * Linked programs are kept on disk (%LOCALAPPDATA%\qemu-x86-opencore\
+ * hd5770-gl), one file per SHA-256 of the IR hash, the GLSL text and the
+ * renderer and version strings, as the driver's program binaries. A binary the driver
+ * rejects is compiled from the text again and replaced.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -77,6 +82,10 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_STREAM_READ                      0x88E1
 #define GL_COPY_READ_BUFFER                 0x8F36
 #define GL_COPY_WRITE_BUFFER                0x8F37
+#define GL_PROGRAM_BINARY_RETRIEVABLE_HINT  0x8257
+#define GL_PROGRAM_BINARY_LENGTH            0x8741
+#define GL_NUM_PROGRAM_BINARY_FORMATS       0x87FE
+#define GL_TRUE                             1
 
 #define HD_GL_PROCS(X) \
     X(const GLubyte *, glGetString, (GLenum)) \
@@ -115,7 +124,11 @@ typedef ptrdiff_t GLsizeiptr;
     X(void, glBufferStorage, (GLenum, GLsizeiptr, const void *, \
                               GLbitfield)) \
     X(void, glDispatchCompute, (GLuint, GLuint, GLuint)) \
-    X(void, glMemoryBarrier, (GLbitfield))
+    X(void, glMemoryBarrier, (GLbitfield)) \
+    X(void, glProgramParameteri, (GLuint, GLenum, GLint)) \
+    X(void, glGetProgramBinary, (GLuint, GLsizei, GLsizei *, GLenum *, \
+                                 void *)) \
+    X(void, glProgramBinary, (GLuint, GLenum, const void *, GLsizei))
 
 #define HD_GL_PTR(ret, name, args) static ret (APIENTRY *p_##name) args;
 HD_GL_PROCS(HD_GL_PTR)
@@ -297,6 +310,7 @@ typedef struct HD5770Gl {
     GLuint buf[B_N];
     GLint align;
     char renderer[160];
+    char *cdir;                 /* program binaries; NULL: none kept */
     char err[320];
     bool dead;                  /* a GL error: no more draws */
     bool dead_told;
@@ -323,6 +337,7 @@ typedef struct HD5770Gl {
     uint64_t st_bytes;
     uint64_t failed;
     uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns;
+    uint64_t pb_hits, pb_rejected, pb_stored;
 } HD5770Gl;
 
 /* ---- the GL thread ---- */
@@ -342,13 +357,137 @@ static bool gl_check(HD5770Gl *g, const char *where)
     return false;
 }
 
+/* ---- program binaries on disk ---- */
+
+#define PB_MAGIC        "HD5770GLPB\x01\x00"
+#define PB_MAX          (64u << 20)
+
+/* header of a program binary file; the binary follows */
+typedef struct PbHead {
+    char magic[12];
+    uint8_t key[32];            /* SHA-256 of the IR hash, source, renderer */
+    uint32_t fmt, len;
+    uint64_t sum;               /* FNV-1a of the binary */
+} PbHead;
+
+static uint64_t pb_sum(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+
+    while (n--) {
+        h = (h ^ *p++) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+static char *pb_path(HD5770Gl *g, const GlProg *p, uint8_t key[32])
+{
+    GChecksum *c = g_checksum_new(G_CHECKSUM_SHA256);
+    gsize n = 32;
+    char hex[33];
+    unsigned k;
+
+    g_checksum_update(c, (const guchar *)&p->hash, sizeof(p->hash));
+    g_checksum_update(c, (const guchar *)p->src, strlen(p->src) + 1);
+    g_checksum_update(c, (const guchar *)g->renderer, strlen(g->renderer) + 1);
+    g_checksum_get_digest(c, key, &n);
+    g_checksum_free(c);
+    for (k = 0; k < 16; k++) {
+        snprintf(hex + 2 * k, 3, "%02x", key[k]);
+    }
+    return g_strdup_printf("%s\\%s.bin", g->cdir, hex);
+}
+
+/* the program from its binary, or 0 */
+static GLuint pb_load(HD5770Gl *g, const char *path, const uint8_t key[32])
+{
+    gchar *data = NULL;
+    gsize n = 0;
+    PbHead h;
+    GLuint pr = 0;
+    GLint ok = 0;
+
+    if (!g_file_get_contents(path, &data, &n, NULL)) {
+        return 0;
+    }
+    if (n < sizeof(h)) {
+        goto bad;
+    }
+    memcpy(&h, data, sizeof(h));
+    if (memcmp(h.magic, PB_MAGIC, sizeof(h.magic)) ||
+        memcmp(h.key, key, 32) || h.len != n - sizeof(h) ||
+        pb_sum((uint8_t *)data + sizeof(h), h.len) != h.sum) {
+        goto bad;
+    }
+    pr = p_glCreateProgram();
+    p_glProgramBinary(pr, h.fmt, data + sizeof(h), h.len);
+    p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+    /* a binary the driver refuses may leave an error behind */
+    while (p_glGetError() != GL_NO_ERROR) {
+        ok = 0;
+    }
+    if (!ok) {
+        p_glDeleteProgram(pr);
+        pr = 0;
+        goto bad;
+    }
+    g->pb_hits++;
+    g_free(data);
+    return pr;
+bad:
+    g->pb_rejected++;
+    g_free(data);
+    return 0;
+}
+
+static void pb_store(HD5770Gl *g, GLuint pr, const char *path,
+                     const uint8_t key[32])
+{
+    GLint len = 0;
+    GLsizei got = 0;
+    GLenum fmt = 0;
+    uint8_t *buf;
+    PbHead h;
+
+    p_glGetProgramiv(pr, GL_PROGRAM_BINARY_LENGTH, &len);
+    if (len <= 0 || (uint32_t)len > PB_MAX) {
+        return;
+    }
+    buf = g_malloc(sizeof(h) + len);
+    p_glGetProgramBinary(pr, len, &got, &fmt, buf + sizeof(h));
+    if (p_glGetError() == GL_NO_ERROR && got > 0 && got <= len) {
+        memset(&h, 0, sizeof(h));
+        memcpy(h.magic, PB_MAGIC, sizeof(h.magic));
+        memcpy(h.key, key, 32);
+        h.fmt = fmt;
+        h.len = got;
+        h.sum = pb_sum(buf + sizeof(h), got);
+        memcpy(buf, &h, sizeof(h));
+        if (g_mkdir_with_parents(g->cdir, 0700) == 0 &&
+            g_file_set_contents(path, (gchar *)buf, sizeof(h) + got, NULL)) {
+            g->pb_stored++;
+        }
+    }
+    g_free(buf);
+}
+
 static void gl_compile(HD5770Gl *g, GlProg *p)
 {
     GLuint sh, pr;
     GLint ok = 0, n = 0;
     const GLchar *src = p->src;
     int64_t t0 = get_clock();
+    uint8_t key[32];
+    char *path = g->cdir ? pb_path(g, p, key) : NULL;
 
+    if (path) {
+        pr = pb_load(g, path, key);
+        if (pr) {
+            p->prog = pr;
+            p->loc = p_glGetUniformLocation(pr, "tile0");
+            goto out;
+        }
+    }
     sh = p_glCreateShader(GL_COMPUTE_SHADER);
     p_glShaderSource(sh, 1, &src, NULL);
     p_glCompileShader(sh);
@@ -365,6 +504,9 @@ static void gl_compile(HD5770Gl *g, GlProg *p)
     }
     pr = p_glCreateProgram();
     p_glAttachShader(pr, sh);
+    if (path) {
+        p_glProgramParameteri(pr, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+    }
     p_glLinkProgram(pr);
     p_glDeleteShader(sh);
     p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
@@ -380,7 +522,11 @@ static void gl_compile(HD5770Gl *g, GlProg *p)
     }
     p->prog = pr;
     p->loc = p_glGetUniformLocation(pr, "tile0");
+    if (path) {
+        pb_store(g, pr, path, key);
+    }
 out:
+    g_free(path);
     g->compiles++;
     g->compile_ns += get_clock() - t0;
 }
@@ -828,6 +974,16 @@ static bool gl_open_ctx(HD5770Gl *g)
         p_glDeleteProgram(t.prog);
         g->compiles = g->failed = 0;
         g->compile_ns = 0;
+    }
+    {
+        GLint nfmt = 0;
+        const char *base = g_getenv("LOCALAPPDATA");
+
+        p_glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nfmt);
+        if (nfmt > 0 && base && *base) {
+            g->cdir = g_strdup_printf("%s\\qemu-x86-opencore\\hd5770-gl",
+                                      base);
+        }
     }
     return true;
 }
@@ -1427,13 +1583,14 @@ static void gl_stats(void *opaque, GString *out)
         " uploaded MB %" PRIu64 " read back MB %" PRIu64 " written back KB %"
         PRIu64 " wait ms %" PRIu64 " (gpu %" PRIu64 " read back %" PRIu64
         ") encode ms %" PRIu64 " programs %u compiled %" PRIu64
-        " (failed %" PRIu64 ") in ms %" PRIu64 "\n",
+        " (failed %" PRIu64 ") in ms %" PRIu64 " binaries: loaded %" PRIu64
+        " rejected %" PRIu64 " stored %" PRIu64 "\n",
         g->syncs, g->segs, g->dispatches,
         g->barriers, g->st_bytes >> 20, g->chk_bytes >> 20, g->up_bytes >> 20,
         g->rb_bytes >> 20, g->wb_bytes >> 10, g->wait_ns / 1000000,
         g->gpu_ns / 1000000, g->rb_ns / 1000000, g->encode_ns / 1000000,
         g_hash_table_size(g->progs), g->compiles, g->failed,
-        g->compile_ns / 1000000);
+        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored);
 }
 
 static void gl_prog_free(gpointer p)
@@ -1470,6 +1627,7 @@ static void gl_close(void *opaque)
     g_free(g->blk);
     g_free(g->pchk);
     g_free(g->pval);
+    g_free(g->cdir);
     g_array_free(g->ranges, true);
     g_queue_free(g->jobs);
     qemu_sem_destroy(&g->up);
