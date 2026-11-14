@@ -51,6 +51,7 @@ const char hd5770_msl_lib[] =
 "    uint mip, last_lv, mip_filter, lev_off;\n"
 "    float min_lod, max_lod, lod_bias;\n"
 "    uint lw[16], lh[16];\n"
+"    uint base_lv, levels, depth, pad;\n"
 "};\n"
 "struct GVb {\n"
 "    uint id, off, len, pad;\n"
@@ -622,6 +623,15 @@ const char hd5770_msl_lib[] =
 "    float u, vv;\n"
 "\n"
 "    v[0] = v[1] = v[2] = v[3] = U(0.0f);\n"
+"    if (op == 0x04) {\n"
+"        uint lv = min(c[0] + t.base_lv, 31u);\n"
+"\n"
+"        v[0] = max(t.w >> lv, 1u);\n"
+"        v[1] = t.dim == 0 ? 1u : max(t.h >> lv, 1u);\n"
+"        v[2] = t.depth;\n"
+"        v[3] = t.levels;\n"
+"        return;\n"
+"    }\n"
 "    if (op == 0x03) {\n"
 "        int x = I(c[0]) + ox / 2, y = I(c[1]) + oy / 2;\n"
 "\n"
@@ -717,7 +727,7 @@ const char hd5770_msl_lib[] =
 "    bool lin;\n"
 "    uint v1[4];\n"
 "\n"
-"    if (op == 0x03 || !t.mip || !((w1 >> 28) & 1) || !((w1 >> 29) & 1)) {\n"
+"    if (op == 0x03 || op == 0x04 || !t.mip || !((w1 >> 28) & 1) || !((w1 >> 29) & 1)) {\n"
 "        hd_tfetch(vram, ram, st, t, w0, w1, w2, c, v);\n"
 "        return;\n"
 "    }\n"
@@ -1305,7 +1315,8 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
     unsigned k, unit = 0;
     bool mip = false;
 
-    if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) != 0x03) {
+    if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) != 0x03 &&
+        (f->w[0] & 0x1f) != 0x04) {
         for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
             /* search */
         }

@@ -398,6 +398,7 @@ static void decode_fetch(HD5770Prog *p, CfInst *cf, HD5770GfxStats *st)
             case 0x07:              /* GET_GRADIENTS_H */
             case 0x08:              /* GET_GRADIENTS_V */
             case 0x03:              /* LD */
+            case 0x04:              /* GET_TEXTURE_RESINFO */
             case 0x10:              /* SAMPLE */
             case 0x11:              /* SAMPLE_L */
             case 0x12:              /* SAMPLE_LB */

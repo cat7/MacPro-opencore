@@ -48,6 +48,7 @@ typedef struct GTex {
     uint32_t mip, last_lv, mip_filter, lev_off;
     float min_lod, max_lod, lod_bias;
     uint32_t lw[16], lh[16];
+    uint32_t base_lv, levels, depth, pad;
 } GTex;
 
 typedef struct GVb {
@@ -87,7 +88,7 @@ typedef struct GTri {
 #define MTL_TRI_SLOT    128     /* staging bytes per GTri */
 
 QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 148);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 152);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 416);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
@@ -671,6 +672,9 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         g->is_float = t->is_float;
         g->unorm8 = t->unorm8;
         g->samp0 = t->samp[0];
+        g->base_lv = t->base_lv;
+        g->levels = t->levels;
+        g->depth = t->depth;
         for (k = 0; k < 4; k++) {
             g->dst_sel[k] = t->dst_sel[k];
             g->bits[k] = t->bits[k];
@@ -880,6 +884,7 @@ static const HD5770GpuOps mtl_ops = {
     .min_pixels = 1024,
     .depth = true,
     .mipmaps = true,
+    .resinfo = true,
     .draw = mtl_draw,
     .sync = mtl_sync,
     .stats = mtl_stats,

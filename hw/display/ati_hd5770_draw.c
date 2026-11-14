@@ -151,6 +151,7 @@ typedef struct Tex {
     unsigned comps;
     bool is_float;
     bool unorm8;                /* 8_8_8_8 UNORM */
+    unsigned base_lv, levels, depth;    /* BASE_LEVEL, levels from it, depth */
     /* the micro tile last addressed */
     uint32_t mtx, mty;
     uint64_t mbase;
@@ -686,6 +687,9 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
         t->sgn |= ((r[4] >> (2 * k)) & 3) == 1 ? 1u << k : 0;
         t->dst_sel[k] = (r[4] >> (16 + 3 * k)) & 7;
     }
+    t->base_lv = r[4] >> 28;
+    t->levels = (r[5] & 0xf) >= t->base_lv ? (r[5] & 0xf) - t->base_lv + 1 : 1;
+    t->depth = t->dim == 2 || t->dim >= 4 ? ((r[1] >> 14) & 0x1fff) + 1 : 1;
     t->s.base = (uint64_t)r[2] << 8;
     t->s.pitch = (((r[0] >> 6) & 0xfff) + 1) * 8;
     t->s.height = t->h;
@@ -1034,6 +1038,16 @@ static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
         return;
     }
     d->st->tex_fetch++;
+    if (op == 0x04) {
+        /* GET_TEXTURE_RESINFO: the size of level x, the number of levels */
+        unsigned lv = MIN(c[0].u + t->base_lv, 31u);
+
+        v[0].u = MAX(t->w >> lv, 1u);
+        v[1].u = t->dim == 0 ? 1 : MAX(t->h >> lv, 1u);
+        v[2].u = t->depth;
+        v[3].u = t->levels;
+        return;
+    }
     if (op == 0x03) {           /* LD: integer texel coordinates */
         int x = c[0].i + ox / 2, y = c[1].i + oy / 2;
 
@@ -2432,6 +2446,9 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
     gt->comps = t.comps;
     gt->is_float = t.is_float;
     gt->unorm8 = t.unorm8;
+    gt->base_lv = t.base_lv;
+    gt->levels = t.levels;
+    gt->depth = t.depth;
     memcpy(gt->samp, t.samp, sizeof(gt->samp));
     memcpy(gt->border, t.border, sizeof(gt->border));
     {
@@ -2607,6 +2624,13 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         return false;
     }
     ir = hd5770_prog_ir(d->ps);
+    for (i = 0; i < ir->nfetches && !g->gpu->ops->resinfo; i++) {
+        if (ir->fetches[i].kind == HD5770_IRF_TEX &&
+            (ir->fetches[i].w[0] & 0x1f) == 0x04) {
+            g->gst.fallback[GFB_PROG]++;
+            return false;
+        }
+    }
     if (d->prov_last) {
         for (i = 0; i < ir->ninsts; i++) {
             if (ir->insts[i].interp && ir->insts[i].flat) {

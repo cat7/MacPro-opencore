@@ -81,6 +81,14 @@ typedef struct HD5770GpuTex {
     float min_lod, max_lod, lod_bias;
     const HD5770GpuSurf *lv;
     uint32_t lw[HD5770_GPU_LEVELS], lh[HD5770_GPU_LEVELS];
+    /*
+     * Added 2026-11-14 (M4b): GET_TEXTURE_RESINFO (fetch opcode 4)
+     * returns, as integers, the width and height of level base_lv + x
+     * (x the integer in the source's first component, each at least 1;
+     * height 1 for a 1D texture), depth and levels. Only for backends
+     * that set HD5770GpuOps.resinfo.
+     */
+    uint32_t base_lv, levels, depth;
 } HD5770GpuTex;
 
 /* a vertex buffer resource the pixel shader fetches from */
@@ -172,6 +180,8 @@ typedef struct HD5770GpuOps {
     bool depth;
     /* added 2026-11-14: takes requests with mipmapped textures */
     bool mipmaps;
+    /* added 2026-11-14 (M4b): takes programs with GET_TEXTURE_RESINFO */
+    bool resinfo;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
