@@ -59,6 +59,13 @@ typedef struct HD5770ShEnv {
     /* PS lanes: parameter p of lanes 0..l->n-1 */
     void (*interp_n)(void *opaque, const struct HD5770Lanes *l, unsigned p,
                      unsigned chan, bool flat, HD5770Val *out);
+    /*
+     * PS, mipmapped textures: TEX with the derivatives of the
+     * coordinates, d[0..3] across x and d[4..7] across y; NULL: tfetch()
+     * for every TEX
+     */
+    void (*tfetch_d)(void *opaque, const uint32_t *w, const HD5770Val c[4],
+                     const float d[8], HD5770Val v[4]);
     const HD5770Prog *fetch;    /* fetch shader a VS calls */
     const uint32_t *loop_const; /* SQ_LOOP_CONST of the stage, 32 */
     const uint32_t *bool_const; /* SQ_BOOL_CONST of the stage */

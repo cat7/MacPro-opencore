@@ -45,6 +45,7 @@
 #define HD5770_GPU_TEX          16
 #define HD5770_GPU_VB           8
 #define HD5770_GPU_INPUTS       32
+#define HD5770_GPU_LEVELS       15
 
 /*
  * A surface in VRAM, or (space 1) in guest RAM: pages[i] is the offset in
@@ -68,6 +69,18 @@ typedef struct HD5770GpuTex {
     uint32_t samp[3];
     float border[4];
     bool is_float, unorm8;
+    /*
+     * Added 2026-11-14: a mipmapped 2D texture (normalised coordinates):
+     * lv[l] is level l (lv[0] = surf), lw/lh its size; the level of
+     * detail comes from the coordinates' change to the pixel on the
+     * right and below, as tfetch_stage() in ati_hd5770_draw.c computes
+     * it. Only for backends that set HD5770GpuOps.mipmaps.
+     */
+    bool mip;
+    uint32_t last_lv, mip_filter;
+    float min_lod, max_lod, lod_bias;
+    const HD5770GpuSurf *lv;
+    uint32_t lw[HD5770_GPU_LEVELS], lh[HD5770_GPU_LEVELS];
 } HD5770GpuTex;
 
 /* a vertex buffer resource the pixel shader fetches from */
@@ -157,6 +170,8 @@ typedef struct HD5770GpuOps {
     unsigned min_pixels;
     /* added 2026-11-14: takes requests with db set */
     bool depth;
+    /* added 2026-11-14: takes requests with mipmapped textures */
+    bool mipmaps;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -179,6 +194,8 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
  * described there.
  */
 char *hd5770_msl_program(const HD5770IR *ir);
+/* the same for draws whose texture units in mipmask are mipmapped */
+char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask);
 extern const char hd5770_msl_lib[];
 
 /* the OpenGL backend (Windows); NULL and *err set if there is none */

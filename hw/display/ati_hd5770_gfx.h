@@ -164,7 +164,7 @@ typedef struct HD5770GfxStats {
     uint64_t gap_vtx_fmt[64], gap_mode[16], gap_prim[64], gap_misc[32];
     uint64_t gap_export[8], gap_src_sel;
     uint64_t blend_on, tex_fetch, vtx_fetch, kills;
-    uint64_t culled, db_tests, db_fails, resolves;
+    uint64_t culled, db_tests, db_fails, resolves, lod_fetches;
     uint64_t rt_fmt[64];
     uint64_t ns;                /* host time in draws */
     HD5770ShaderInfo sh[HD5770_SHADER_SLOTS];

@@ -139,6 +139,8 @@ struct HD5770ShaderCache {
     ShEntry *b[SH_BUCKETS];
 };
 
+#define HD5770_TEX_LEVELS 15
+
 typedef struct Tex {
     HD5770Surf s;
     unsigned fmt, num, w, h, dim;
@@ -152,6 +154,12 @@ typedef struct Tex {
     /* the micro tile last addressed */
     uint32_t mtx, mty;
     uint64_t mbase;
+    /* mipmaps: levels 1..last_lv from MIP_ADDRESS, sampled by LOD */
+    bool mip;
+    unsigned last_lv, mip_filter;
+    float min_lod, max_lod, lod_bias;
+    HD5770Surf lv[HD5770_TEX_LEVELS];
+    uint32_t lw[HD5770_TEX_LEVELS], lh[HD5770_TEX_LEVELS];
 } Tex;
 
 #define TEX_CACHE 8
@@ -202,6 +210,7 @@ typedef struct Draw {
     /* culling and facing */
     unsigned cull;              /* bit 0 front, bit 1 back */
     bool face_cw, prov_last, front;
+    bool mips;                  /* a PS texture is mipmapped */
     /* resolve: colour buffer 0 is copied to colour buffer 1 */
     bool resolve;
     HD5770Surf rs;
@@ -655,6 +664,8 @@ static void vfetch_ps(void *opaque, const uint32_t *w, uint32_t index,
 /* ---------------------------------------------------------------- */
 /* Textures                                                       */
 
+static void tex_levels(Tex *t, uint64_t mip_addr);
+
 static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
 {
     HD5770Gfx *g = d->g;
@@ -722,8 +733,19 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
         return false;
     }
     if (t->dim == 1 && (r[5] & 0xf) > (r[4] >> 28) && ((sm[0] >> 15) & 3)) {
-        /* mipmapped: level BASE_LEVEL is sampled */
-        d->st->gap_misc[HD5770_GAP_MIP]++;
+        if (r[4] >> 28) {
+            /* a base level other than 0: level 0 is sampled */
+            d->st->gap_misc[HD5770_GAP_MIP]++;
+        } else {
+            uint32_t b = sm[2] & 0x3fff;
+
+            t->mip = true;
+            t->last_lv = MIN(r[5] & 0xf, HD5770_TEX_LEVELS - 1);
+            t->mip_filter = (sm[0] >> 15) & 3;
+            t->min_lod = (sm[1] & 0xfff) / 256.0f;
+            t->max_lod = ((sm[1] >> 12) & 0xfff) / 256.0f;
+            t->lod_bias = (int32_t)(b << 18) / (float)(1 << 26);
+        }
     }
     if (t->dim == 0) {
         t->h = 1;
@@ -733,6 +755,9 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
     t->unorm8 = t->fmt == HD5770_FMT_8_8_8_8 && t->num == HD5770_NUM_NORM &&
                 !t->sgn;
     t->mtx = t->mty = UINT32_MAX;
+    if (t->mip) {
+        tex_levels(t, (uint64_t)r[3] << 8);
+    }
     return true;
 }
 
@@ -752,11 +777,14 @@ static inline uint64_t surf_off(const HD5770Surf *s, uint32_t *mtx,
     return *mbase + s->eoff[(y & 7) * 8 + (x & 7)];
 }
 
-/* texel (x, y) as raw components, x and y inside the texture */
-static void texel(Draw *d, Tex *t, int x, int y, HD5770Val out[4])
+/* texel (x, y) of level lv as raw components, x and y inside it */
+static void texel(Draw *d, Tex *t, unsigned lv, int x, int y,
+                  HD5770Val out[4])
 {
-    uint64_t off = surf_off(&t->s, &t->mtx, &t->mty, &t->mbase, x, y);
-    uint8_t *p = hd5770_span_ptr(&d->g->mem, &d->span_tex, t->s.base + off,
+    const HD5770Surf *ls = lv ? &t->lv[lv] : &t->s;
+    uint64_t off = lv ? hd5770_surf_offset_fast(ls, x, y)
+                      : surf_off(&t->s, &t->mtx, &t->mty, &t->mbase, x, y);
+    uint8_t *p = hd5770_span_ptr(&d->g->mem, &d->span_tex, ls->base + off,
                                  t->s.bpe, false);
     uint32_t c[4];
     unsigned bits[4], k, n;
@@ -833,11 +861,11 @@ static bool wrap(int *c, int size, unsigned mode)
     return true;
 }
 
-static void sample_point(Draw *d, Tex *t, int x, int y,
+static void sample_point(Draw *d, Tex *t, unsigned lv, int x, int y,
                          HD5770Val out[4])
 {
-    if (!wrap(&x, t->w, t->samp[0] & 7) ||
-        !wrap(&y, t->h, (t->samp[0] >> 3) & 7)) {
+    if (!wrap(&x, lv ? t->lw[lv] : t->w, t->samp[0] & 7) ||
+        !wrap(&y, lv ? t->lh[lv] : t->h, (t->samp[0] >> 3) & 7)) {
         unsigned k;
 
         for (k = 0; k < 4; k++) {
@@ -845,7 +873,72 @@ static void sample_point(Draw *d, Tex *t, int x, int y,
         }
         return;
     }
-    texel(d, t, x, y, out);
+    texel(d, t, lv, x, y, out);
+}
+
+/*
+ * The mip chain of a 2D texture: level l (1..last_lv) follows level
+ * l - 1 from MIP_ADDRESS on, each as large as its own size padded to its
+ * tiling; a 2D-tiled level smaller than a macro tile and all after it
+ * are 1D tiled.
+ */
+static void tex_levels(Tex *t, uint64_t mip_addr)
+{
+    const HD5770Surf *s0 = &t->s;
+    uint32_t mtw = 8 * s0->bankw * s0->pipes * s0->mtilea;
+    uint32_t mth = 8 * s0->bankh * s0->banks / s0->mtilea;
+    uint32_t bpe = s0->bpe, grp = s0->pipe_interleave;
+    uint64_t off = mip_addr;
+    unsigned mode = s0->mode, l;
+
+    for (l = 1; l <= t->last_lv; l++) {
+        HD5770Surf *ls = &t->lv[l];
+        uint32_t w = MAX(t->w >> l, 1u), h = MAX(t->h >> l, 1u), pw, ph;
+
+        if (mode == HD5770_ARRAY_2D_TILED_THIN1 && (w < mtw || h < mth)) {
+            mode = HD5770_ARRAY_1D_TILED_THIN1;
+        }
+        switch (mode) {
+        case HD5770_ARRAY_2D_TILED_THIN1:
+            pw = ROUND_UP(w, mtw);
+            ph = ROUND_UP(h, mth);
+            break;
+        case HD5770_ARRAY_1D_TILED_THIN1:
+            pw = ROUND_UP(w, MAX(8u, grp / (8 * bpe)));
+            ph = ROUND_UP(h, 8);
+            break;
+        case HD5770_ARRAY_LINEAR_ALIGNED:
+            pw = ROUND_UP(w, MAX(64u, grp / bpe));
+            ph = h;
+            break;
+        default:
+            pw = w;
+            ph = h;
+            break;
+        }
+        *ls = *s0;
+        ls->base = off;
+        ls->mode = mode;
+        ls->pitch = pw;
+        ls->height = ph;
+        hd5770_surf_prep(ls);
+        t->lw[l] = w;
+        t->lh[l] = h;
+        off += (uint64_t)pw * ph * bpe;
+    }
+}
+
+/* log2 by the exponent and a linear mantissa: the same on every host */
+static float lod_log2(float x)
+{
+    HD5770Val v;
+
+    if (!(x > 0.0f)) {
+        return -128.0f;
+    }
+    v.f = x;
+    return (float)((int)((v.u >> 23) & 0xff) - 127) +
+           (float)(v.u & 0x7fffff) * (1.0f / 8388608.0f);
 }
 
 /* the texture of resource id and sampler sid, set up once per draw */
@@ -864,18 +957,72 @@ static Tex *tex_get(Draw *d, unsigned id, unsigned sid)
         return NULL;
     }
     pend_check(d->g, d->tex[i].s.base, hd5770_surf_size(&d->tex[i].s));
+    if (d->tex[i].mip) {
+        unsigned l;
+
+        for (l = 1; l <= d->tex[i].last_lv; l++) {
+            pend_check(d->g, d->tex[i].lv[l].base,
+                       hd5770_surf_size(&d->tex[i].lv[l]));
+        }
+    }
     d->tex_key[i] = key;
     d->n_tex = MAX(d->n_tex, i + 1);
     return &d->tex[i];
 }
 
+/* a normalised coordinate in texels of a level, with the half-texel offset */
+static float lv_coord(float c, uint32_t size, int o)
+{
+    float r = c * size;
+
+    r += o * 0.5f;
+    return r;
+}
+
+/* point or bilinear sample of level lv at (u, vv), in its texels */
+static void sample_lv(Draw *d, Tex *t, unsigned lv, float u, float vv,
+                      bool lin, HD5770Val v[4])
+{
+    unsigned k;
+
+    if (!lin) {
+        sample_point(d, t, lv, (int)floorf(u), (int)floorf(vv), v);
+        return;
+    }
+    {
+        /* bilinear */
+        float fx = u - 0.5f, fy = vv - 0.5f;
+        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+        float ax = fx - x0, ay = fy - y0;
+        HD5770Val t00[4], t10[4], t01[4], t11[4];
+
+        sample_point(d, t, lv, x0, y0, t00);
+        sample_point(d, t, lv, x0 + 1, y0, t10);
+        sample_point(d, t, lv, x0, y0 + 1, t01);
+        sample_point(d, t, lv, x0 + 1, y0 + 1, t11);
+        for (k = 0; k < 4; k++) {
+            float top = t00[k].f + (t10[k].f - t00[k].f) * ax;
+            float bot = t01[k].f + (t11[k].f - t01[k].f) * ax;
+
+            v[k].f = top + (bot - top) * ay;
+        }
+    }
+}
+
+/*
+ * TEX. dv: the derivatives of the coordinates across x (0..3) and y
+ * (4..7), NULL if not known; they choose the level of a mipmapped
+ * texture.
+ */
 static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
-                         HD5770Val v[4], unsigned base_r, unsigned base_s)
+                         HD5770Val v[4], unsigned base_r, unsigned base_s,
+                         const float *dv)
 {
     unsigned op = w[0] & 0x1f, id, sid, k;
     float u, vv;
     Tex *t;
     int ox = ((int32_t)(w[2] << 27)) >> 27, oy = ((int32_t)(w[2] << 22)) >> 27;
+    bool nx = (w[1] >> 28) & 1, ny = (w[1] >> 29) & 1;
 
     id = ((w[0] >> 8) & 0xff) + base_r;
     sid = ((w[2] >> 15) & 0x1f) + base_s;
@@ -891,16 +1038,66 @@ static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
         int x = c[0].i + ox / 2, y = c[1].i + oy / 2;
 
         if (x >= 0 && y >= 0 && x < (int)t->w && y < (int)t->h) {
-            texel(d, t, x, y, v);
+            texel(d, t, 0, x, y, v);
+        }
+        return;
+    }
+    if (t->mip && nx && ny) {
+        /* the level of detail, relative to level 0 */
+        float lod = 0.0f, a, b, l0, f;
+        unsigned lv;
+        bool lin;
+        HD5770Val v1[4];
+
+        if (op == 0x11) {               /* SAMPLE_L */
+            lod = c[3].f;
+        } else if (op != 0x13) {        /* not SAMPLE_LZ */
+            float ax = dv ? dv[0] * t->w : 0.0f, ay = dv ? dv[1] * t->h : 0.0f;
+            float bx = dv ? dv[4] * t->w : 0.0f, by = dv ? dv[5] * t->h : 0.0f;
+
+            a = ax * ax + ay * ay;
+            b = bx * bx + by * by;
+            lod = 0.5f * lod_log2(fmaxf(a, b));
+            if (op == 0x12) {           /* SAMPLE_LB */
+                lod += c[3].f;
+            }
+        }
+        lod = fminf(fmaxf(lod + t->lod_bias, t->min_lod), t->max_lod);
+        d->st->lod_fetches++;
+        if (!(lod > 0.0f)) {
+            /* magnification */
+            sample_lv(d, t, 0, lv_coord(c[0].f, t->w, ox),
+                      lv_coord(c[1].f, t->h, oy), (t->samp[0] >> 9) & 1, v);
+            return;
+        }
+        lin = (t->samp[0] >> 11) & 1;
+        if (t->mip_filter == 1) {
+            lv = MIN((unsigned)floorf(lod + 0.5f), t->last_lv);
+            sample_lv(d, t, lv, lv_coord(c[0].f, lv ? t->lw[lv] : t->w, ox),
+                      lv_coord(c[1].f, lv ? t->lh[lv] : t->h, oy), lin, v);
+            return;
+        }
+        l0 = floorf(lod);
+        f = lod - l0;
+        lv = MIN((unsigned)l0, t->last_lv);
+        sample_lv(d, t, lv, lv_coord(c[0].f, lv ? t->lw[lv] : t->w, ox),
+                  lv_coord(c[1].f, lv ? t->lh[lv] : t->h, oy), lin, v);
+        if (lv < t->last_lv) {
+            lv++;
+            sample_lv(d, t, lv, lv_coord(c[0].f, t->lw[lv], ox),
+                      lv_coord(c[1].f, t->lh[lv], oy), lin, v1);
+            for (k = 0; k < 4; k++) {
+                v[k].f = v[k].f + (v1[k].f - v[k].f) * f;
+            }
         }
         return;
     }
     u = c[0].f;
     vv = c[1].f;
-    if ((w[1] >> 28) & 1) {
+    if (nx) {
         u *= t->w;
     }
-    if ((w[1] >> 29) & 1) {
+    if (ny) {
         vv *= t->h;
     }
     u += ox * 0.5f;
@@ -908,40 +1105,26 @@ static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
     if (t->dim == 0) {
         vv = 0.5f;
     }
-    if (((t->samp[0] >> 9) & 1) == 0 && ((t->samp[0] >> 11) & 1) == 0) {
-        sample_point(d, t, (int)floorf(u), (int)floorf(vv), v);
-        return;
-    }
-    {
-        /* bilinear */
-        float fx = u - 0.5f, fy = vv - 0.5f;
-        int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
-        float ax = fx - x0, ay = fy - y0;
-        HD5770Val t00[4], t10[4], t01[4], t11[4];
-
-        sample_point(d, t, x0, y0, t00);
-        sample_point(d, t, x0 + 1, y0, t10);
-        sample_point(d, t, x0, y0 + 1, t01);
-        sample_point(d, t, x0 + 1, y0 + 1, t11);
-        for (k = 0; k < 4; k++) {
-            float top = t00[k].f + (t10[k].f - t00[k].f) * ax;
-            float bot = t01[k].f + (t11[k].f - t01[k].f) * ax;
-
-            v[k].f = top + (bot - top) * ay;
-        }
-    }
+    sample_lv(d, t, 0, u, vv, ((t->samp[0] >> 9) & 1) || ((t->samp[0] >> 11) & 1),
+              v);
 }
 
 static void tfetch_ps(void *opaque, const uint32_t *w, const HD5770Val c[4],
                       HD5770Thread *th, HD5770Val v[4])
 {
-    tfetch_stage(opaque, w, c, v, 0, 0);
+    tfetch_stage(opaque, w, c, v, 0, 0, NULL);
+}
+
+static void tfetch_ps_d(void *opaque, const uint32_t *w, const HD5770Val c[4],
+                        const float dv[8], HD5770Val v[4])
+{
+    tfetch_stage(opaque, w, c, v, 0, 0, dv);
 }
 
 static void tfetch_vs(void *opaque, const uint32_t *w, const HD5770Val c[4],
                       HD5770Thread *th, HD5770Val v[4])
 {
-    tfetch_stage(opaque, w, c, v, RES_VS, SAMPLER_VS);
+    tfetch_stage(opaque, w, c, v, RES_VS, SAMPLER_VS, NULL);
 }
 
 /* ---------------------------------------------------------------- */
@@ -2260,6 +2443,27 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
     for (k = 0; k < 4; k++) {
         gt->dst_sel[k] = t.dst_sel[k];
     }
+    if (t.mip) {
+        HD5770GpuSurf *lv = g_new0(HD5770GpuSurf, t.last_lv + 1);
+
+        gt->lv = lv;
+        lv[0] = gt->surf;
+        for (k = 1; k <= t.last_lv; k++) {
+            if (!gpu_surf(d->g, &t.lv[k], false, &lv[k]) || lv[k].space) {
+                return false;
+            }
+            gt->lw[k] = t.lw[k];
+            gt->lh[k] = t.lh[k];
+        }
+        gt->lw[0] = t.w;
+        gt->lh[0] = t.h;
+        gt->mip = true;
+        gt->last_lv = t.last_lv;
+        gt->mip_filter = t.mip_filter;
+        gt->min_lod = t.min_lod;
+        gt->max_lod = t.max_lod;
+        gt->lod_bias = t.lod_bias;
+    }
     return true;
 }
 
@@ -2318,6 +2522,7 @@ static void gpu_req_free(HD5770GpuDraw *q)
     }
     for (i = 0; i < HD5770_GPU_TEX; i++) {
         g_free((void *)q->tex[i].surf.pages);
+        g_free((void *)q->tex[i].lv);
     }
     g_free((void *)q->rt.pages);
     g_free((void *)q->zs.pages);
@@ -2384,6 +2589,10 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     }
     if (d->rt_bpe > 8) {
         g->gst.fallback[GFB_RT]++;
+        return false;
+    }
+    if (d->mips && !g->gpu->ops->mipmaps) {
+        g->gst.fallback[GFB_TEX]++;
         return false;
     }
     if (!d->lanes) {
@@ -2539,6 +2748,14 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
             pend_add(g, q->tex[i].surf.voff,
                      q->tex[i].surf.voff + hd5770_surf_size(&q->tex[i].surf.s));
         }
+        if (q->tex[i].mip) {
+            unsigned l;
+
+            for (l = 1; l <= q->tex[i].last_lv; l++) {
+                pend_add(g, q->tex[i].lv[l].voff, q->tex[i].lv[l].voff +
+                         hd5770_surf_size(&q->tex[i].lv[l].s));
+            }
+        }
     }
     if (g->gpu_mode == HD5770_GPU_VERIFY && nr) {
         uint8_t *gpu[3];
@@ -2585,6 +2802,25 @@ out:
     return ok;
 }
 
+/* the pixel shader samples a mipmapped texture: it needs derivatives */
+static void ps_mips(Draw *d)
+{
+    uint8_t ids[16];
+    unsigned nres, i;
+
+    hd5770_prog_resources(d->ps, ids, &nres, ARRAY_SIZE(ids));
+    for (i = 0; i < nres; i++) {
+        const uint32_t *r = &d->g->ctx[(SQ_RESOURCE_0 - 0x28000) / 4 + ids[i] * 8];
+
+        if (((r[7] >> 30) & 3) == 2 && (r[0] & 7) == 1 &&
+            (r[5] & 0xf) > (r[4] >> 28)) {
+            d->mips = true;
+            d->ps_env.tfetch_d = tfetch_ps_d;
+            return;
+        }
+    }
+}
+
 /*
  * The pixel shader runs on lanes unless it samples the render target:
  * then each pixel must see the ones drawn before it.
@@ -2613,6 +2849,7 @@ static void lanes_setup(Draw *d)
             return;
         }
     }
+    grad |= d->mips;
     d->kv = g_new(HD5770Val, MAX(nconst, 1));
     hd5770_prog_bind(d->ps, &d->ps_env, d->kv);
     d->lanes = g_new0(HD5770Lanes, grad ? 3 : 1);
@@ -2720,7 +2957,12 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         }
     }
     if (!d->color && !d->db) {
-        reason = HD5770_SKIP_NOCOLOR;
+        if (mode == CB_DISABLE && !(d->rctl & RC_COPY)) {
+            /* nothing to write, e.g. an HTILE decompress pass */
+            st->drawn++;
+        } else {
+            reason = HD5770_SKIP_NOCOLOR;
+        }
         goto out;
     }
     if (CTX(g, PA_SC_AA_CONFIG) & 7) {
@@ -2805,6 +3047,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     d->ps_env.bool_const = &g->ctx[(SQ_BOOL_CONST_0 - 0x28000) / 4];
     ps_inputs(d);
     d->ps_env.interp_n = interp_n;
+    ps_mips(d);
     lanes_setup(d);
 
     nv = MIN(count, MAX_VERTS);
@@ -2985,11 +3228,11 @@ void hd5770_gfx_stats(HD5770Gfx *g, GString *out)
         "3D: blended %" PRIu64 " tex fetches %" PRIu64 " vtx fetches %" PRIu64
         " kills %" PRIu64 " ms in draws %" PRIu64 "\n"
         "3D: culled %" PRIu64 " depth/stencil tests %" PRIu64 " failed %"
-        PRIu64 " resolves %" PRIu64 "\n",
+        PRIu64 " resolves %" PRIu64 " mipmapped fetches %" PRIu64 "\n",
         st->draws, st->drawn, st->skipped, st->prims, st->verts, st->pixels,
         st->blend_on, st->tex_fetch, st->vtx_fetch, st->kills,
         st->ns / 1000000, st->culled, st->db_tests, st->db_fails,
-        st->resolves);
+        st->resolves, st->lod_fetches);
     g_string_append(out, "colour formats drawn:");
     for (i = 0; i < 64; i++) {
         if (st->rt_fmt[i]) {

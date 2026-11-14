@@ -1226,7 +1226,27 @@ static void run_fetch(Run *r, const CfInst *cf)
                 src[k] = sel < 4 ? r->t->r[sg][sel]
                                  : fval(sel == 5 ? 1.0f : 0.0f);
             }
-            r->env->tfetch(r->env->opaque, w, src, r->t, out);
+            if (r->env->tfetch_d && op != 0x03) {
+                /* derivatives from the neighbours to the right and below */
+                HD5770Val nx[4], ny[4];
+                float dv[8] = { 0 };
+
+                if (!r->stop && r->env->neighbour &&
+                    r->env->neighbour(r->env->opaque, 1, 0, r->pc, i, sg, nx) &&
+                    r->env->neighbour(r->env->opaque, 0, 1, r->pc, i, sg, ny)) {
+                    for (k = 0; k < 4; k++) {
+                        unsigned sel = (w[2] >> (20 + 3 * k)) & 7;
+
+                        if (sel < 4) {
+                            dv[k] = nx[sel].f - src[k].f;
+                            dv[4 + k] = ny[sel].f - src[k].f;
+                        }
+                    }
+                }
+                r->env->tfetch_d(r->env->opaque, w, src, dv, out);
+            } else {
+                r->env->tfetch(r->env->opaque, w, src, r->t, out);
+            }
             for (k = 0; k < 4; k++) {
                 unsigned sel = (w[1] >> (9 + 3 * k)) & 7;
 
@@ -2129,6 +2149,7 @@ static void lane_fetch(const HD5770Prog *p, const HD5770IROp *o,
 {
     const HD5770IR *ir = &p->lane->ir;
     unsigned i, k, x, q;
+    float dv[HD5770_LANES][8];
 
     for (i = 0; i < o->n; i++) {
         const HD5770IRFetch *f = &ir->fetches[o->first + i];
@@ -2163,6 +2184,24 @@ static void lane_fetch(const HD5770Prog *p, const HD5770IROp *o,
                 }
                 continue;
             }
+            if (!q && env->tfetch_d && nl == 3 && (w[0] & 0x1f) != 0x03) {
+                /*
+                 * derivatives across the quad, the same for the pixel and
+                 * its neighbours; read before any set's result lands
+                 */
+                for (x = 0; x < l[0]->n; x++) {
+                    for (k = 0; k < 4; k++) {
+                        unsigned sel = (w[2] >> (20 + 3 * k)) & 7;
+
+                        dv[x][k] = dv[x][4 + k] = 0.0f;
+                        if (sel < 4) {
+                            dv[x][k] = l[1]->r[f->src][sel][x].f - sg[sel][x].f;
+                            dv[x][4 + k] = l[2]->r[f->src][sel][x].f -
+                                           sg[sel][x].f;
+                        }
+                    }
+                }
+            }
             for (x = 0; x < l[q]->n; x++) {
                 for (k = 0; k < 4; k++) {
                     unsigned sel = (w[2] >> (20 + 3 * k)) & 7;
@@ -2170,7 +2209,11 @@ static void lane_fetch(const HD5770Prog *p, const HD5770IROp *o,
                     src[k] = sel < 4 ? sg[sel][x]
                                      : fval(sel == 5 ? 1.0f : 0.0f);
                 }
-                env->tfetch(env->opaque, w, src, NULL, out);
+                if (env->tfetch_d && nl == 3 && (w[0] & 0x1f) != 0x03) {
+                    env->tfetch_d(env->opaque, w, src, dv[x], out);
+                } else {
+                    env->tfetch(env->opaque, w, src, NULL, out);
+                }
                 lane_dst(dst, w, x, out);
             }
         }
@@ -2228,7 +2271,7 @@ void hd5770_prog_run_lanes(const HD5770Prog *p, const HD5770ShEnv *env,
 {
     const HD5770IR *ir = &p->lane->ir;
     HD5770Lanes *set[3] = { l, nh, nv };
-    unsigned i, g, q, nl = ir->grad ? 3 : 1;
+    unsigned i, g, q, nl = ir->grad || nh ? 3 : 1;
 
     l->color0 = false;
     for (q = 0; q < nl; q++) {

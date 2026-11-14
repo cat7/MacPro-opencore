@@ -45,6 +45,9 @@ typedef struct GTex {
     uint32_t dst_sel[4];
     uint32_t bits[4];
     float border[4];
+    uint32_t mip, last_lv, mip_filter, lev_off;
+    float min_lod, max_lod, lod_bias;
+    uint32_t lw[16], lh[16];
 } GTex;
 
 typedef struct GVb {
@@ -84,7 +87,7 @@ typedef struct GTri {
 #define MTL_TRI_SLOT    128     /* staging bytes per GTri */
 
 QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 109);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 148);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 416);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
@@ -157,18 +160,19 @@ static void mtl_exact_math(MTLCompileOptions *o)
  * The program of an IR, compiled in the background on first use: until
  * it is ready the device draws on the CPU.
  */
-static MtlProg *mtl_prog(HD5770Mtl *m, const HD5770IR *ir)
+static MtlProg *mtl_prog(HD5770Mtl *m, const HD5770IR *ir, uint32_t mipmask)
 {
-    MtlProg *p = g_hash_table_lookup(m->progs, &ir->hash);
-    uint64_t hash = ir->hash;
+    /* a program with mipmapped units is its own variant */
+    uint64_t hash = ir->hash ^ (mipmask * 0x9e3779b97f4a7c15ull);
+    MtlProg *p = g_hash_table_lookup(m->progs, &hash);
     char *src;
 
     if (p) {
         return p;
     }
     p = g_new0(MtlProg, 1);
-    g_hash_table_insert(m->progs, g_memdup2(&ir->hash, sizeof(ir->hash)), p);
-    src = hd5770_msl_program(ir);
+    g_hash_table_insert(m->progs, g_memdup2(&hash, sizeof(hash)), p);
+    src = hd5770_msl_program_mip(ir, mipmask);
     if (!src) {
         p->state = MTL_P_FAILED;
         return p;
@@ -382,6 +386,29 @@ static uint64_t mtl_hi(const HD5770GpuSurf *s)
     return s->space ? MTL_RAM_RANGE + 1 : s->voff + hd5770_surf_size(&s->s);
 }
 
+/* the VRAM bytes a texture reads: level 0, and the mip chain after it */
+static uint64_t mtl_tex_lo(const HD5770GpuTex *t)
+{
+    uint64_t lo = mtl_lo(&t->surf);
+    unsigned l;
+
+    for (l = 1; t->mip && l <= t->last_lv; l++) {
+        lo = MIN(lo, mtl_lo(&t->lv[l]));
+    }
+    return lo;
+}
+
+static uint64_t mtl_tex_hi(const HD5770GpuTex *t)
+{
+    uint64_t hi = mtl_hi(&t->surf);
+    unsigned l;
+
+    for (l = 1; t->mip && l <= t->last_lv; l++) {
+        hi = MAX(hi, mtl_hi(&t->lv[l]));
+    }
+    return hi;
+}
+
 /* the surfaces a request writes: target, depth plane, stencil plane */
 static unsigned mtl_writes(const HD5770GpuDraw *d, const HD5770GpuSurf **ws)
 {
@@ -452,9 +479,8 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
             }
         }
         for (k = 0; first && !bar && k < d->ntex; k++) {
-            const HD5770GpuSurf *ts = &d->tex[k].surf;
-
-            bar = mtl_overlap(a->lo, a->hi, mtl_lo(ts), mtl_hi(ts));
+            bar = mtl_overlap(a->lo, a->hi, mtl_tex_lo(&d->tex[k]),
+                              mtl_tex_hi(&d->tex[k]));
         }
     }
     for (i = 0; !bar && i < m->nrd; i++) {
@@ -470,10 +496,8 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
     }
     if (first || bar) {
         for (k = 0; k < d->ntex; k++) {
-            const HD5770GpuSurf *ts = &d->tex[k].surf;
-
-            m->rd[m->nrd].lo = mtl_lo(ts);
-            m->rd[m->nrd].hi = mtl_hi(ts);
+            m->rd[m->nrd].lo = mtl_tex_lo(&d->tex[k]);
+            m->rd[m->nrd].hi = mtl_tex_hi(&d->tex[k]);
             m->nrd++;
         }
     }
@@ -491,7 +515,7 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
 static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
 {
     HD5770Mtl *m = opaque;
-    MtlProg *p = mtl_prog(m, d->ir);
+    MtlProg *p;
     size_t need, o_draw, o_tex, o_tri, o_prm, o_kv, o_cf, o_vb[HD5770_GPU_VB];
     size_t prm_tri = (size_t)d->ninputs * 12 * sizeof(float);
     uint8_t *st = m->st.contents;
@@ -500,7 +524,12 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     int miny = INT_MAX, maxy = -1;
     unsigned i, k;
     bool first = true;
+    uint32_t mipmask = 0;
 
+    for (i = 0; i < d->ntex; i++) {
+        mipmask |= (uint32_t)d->tex[i].mip << i;
+    }
+    p = mtl_prog(m, d->ir, mipmask);
     switch (qatomic_load_acquire(&p->state)) {
     case MTL_P_BUILDING:
         m->declined[MTL_BUILDING]++;
@@ -549,6 +578,9 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             return false;
         }
         need += (d->tex[i].surf.npages + 1) * 4 + MTL_ALIGN;
+        if (d->tex[i].mip) {
+            need += (d->tex[i].last_lv + 1) * sizeof(GSurf) + MTL_ALIGN;
+        }
     }
     if (need > MTL_STAGING) {
         m->declined[MTL_NO_ROOM]++;
@@ -643,6 +675,25 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             g->dst_sel[k] = t->dst_sel[k];
             g->bits[k] = t->bits[k];
             g->border[k] = t->border[k];
+        }
+        g->lw[0] = t->w;
+        g->lh[0] = t->h;
+        if (t->mip) {
+            size_t lo = mtl_take(m, (t->last_lv + 1) * sizeof(GSurf));
+            GSurf *ls = (GSurf *)(st + lo);
+
+            for (k = 1; k <= t->last_lv; k++) {
+                mtl_surf(m, &ls[k], &t->lv[k]);
+                g->lw[k] = t->lw[k];
+                g->lh[k] = t->lh[k];
+            }
+            g->mip = 1;
+            g->last_lv = t->last_lv;
+            g->mip_filter = t->mip_filter;
+            g->lev_off = lo;
+            g->min_lod = t->min_lod;
+            g->max_lod = t->max_lod;
+            g->lod_bias = t->lod_bias;
         }
     }
 
@@ -828,6 +879,7 @@ static const HD5770GpuOps mtl_ops = {
     /* the CPU finishes these sooner than a round trip */
     .min_pixels = 1024,
     .depth = true,
+    .mipmaps = true,
     .draw = mtl_draw,
     .sync = mtl_sync,
     .stats = mtl_stats,

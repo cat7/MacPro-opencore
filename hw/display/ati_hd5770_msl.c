@@ -48,6 +48,9 @@ const char hd5770_msl_lib[] =
 "    uint dst_sel[4];\n"
 "    uint bits[4];\n"
 "    float border[4];\n"
+"    uint mip, last_lv, mip_filter, lev_off;\n"
+"    float min_lod, max_lod, lod_bias;\n"
+"    uint lw[16], lh[16];\n"
 "};\n"
 "struct GVb {\n"
 "    uint id, off, len, pad;\n"
@@ -547,11 +550,11 @@ const char hd5770_msl_lib[] =
 "    return true;\n"
 "}\n"
 "\n"
-"static __attribute__((always_inline)) void hd_texel(device uchar *vram, device uchar *ram, device const uchar *st,\n"
-"                     device const GTex &t, int x, int y,\n"
+"static __attribute__((always_inline)) void hd_texel_s(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                     device const GTex &t, device const GSurf &ls, int x, int y,\n"
 "                     thread uint *out)\n"
 "{\n"
-"    device uchar *p = hd_at(t.s, hd_addr(t.s, x, y), vram, ram, st);\n"
+"    device uchar *p = hd_at(ls, hd_addr(ls, x, y), vram, ram, st);\n"
 "    uint4 v;\n"
 "    uint c[4];\n"
 "\n"
@@ -577,17 +580,31 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
-"static __attribute__((always_inline)) void hd_point(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"static __attribute__((always_inline)) void hd_texel(device uchar *vram, device uchar *ram, device const uchar *st,\n"
 "                     device const GTex &t, int x, int y,\n"
 "                     thread uint *out)\n"
 "{\n"
-"    if (!hd_wrap(x, t.w, t.samp0 & 7) || !hd_wrap(y, t.h, (t.samp0 >> 3) & 7)) {\n"
+"    hd_texel_s(vram, ram, st, t, t.s, x, y, out);\n"
+"}\n"
+"\n"
+"static __attribute__((always_inline)) void hd_point_s(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                     device const GTex &t, device const GSurf &ls, uint lw, uint lh,\n"
+"                     int x, int y, thread uint *out)\n"
+"{\n"
+"    if (!hd_wrap(x, lw, t.samp0 & 7) || !hd_wrap(y, lh, (t.samp0 >> 3) & 7)) {\n"
 "        for (uint k = 0; k < 4; k++) {\n"
 "            out[k] = U(t.border[k]);\n"
 "        }\n"
 "        return;\n"
 "    }\n"
-"    hd_texel(vram, ram, st, t, x, y, out);\n"
+"    hd_texel_s(vram, ram, st, t, ls, x, y, out);\n"
+"}\n"
+"\n"
+"static __attribute__((always_inline)) void hd_point(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                     device const GTex &t, int x, int y,\n"
+"                     thread uint *out)\n"
+"{\n"
+"    hd_point_s(vram, ram, st, t, t.s, t.w, t.h, x, y, out);\n"
 "}\n"
 "\n"
 "static __attribute__((always_inline)) int hd_floori(float f)\n"
@@ -645,6 +662,100 @@ const char hd5770_msl_lib[] =
 "            float bot = fma(F(t11[k]) - F(t01[k]), ax, F(t01[k]));\n"
 "\n"
 "            v[k] = U(fma(bot - top, ay, top));\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
+"/* sample_lv(): point or bilinear sample of a level at (u, vv) in its texels */\n"
+"static __attribute__((always_inline)) void hd_sample_lv(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                      device const GTex &t, uint l, float u, float vv, bool lin,\n"
+"                      thread uint *v)\n"
+"{\n"
+"    device const GSurf &ls = l ? ((device const GSurf *)(st + t.lev_off))[l] : t.s;\n"
+"    uint lw = t.lw[l], lh = t.lh[l];\n"
+"\n"
+"    if (!lin) {\n"
+"        hd_point_s(vram, ram, st, t, ls, lw, lh, hd_floori(u), hd_floori(vv), v);\n"
+"        return;\n"
+"    }\n"
+"    float fx = u - 0.5f, fy = vv - 0.5f;\n"
+"    int x0 = hd_floori(fx), y0 = hd_floori(fy);\n"
+"    float ax = fx - x0, ay = fy - y0;\n"
+"    uint t00[4], t10[4], t01[4], t11[4];\n"
+"\n"
+"    hd_point_s(vram, ram, st, t, ls, lw, lh, x0, y0, t00);\n"
+"    hd_point_s(vram, ram, st, t, ls, lw, lh, x0 + 1, y0, t10);\n"
+"    hd_point_s(vram, ram, st, t, ls, lw, lh, x0, y0 + 1, t01);\n"
+"    hd_point_s(vram, ram, st, t, ls, lw, lh, x0 + 1, y0 + 1, t11);\n"
+"    for (uint k = 0; k < 4; k++) {\n"
+"        float top = fma(F(t10[k]) - F(t00[k]), ax, F(t00[k]));\n"
+"        float bot = fma(F(t11[k]) - F(t01[k]), ax, F(t01[k]));\n"
+"\n"
+"        v[k] = U(fma(bot - top, ay, top));\n"
+"    }\n"
+"}\n"
+"\n"
+"/* lod_log2() */\n"
+"static __attribute__((always_inline)) float hd_lodlog2(float x)\n"
+"{\n"
+"    if (!(x > 0.0f)) {\n"
+"        return -128.0f;\n"
+"    }\n"
+"    uint b = as_type<uint>(x);\n"
+"    return fma((float)(b & 0x7fffff), 1.0f / 8388608.0f, (float)((int)((b >> 23) & 0xff) - 127));\n"
+"}\n"
+"\n"
+"/* tfetch_stage() with derivatives, for a mipmapped texture */\n"
+"static __attribute__((always_inline)) void hd_tfetch_d(device uchar *vram, device uchar *ram, device const uchar *st,\n"
+"                      device const GTex &t, uint w0,\n"
+"                      uint w1, uint w2, thread const uint *c, thread const float *dv,\n"
+"                      thread uint *v)\n"
+"{\n"
+"    uint op = w0 & 0x1f, lv;\n"
+"    int ox = ((int)(w2 << 27)) >> 27, oy = ((int)(w2 << 22)) >> 27;\n"
+"    float lod = 0.0f, l0, f;\n"
+"    bool lin;\n"
+"    uint v1[4];\n"
+"\n"
+"    if (op == 0x03 || !t.mip || !((w1 >> 28) & 1) || !((w1 >> 29) & 1)) {\n"
+"        hd_tfetch(vram, ram, st, t, w0, w1, w2, c, v);\n"
+"        return;\n"
+"    }\n"
+"    if (op == 0x11) {\n"
+"        lod = F(c[3]);\n"
+"    } else if (op != 0x13) {\n"
+"        float ax = dv[0] * t.w, ay = dv[1] * t.h, bx = dv[4] * t.w, by = dv[5] * t.h;\n"
+"        float a = fma(ax, ax, ay * ay), b = fma(bx, bx, by * by);\n"
+"\n"
+"        lod = 0.5f * hd_lodlog2(max(a, b));\n"
+"        if (op == 0x12) {\n"
+"            lod += F(c[3]);\n"
+"        }\n"
+"    }\n"
+"    lod = min(max(lod + t.lod_bias, t.min_lod), t.max_lod);\n"
+"    if (!(lod > 0.0f)) {\n"
+"        hd_sample_lv(vram, ram, st, t, 0, fma((float)ox, 0.5f, F(c[0]) * t.w),\n"
+"                     fma((float)oy, 0.5f, F(c[1]) * t.h), (t.samp0 >> 9) & 1, v);\n"
+"        return;\n"
+"    }\n"
+"    lin = (t.samp0 >> 11) & 1;\n"
+"    if (t.mip_filter == 1) {\n"
+"        lv = min((uint)floor(lod + 0.5f), t.last_lv);\n"
+"        hd_sample_lv(vram, ram, st, t, lv, fma((float)ox, 0.5f, F(c[0]) * t.lw[lv]),\n"
+"                     fma((float)oy, 0.5f, F(c[1]) * t.lh[lv]), lin, v);\n"
+"        return;\n"
+"    }\n"
+"    l0 = floor(lod);\n"
+"    f = lod - l0;\n"
+"    lv = min((uint)l0, t.last_lv);\n"
+"    hd_sample_lv(vram, ram, st, t, lv, fma((float)ox, 0.5f, F(c[0]) * t.lw[lv]),\n"
+"                 fma((float)oy, 0.5f, F(c[1]) * t.lh[lv]), lin, v);\n"
+"    if (lv < t.last_lv) {\n"
+"        lv++;\n"
+"        hd_sample_lv(vram, ram, st, t, lv, fma((float)ox, 0.5f, F(c[0]) * t.lw[lv]),\n"
+"                     fma((float)oy, 0.5f, F(c[1]) * t.lh[lv]), lin, v1);\n"
+"        for (uint k = 0; k < 4; k++) {\n"
+"            v[k] = U(fma(F(v1[k]) - F(v[k]), f, F(v[k])));\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -1189,10 +1300,35 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
 }
 
 static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
-                       unsigned q)
+                       unsigned q, uint32_t mipmask, unsigned fi)
 {
     unsigned k, unit = 0;
+    bool mip = false;
 
+    if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) != 0x03) {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        mip = (mipmask >> unit) & 1;
+    }
+    if (mip && !q) {
+        /*
+         * derivatives across the quad from the neighbour sets, read
+         * before any set's result lands; the same for all three
+         */
+        g_string_append_printf(o, "    float DV%u[8] = {", fi);
+        for (k = 0; k < 8; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * (k & 3))) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, " F(R%u[%u][%u]) - F(R0[%u][%u])",
+                                       k < 4 ? 1 : 2, f->src, sel, f->src, sel);
+            } else {
+                g_string_append(o, " 0.0f");
+            }
+            g_string_append(o, k < 7 ? "," : " };\n");
+        }
+    }
     g_string_append(o, "    {\n        uint o[4] = { 0, 0, 0, 0 };\n");
     if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
         /* the neighbour minus this pixel; in a neighbour, itself */
@@ -1228,8 +1364,14 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
             }
             g_string_append(o, k < 3 ? "," : " };\n");
         }
-        g_string_append_printf(o, "        hd_tfetch(vram, ram, st, tex[%u], 0x%08xu, 0x%08xu, "
-                               "0x%08xu, c, o);\n", unit, f->w[0], f->w[1], f->w[2]);
+        if (mip) {
+            g_string_append_printf(o, "        hd_tfetch_d(vram, ram, st, tex[%u], 0x%08xu, 0x%08xu, "
+                                   "0x%08xu, c, DV%u, o);\n", unit, f->w[0], f->w[1],
+                                   f->w[2], fi);
+        } else {
+            g_string_append_printf(o, "        hd_tfetch(vram, ram, st, tex[%u], 0x%08xu, 0x%08xu, "
+                                   "0x%08xu, c, o);\n", unit, f->w[0], f->w[1], f->w[2]);
+        }
     }
     for (k = 0; k < 4; k++) {
         unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
@@ -1247,10 +1389,16 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
 
 char *hd5770_msl_program(const HD5770IR *ir)
 {
+    return hd5770_msl_program_mip(ir, 0);
+}
+
+char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
+{
     GString *o = g_string_new(hd5770_msl_lib);
     GString *tab = g_string_new("constant float hd_u8[256] = {");
     const char *mark = strstr(o->str, "HD_U8_TABLE");
-    unsigned i, j, k, q, nq = ir->grad ? 3 : 1, ng = MAX(ir->ngpr, 1u);
+    unsigned i, j, k, q, nq = ir->grad || mipmask ? 3 : 1;
+    unsigned ng = MAX(ir->ngpr, 1u);
 
     for (i = 0; i < 256; i++) {
         float f = i / (float)((1u << 8) - 1);
@@ -1355,7 +1503,8 @@ char *hd5770_msl_program(const HD5770IR *ir)
         case HD5770_IRO_FETCH:
             for (j = 0; j < op->n; j++) {
                 for (q = 0; q < nq; q++) {
-                    emit_fetch(o, ir, &ir->fetches[op->first + j], q);
+                    emit_fetch(o, ir, &ir->fetches[op->first + j], q, mipmask,
+                               op->first + j);
                 }
             }
             break;
