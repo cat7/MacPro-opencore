@@ -15,6 +15,7 @@
 
 #include "qemu/osdep.h"
 
+#include "block/thread-pool.h"
 #include "io/channel-file.h"
 #include "monitor/qmp-helpers.h"
 #include "qapi/qapi-commands-ui.h"
@@ -319,6 +320,23 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
     return true;
 }
 
+typedef struct ScreendumpJob {
+    int fd;
+    bool png;
+    pixman_image_t *image;
+    Error *err;
+} ScreendumpJob;
+
+/* on a pool thread: encodes a private copy, so no lock is needed */
+static int screendump_save(void *opaque)
+{
+    ScreendumpJob *job = opaque;
+    bool ok = job->png ? png_save(job->fd, job->image, &job->err)
+                       : ppm_save(job->fd, job->image, &job->err);
+
+    return ok ? 0 : -1;
+}
+
 /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
 void coroutine_fn
 qmp_screendump(const char *filename, const char *device,
@@ -328,7 +346,8 @@ qmp_screendump(const char *filename, const char *device,
     g_autoptr(pixman_image_t) image = NULL;
     QemuConsole *con;
     DisplaySurface *surface;
-    int fd;
+    ScreendumpJob job = { 0 };
+    int fd, w, h;
 
     if (device) {
         con = qemu_console_lookup_by_device_name(device, has_head ? head : 0,
@@ -353,8 +372,9 @@ qmp_screendump(const char *filename, const char *device,
 
     /*
      * All pending coroutines are woken up, while the BQL is held.  No
-     * further graphic update are possible until it is released.  Take
-     * an image ref before that.
+     * further graphic update are possible until it is released.  Copy
+     * the image before that; the encoding runs on a pool thread, and
+     * the main loop goes on meanwhile.
      */
     surface = qemu_console_surface(con);
     if (!surface) {
@@ -362,7 +382,17 @@ qmp_screendump(const char *filename, const char *device,
         object_unref(con);
         return;
     }
-    image = pixman_image_ref(surface->image);
+    w = pixman_image_get_width(surface->image);
+    h = pixman_image_get_height(surface->image);
+    image = pixman_image_create_bits(pixman_image_get_format(surface->image),
+                                     w, h, NULL, 0);
+    if (!image) {
+        error_setg(errp, "out of memory for the screendump");
+        object_unref(con);
+        return;
+    }
+    pixman_image_composite(PIXMAN_OP_SRC, surface->image, NULL, image,
+                           0, 0, 0, 0, 0, 0, w, h);
     object_unref(con);
 
     fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);
@@ -370,21 +400,12 @@ qmp_screendump(const char *filename, const char *device,
         return;
     }
 
-    /*
-     * The image content could potentially be updated as the coroutine
-     * yields and releases the BQL. It could produce corrupted dump, but
-     * it should be otherwise safe.
-     */
-    if (has_format && format == IMAGE_FORMAT_PNG) {
-        /* PNG format specified for screendump */
-        if (!png_save(fd, image, errp)) {
-            qemu_unlink(filename);
-        }
-    } else {
-        /* PPM format specified/default for screendump */
-        if (!ppm_save(fd, image, errp)) {
-            qemu_unlink(filename);
-        }
+    job.fd = fd;
+    job.png = has_format && format == IMAGE_FORMAT_PNG;
+    job.image = image;
+    if (thread_pool_submit_co(screendump_save, &job) < 0) {
+        error_propagate(errp, job.err);
+        qemu_unlink(filename);
     }
 }
 #endif /* CONFIG_PIXMAN */
