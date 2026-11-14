@@ -68,6 +68,7 @@
 #define SPI_VS_OUT_CONFIG               0x286c4
 #define SPI_PS_IN_CONTROL_0             0x286cc
 #define SPI_PS_IN_CONTROL_1             0x286d0
+#define SPI_INTERP_CONTROL_0            0x286d4
 #define SPI_BARYC_CNTL                  0x286e0
 #define CB_BLEND0_CONTROL               0x28780
 #define DB_DEPTH_CONTROL                0x28800
@@ -2236,13 +2237,15 @@ static void ps_inputs(Draw *d)
     HD5770Gfx *g = d->g;
     unsigned nin = CTX(g, SPI_PS_IN_CONTROL_0) & 0x3f, p, k;
     unsigned nout = ((CTX(g, SPI_VS_OUT_CONFIG) >> 1) & 0x1f) + 1;
+    /* FLAT_SHADE of an input counts only with the global FLAT_SHADE_ENA */
+    bool flat_ena = CTX(g, SPI_INTERP_CONTROL_0) & 1;
 
     for (p = 0; p < HD5770_PARAMS; p++) {
         uint32_t c = CTX(g, SPI_PS_INPUT_CNTL_0 + 4 * p);
         unsigned sem = c & 0xff, def = (c >> 8) & 3;
 
         d->ps_src[p] = -1;
-        d->ps_flat[p] = (c >> 10) & 1;
+        d->ps_flat[p] = flat_ena && ((c >> 10) & 1);
         d->ps_default[p][0] = d->ps_default[p][1] = d->ps_default[p][2] =
             def >= 2 ? 1.0f : 0.0f;
         d->ps_default[p][3] = def & 1 ? 1.0f : 0.0f;
