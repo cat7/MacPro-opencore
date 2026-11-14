@@ -16,7 +16,9 @@
  * surfaces, 2 draws, 3 textures, 4 triangles, 5 words (inputs, constants,
  * the constant file, vertex buffer bytes), 6 tiles: eight words each,
  * the draw, the triangle, its inputs' word offset, its first texture,
- * the constants' word offset, then x, y, w.
+ * the constants' word offset, then x, y, w. A program that fetches
+ * gradients runs the pixels to the right and below alongside, in
+ * register sets of their own (r_1, r_2), as the CPU path's lanes do.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -1111,14 +1113,17 @@ const char hd5770_glsl_lib[] =
 "}\n"
 ;
 
-static void src_expr(GString *o, const HD5770IRSrc *s)
+/* names of register set q: the pixel's (0), right (1), below (2) */
+static const char *const set_sfx[3] = { "", "_1", "_2" };
+
+static void src_expr(GString *o, const HD5770IRSrc *s, unsigned q)
 {
     switch (s->kind) {
     case HD5770_IRS_GPR:
-        g_string_append_printf(o, "r[%u][%u]", s->idx, s->chan);
+        g_string_append_printf(o, "r%s[%u][%u]", set_sfx[q], s->idx, s->chan);
         break;
     case HD5770_IRS_PV:
-        g_string_append_printf(o, "pv[%u]", s->chan);
+        g_string_append_printf(o, "pv%s[%u]", set_sfx[q], s->chan);
         break;
     case HD5770_IRS_CONST:
         g_string_append_printf(o, "words[kvo + %uu]", s->k);
@@ -1140,8 +1145,10 @@ static unsigned src_mods(const HD5770IRInst *in)
     return m;
 }
 
-static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
+static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
+                       unsigned q)
 {
+    const char *x = set_sfx[q];
     unsigned i, k;
 
     g_string_append(o, "    {\n");
@@ -1153,7 +1160,7 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
         }
         for (k = 0; k < in->nsrc; k++) {
             g_string_append_printf(o, "        uint s%u_%u = ", i, k);
-            src_expr(o, &in->src[k]);
+            src_expr(o, &in->src[k], q);
             g_string_append(o, ";\n");
         }
         g_string_append_printf(o, "        uint q%u = 0u;\n", i);
@@ -1175,8 +1182,9 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                                    m, i, m, i);
         } else if (in->interp) {
             g_string_append_printf(o, "        q%u = U(hd_interp(di, ti, pr, %uu, %uu, "
-                                   "%s, b0, b1, b2, pw));\n", i, in->prm,
-                                   in->dst_chan, in->flat ? "true" : "false");
+                                   "%s, b0%s, b1%s, b2%s, pw%s));\n", i, in->prm,
+                                   in->dst_chan, in->flat ? "true" : "false",
+                                   x, x, x, x);
         } else if (in->max4) {
             continue;
         } else {
@@ -1189,7 +1197,9 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                     g_string_append(o, ", 0u");
                 }
             }
-            g_string_append(o, ", k); if (k) { killed = true; } }\n");
+            /* only the pixel's own set kills */
+            g_string_append(o, q ? ", k); }\n"
+                                 : ", k); if (k) { killed = true; } }\n");
         }
     }
     if (g->dot) {
@@ -1227,28 +1237,45 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
                                    i, in->op, src_mods(in),
                                    in->clamp ? "true" : "false", in->omod, i);
         }
-        g_string_append_printf(o, "        pv[%u] = q%u;\n", in->slot, i);
+        g_string_append_printf(o, "        pv%s[%u] = q%u;\n", x, in->slot, i);
     }
     for (i = 0; i < g->n; i++) {
         const HD5770IRInst *in = &ir->insts[g->first + i];
 
         if (in->wr) {
-            g_string_append_printf(o, "        r[%u][%u] = q%u;\n", in->dst,
+            g_string_append_printf(o, "        r%s[%u][%u] = q%u;\n", x, in->dst,
                                    in->dst_chan, i);
         }
     }
     g_string_append(o, "    }\n");
 }
 
-static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
+static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
+                       unsigned q)
 {
+    const char *x = set_sfx[q];
     unsigned k, unit = 0;
 
     g_string_append(o, "    {\n        uint o[4] = uint[4](0u, 0u, 0u, 0u);\n");
-    if (f->kind == HD5770_IRF_VTX) {
+    if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
+        /* the neighbour minus this pixel; in a neighbour, itself */
+        const char *nb = set_sfx[q ? q : f->kind == HD5770_IRF_GRAD_H ? 1 : 2];
+
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "        o[%u] = U(hd_fsub(F(r%s[%u][%u]), "
+                                       "F(r%s[%u][%u])));\n", k, nb, f->src, sel,
+                                       x, f->src, sel);
+            } else {
+                g_string_append_printf(o, "        o[%u] = U(0.0);\n", k);
+            }
+        }
+    } else if (f->kind == HD5770_IRF_VTX) {
         g_string_append_printf(o, "        hd_vfetch(di, 0x%08xu, 0x%08xu, 0x%08xu, "
-                               "r[%u][%u], o);\n", f->w[0], f->w[1], f->w[2],
-                               f->src, (f->w[0] >> 24) & 3);
+                               "r%s[%u][%u], o);\n", f->w[0], f->w[1], f->w[2],
+                               x, f->src, (f->w[0] >> 24) & 3);
     } else {
         for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
             /* search */
@@ -1258,7 +1285,7 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
             unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
 
             if (sel < 4) {
-                g_string_append_printf(o, "r[%u][%u]", f->src, sel);
+                g_string_append_printf(o, "r%s[%u][%u]", x, f->src, sel);
             } else {
                 g_string_append(o, sel == 5 ? "U(1.0)" : "U(0.0)");
             }
@@ -1271,9 +1298,10 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
         unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
 
         if (sel < 4) {
-            g_string_append_printf(o, "        r[%u][%u] = o[%u];\n", f->dst, k, sel);
+            g_string_append_printf(o, "        r%s[%u][%u] = o[%u];\n", x, f->dst,
+                                   k, sel);
         } else if (sel == 4 || sel == 5) {
-            g_string_append_printf(o, "        r[%u][%u] = U(%s);\n", f->dst, k,
+            g_string_append_printf(o, "        r%s[%u][%u] = U(%s);\n", x, f->dst, k,
                                    sel == 5 ? "1.0" : "0.0");
         }
     }
@@ -1328,11 +1356,8 @@ char *hd5770_glsl_lib_only(void)
 char *hd5770_glsl_program(const HD5770IR *ir)
 {
     GString *o;
-    unsigned i, j, k;
+    unsigned i, j, k, q, nq = ir->grad ? 3 : 1, ng = MAX(ir->ngpr, 1u);
 
-    if (ir->grad) {
-        return NULL;
-    }
     o = g_string_new(NULL);
     emit_head(o);
     g_string_append(o, hd5770_glsl_lib);
@@ -1364,33 +1389,58 @@ char *hd5770_glsl_program(const HD5770IR *ir)
         "        float s = hd_sum3(b0, tris[ti].w[0], b1, tris[ti].w[1], b2, tris[ti].w[2]);\n"
         "        pw = s != 0.0 ? hd_div(1.0, s) : 0.0;\n"
         "    }\n");
-    g_string_append_printf(o,
-        "    uvec4 r[%u];\n"
-        "    for (uint i = 0u; i < %uu; i++) {\n"
-        "        r[i] = uvec4(0u);\n"
-        "    }\n"
-        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u), col[4] = uint[4](0u, 0u, 0u, 0u);\n"
+    g_string_append(o,
+        "    uint col[4] = uint[4](0u, 0u, 0u, 0u);\n"
         "    bool killed = false, c0 = false;\n"
-        "    int pg = draws[di].pos_gpr;\n",
-        MAX(ir->ngpr, 1u), MAX(ir->ngpr, 1u));
-    for (i = 0; i < ir->ngpr; i++) {
-        g_string_append_printf(o, "    if (pg == %u) {\n        r[%u] = uvec4(U(px), "
-                               "U(py), U(0.0), U(1.0));\n    }\n", i, i);
+        "    int pg = draws[di].pos_gpr;\n");
+    for (q = 0; q < nq; q++) {
+        const char *x = set_sfx[q];
+
+        if (q) {
+            /* bary() at the pixel to the right (1) or below (2) */
+            g_string_append_printf(o,
+                "    float px%s = hd_fadd(float(x + %d), pc), py%s = hd_fadd(float(y + %d), pc);\n"
+                "    float b0%s = hd_div(hd_edge(tx1, ty1, tx2, ty2, px%s, py%s), area);\n"
+                "    float b1%s = hd_div(hd_edge(tx2, ty2, tx0, ty0, px%s, py%s), area);\n"
+                "    float b2%s = hd_div(hd_edge(tx0, ty0, tx1, ty1, px%s, py%s), area);\n"
+                "    float pw%s = 0.0;\n"
+                "    if (draws[di].persp != 0u) {\n"
+                "        float s = hd_sum3(b0%s, tris[ti].w[0], b1%s, tris[ti].w[1], b2%s, tris[ti].w[2]);\n"
+                "        pw%s = s != 0.0 ? hd_div(1.0, s) : 0.0;\n"
+                "    }\n",
+                x, q == 1, x, q == 2, x, x, x, x, x, x, x, x, x, x, x, x, x, x);
+        }
+        g_string_append_printf(o,
+            "    uvec4 r%s[%u];\n"
+            "    for (uint i = 0u; i < %uu; i++) {\n"
+            "        r%s[i] = uvec4(0u);\n"
+            "    }\n"
+            "    uint pv%s[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n",
+            x, ng, ng, x, x);
+        for (i = 0; i < ir->ngpr; i++) {
+            g_string_append_printf(o, "    if (pg == %u) {\n        r%s[%u] = uvec4(U(px%s), "
+                                   "U(py%s), U(0.0), U(1.0));\n    }\n",
+                                   i, x, i, x, x);
+        }
+        g_string_append_printf(o, "    r%s[%u][0] = U(b1%s);\n    r%s[%u][1] = U(b2%s);\n",
+                               x, ir->map[0], x, x, ir->map[0], x);
     }
-    g_string_append_printf(o, "    r[%u][0] = U(b1);\n    r[%u][1] = U(b2);\n",
-                           ir->map[0], ir->map[0]);
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
 
         switch (op->kind) {
         case HD5770_IRO_ALU:
             for (j = 0; j < op->n; j++) {
-                emit_group(o, ir, &ir->groups[op->first + j]);
+                for (q = 0; q < nq; q++) {
+                    emit_group(o, ir, &ir->groups[op->first + j], q);
+                }
             }
             break;
         case HD5770_IRO_FETCH:
             for (j = 0; j < op->n; j++) {
-                emit_fetch(o, ir, &ir->fetches[op->first + j]);
+                for (q = 0; q < nq; q++) {
+                    emit_fetch(o, ir, &ir->fetches[op->first + j], q);
+                }
             }
             break;
         default: {
