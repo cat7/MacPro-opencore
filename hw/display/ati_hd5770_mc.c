@@ -349,6 +349,7 @@ static uint64_t hdp_read(void *opaque, hwaddr addr, unsigned size)
     unsigned i;
 
     s->hdp_accesses++;
+    ati_hd5770_cp_drain(s);
     for (i = 0; i < size; i++) {
         uint64_t a = hdp_byte(s, addr + i);
 
@@ -367,6 +368,7 @@ static void hdp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     unsigned i;
 
     s->hdp_accesses++;
+    ati_hd5770_cp_drain(s);
     for (i = 0; i < size; i++) {
         uint64_t a = hdp_byte(s, addr + i);
 
@@ -404,6 +406,8 @@ void ati_hd5770_hdp_init(ATIHD5770State *s)
     memory_region_add_subregion(&s->bar0, 0, &s->aper);
     memory_region_init_io(&s->hdp_io, obj, &hdp_ops, s, "ati-hd5770-hdp",
                           size);
+    /* an access may wait for the engine with the BQL released */
+    s->hdp_io.disable_reentrancy_guard = true;
     for (i = 0; i < EG_HDP_SURFACES; i++) {
         memory_region_init_alias(&s->hdp_win[i], obj, "ati-hd5770-hdp-win",
                                  &s->hdp_io, 0, 0x1000);

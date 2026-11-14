@@ -305,6 +305,7 @@ void ati_hd5770_cp_reset(ATIHD5770State *s);
 bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
+void ati_hd5770_cp_drain(ATIHD5770State *s);
 void ati_hd5770_cp_gaps(ATIHD5770State *s, GString *out);
 void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out);
 uint64_t ati_hd5770_gpu_clock(void);

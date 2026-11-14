@@ -866,6 +866,18 @@ static void cp_wait_idle(ATIHD5770State *s)
     qemu_mutex_unlock(&s->eng_lock);
 }
 
+/*
+ * Before a CPU access through an HDP window the engine finishes what is
+ * queued, so the access lands after the draws submitted before it (with
+ * the BQL, which is released while waiting).
+ */
+void ati_hd5770_cp_drain(ATIHD5770State *s)
+{
+    if (qatomic_read(&s->eng_busy)) {
+        cp_wait_idle(s);
+    }
+}
+
 static void *cp_thread_fn(void *opaque)
 {
     ATIHD5770State *s = opaque;
