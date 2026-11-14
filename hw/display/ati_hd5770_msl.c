@@ -1385,7 +1385,7 @@ char *hd5770_msl_program(const HD5770IR *ir)
         "    if (u.db && !hd_db(vram, ram, st, u, x, y,\n"
         "                       fma(t.z[2], B2_0, fma(t.z[0], B0_0, t.z[1] * B1_0)),\n"
         "                       t.front != 0)) {\n        return;\n    }\n"
-        "    if (!c0) {\n        return;\n    }\n"
+        "    if (!c0 || !u.wmask) {\n        return;\n    }\n"
         "    hd_put(vram, ram, st, u, x, y, col);\n"
         "}\n");
     return g_string_free(o, false);

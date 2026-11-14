@@ -1134,8 +1134,9 @@ static bool rt_setup(Draw *d, unsigned cb)
         d->st->gap_mode[d->rt.mode]++;
         return false;
     }
-    if ((info >> 17) & 3) {
-        /* fast clear / compression metadata */
+    if (((info >> 17) & 1) ||
+        (((info >> 18) & 1) && (CTX(g, PA_SC_AA_CONFIG) & 7))) {
+        /* fast clear metadata, or compressed multisampled data */
         d->st->gap_misc[HD5770_GAP_ROP]++;
     }
     d->x1 = MIN(d->x1, (int)d->rt.pitch);
@@ -2325,6 +2326,36 @@ static void gpu_req_free(HD5770GpuDraw *q)
 }
 
 /*
+ * Rows y0..y1 of the draw's target, depth or stencil plane are in VRAM
+ * ranges queued draws use: drawing them on the CPU would wait for the GPU.
+ */
+static bool gpu_queued(HD5770Gfx *g, Draw *d, int y0, int y1)
+{
+    const HD5770Surf *ws[3] = { d->color ? &d->rt : NULL,
+                                d->db && d->zfmt ? &d->zs : NULL,
+                                d->db && d->has_s ? &d->ss : NULL };
+    unsigned i, k;
+
+    for (i = 0; i < 3 && y1 >= y0; i++) {
+        uint64_t lo, hi, off;
+
+        if (!ws[i]) {
+            continue;
+        }
+        hd5770_surf_rows(ws[i], y0, y1 + 1, &lo, &hi);
+        if (!vram_off(g, lo, hi - lo, &off)) {
+            continue;
+        }
+        for (k = 0; k < g->npend; k++) {
+            if (off < g->pend[k][1] && g->pend[k][0] < off + (hi - lo)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * The draw on the host GPU, if the backend takes it. With gpu=verify the
  * CPU path draws it again over the same pixels, the two are compared,
  * and VRAM keeps the CPU's result.
@@ -2346,8 +2377,8 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         return false;
     }
     g->gst.offered++;
-    if (d->resolve || !d->color || (d->db && !g->gpu->ops->depth) ||
-        (d->db && d->zexport)) {
+    if (d->resolve || (!d->color && !d->db) ||
+        (d->db && !g->gpu->ops->depth) || (d->db && d->zexport)) {
         g->gst.fallback[GFB_DB]++;
         return false;
     }
@@ -2369,7 +2400,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         }
     }
     q = g_new0(HD5770GpuDraw, 1);
-    if (!gpu_surf(g, &d->rt, true, &q->rt)) {
+    if (d->color && !gpu_surf(g, &d->rt, true, &q->rt)) {
         g->gst.fallback[GFB_RT]++;
         goto out;
     }
@@ -2392,6 +2423,10 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         q->zclear = d->zclear;
         q->zmin = d->zmin;
         q->zmax = d->zmax;
+        if (!d->color) {
+            /* no colour: wmask 0, the depth (or stencil) plane stands in */
+            q->rt = d->zfmt ? q->zs : q->ss;
+        }
     }
     q->ir = ir;
     q->kv = (const uint32_t *)d->kv;
@@ -2404,7 +2439,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     q->rt_unorm8 = d->rt_unorm8;
     q->rt_float = d->rt_float;
     q->rt_blend = d->rt_blend;
-    q->wmask = d->wmask;
+    q->wmask = d->color ? d->wmask : 0;
     q->blend = d->blend;
     memcpy(q->blend_const, d->blend_const, sizeof(q->blend_const));
     q->alpha_test = d->alpha_test;
@@ -2450,12 +2485,13 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         area += (uint64_t)(q->tri[i].x1 - q->tri[i].x0 + 1) *
                 (q->tri[i].y1 - q->tri[i].y0 + 1);
     }
-    if (area < g->gpu->ops->min_pixels && g->gpu_mode == HD5770_GPU_ON) {
+    if (area < g->gpu->ops->min_pixels && g->gpu_mode == HD5770_GPU_ON &&
+        !gpu_queued(g, d, y0, y1)) {
         g->gst.fallback[GFB_SMALL]++;
         goto out;
     }
     /* the VRAM rows the draw writes: target, depth, stencil */
-    ws[0] = q->rt.space ? NULL : &q->rt;
+    ws[0] = q->rt.space || !d->color ? NULL : &q->rt;
     ws[1] = q->db && q->zfmt ? &q->zs : NULL;
     ws[2] = q->db && q->has_s ? &q->ss : NULL;
     for (i = 0; i < 3 && y1 >= y0; i++) {
