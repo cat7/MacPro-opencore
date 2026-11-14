@@ -431,29 +431,34 @@ unsigned hd5770_fmt_bytes(unsigned fmt)
 }
 
 /* component widths from component 0 (least significant) up */
+/*
+ * component widths, component 0 in the least significant bits: the
+ * names list the fields from the most significant one (FMT_8_24 holds
+ * a 24-bit X under an 8-bit Y)
+ */
 static const uint8_t fmt_bits[64][4] = {
     [HD5770_FMT_8] = { 8 },
     [HD5770_FMT_4_4] = { 4, 4 },
-    [HD5770_FMT_3_3_2] = { 3, 3, 2 },
+    [HD5770_FMT_3_3_2] = { 2, 3, 3 },
     [HD5770_FMT_16] = { 16 },
     [HD5770_FMT_16_FLOAT] = { 16 },
     [HD5770_FMT_8_8] = { 8, 8 },
     [HD5770_FMT_5_6_5] = { 5, 6, 5 },
-    [HD5770_FMT_6_5_5] = { 6, 5, 5 },
-    [HD5770_FMT_1_5_5_5] = { 1, 5, 5, 5 },
+    [HD5770_FMT_6_5_5] = { 5, 5, 6 },
+    [HD5770_FMT_1_5_5_5] = { 5, 5, 5, 1 },
     [HD5770_FMT_4_4_4_4] = { 4, 4, 4, 4 },
-    [HD5770_FMT_5_5_5_1] = { 5, 5, 5, 1 },
+    [HD5770_FMT_5_5_5_1] = { 1, 5, 5, 5 },
     [HD5770_FMT_32] = { 32 },
     [HD5770_FMT_32_FLOAT] = { 32 },
     [HD5770_FMT_16_16] = { 16, 16 },
     [HD5770_FMT_16_16_FLOAT] = { 16, 16 },
-    [HD5770_FMT_8_24] = { 8, 24 },
-    [HD5770_FMT_24_8] = { 24, 8 },
-    [HD5770_FMT_10_11_11] = { 10, 11, 11 },
-    [HD5770_FMT_11_11_10] = { 11, 11, 10 },
-    [HD5770_FMT_2_10_10_10] = { 2, 10, 10, 10 },
+    [HD5770_FMT_8_24] = { 24, 8 },
+    [HD5770_FMT_24_8] = { 8, 24 },
+    [HD5770_FMT_10_11_11] = { 11, 11, 10 },
+    [HD5770_FMT_11_11_10] = { 10, 11, 11 },
+    [HD5770_FMT_2_10_10_10] = { 10, 10, 10, 2 },
     [HD5770_FMT_8_8_8_8] = { 8, 8, 8, 8 },
-    [HD5770_FMT_10_10_10_2] = { 10, 10, 10, 2 },
+    [HD5770_FMT_10_10_10_2] = { 2, 10, 10, 10 },
     [HD5770_FMT_32_32] = { 32, 32 },
     [HD5770_FMT_32_32_FLOAT] = { 32, 32 },
     [HD5770_FMT_16_16_16_16] = { 16, 16, 16, 16 },
