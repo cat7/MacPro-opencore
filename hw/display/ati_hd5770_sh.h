@@ -72,7 +72,7 @@ struct HD5770Thread {
     HD5770Val color[HD5770_MRTS][4];
     uint32_t param_mask, color_mask;
     bool pos_written, killed;
-    HD5770Val depth;
+    HD5770Val depth, stencil;   /* the DB export: depth, stencil reference */
     bool depth_written;
 };
 

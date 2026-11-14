@@ -31,6 +31,14 @@
 
 /* context and config registers */
 #define VGT_PRIMITIVE_TYPE              0x8958
+#define DB_RENDER_CONTROL               0x28000
+#define DB_STENCIL_CLEAR                0x28028
+#define DB_DEPTH_CLEAR                  0x2802c
+#define DB_Z_INFO                       0x28040
+#define DB_STENCIL_INFO                 0x28044
+#define DB_Z_WRITE_BASE                 0x28050
+#define DB_STENCIL_WRITE_BASE           0x28054
+#define DB_DEPTH_SIZE                   0x28058
 #define GB_ADDR_CONFIG                  0x98f8
 #define PA_SC_SCREEN_SCISSOR_TL         0x28030
 #define PA_SC_SCREEN_SCISSOR_BR         0x28034
@@ -46,19 +54,25 @@
 #define PA_SC_GENERIC_SCISSOR_BR        0x28244
 #define PA_SC_VPORT_SCISSOR_0_TL        0x28250
 #define PA_SC_VPORT_SCISSOR_0_BR        0x28254
+#define PA_SC_VPORT_ZMIN_0              0x282d0
+#define PA_SC_VPORT_ZMAX_0              0x282d4
 #define VGT_INDX_OFFSET                 0x28408
 #define SX_ALPHA_TEST_CONTROL           0x28410
 #define CB_BLEND_RED                    0x28414
+#define DB_STENCILREFMASK               0x28430
+#define DB_STENCILREFMASK_BF            0x28434
 #define SX_ALPHA_REF                    0x28438
 #define PA_CL_VPORT_XSCALE_0            0x2843c
 #define SPI_VS_OUT_ID_0                 0x2861c
 #define SPI_PS_INPUT_CNTL_0             0x28644
 #define SPI_VS_OUT_CONFIG               0x286c4
 #define SPI_PS_IN_CONTROL_0             0x286cc
+#define SPI_PS_IN_CONTROL_1             0x286d0
 #define SPI_BARYC_CNTL                  0x286e0
 #define CB_BLEND0_CONTROL               0x28780
 #define DB_DEPTH_CONTROL                0x28800
 #define CB_COLOR_CONTROL                0x28808
+#define DB_SHADER_CONTROL               0x2880c
 #define PA_CL_CLIP_CNTL                 0x28810
 #define PA_SU_SC_MODE_CNTL              0x28814
 #define PA_CL_VTE_CNTL                  0x28818
@@ -68,6 +82,7 @@
 #define SQ_ALU_CONST_CACHE_PS_0         0x28940
 #define SQ_ALU_CONST_CACHE_VS_0         0x28980
 #define PA_SC_MODE_CNTL_0               0x28a48
+#define PA_SC_AA_CONFIG                 0x28be0
 #define PA_SU_VTX_CNTL                  0x28c08
 #define CB_COLOR0_BASE                  0x28c60
 #define CB_COLOR_STRIDE                 0x3c
@@ -86,8 +101,29 @@
 enum {
     PRIM_POINTLIST = 1, PRIM_LINELIST = 2, PRIM_LINESTRIP = 3,
     PRIM_TRILIST = 4, PRIM_TRIFAN = 5, PRIM_TRISTRIP = 6,
-    PRIM_RECTLIST = 0x11, PRIM_QUADLIST = 0x13,
+    PRIM_RECTLIST = 0x11, PRIM_QUADLIST = 0x13, PRIM_QUADSTRIP = 0x14,
+    PRIM_POLYGON = 0x15,
 };
+
+/* CB_COLOR_CONTROL.MODE */
+enum { CB_DISABLE = 0, CB_NORMAL = 1, CB_RESOLVE = 3 };
+
+/* DB_DEPTH_CONTROL */
+#define DC_STENCIL      (1u << 0)
+#define DC_Z            (1u << 1)
+#define DC_Z_WRITE      (1u << 2)
+#define DC_BACKFACE     (1u << 7)
+/* DB_RENDER_CONTROL */
+#define RC_DEPTH_CLEAR  (1u << 0)
+#define RC_STENCIL_CLEAR (1u << 1)
+#define RC_COPY         (3u << 2)
+#define RC_COLOR_DISABLE (1u << 12)
+
+/*
+ * PA_SU_SC_MODE_CNTL.FACE = 0: counter-clockwise triangles face front.
+ * Window y grows downwards; a positive edge() area is clockwise there.
+ */
+#define FACE_CW_IS_AREA_POS     1
 
 typedef struct ShEntry {
     uint64_t addr;
@@ -140,6 +176,7 @@ typedef struct Draw {
     uint32_t rt_mtx, rt_mty;    /* the micro tile last addressed */
     uint64_t rt_mbase;
     uint32_t wmask;
+    bool color;                 /* colour buffer 0 is written */
     uint32_t blend;
     float blend_const[4];
     bool alpha_test;
@@ -150,6 +187,28 @@ typedef struct Draw {
     uint32_t cliprule;
     int cr[4][4];               /* clip rects x0, y0, x1, y1 */
     float pix_center;
+    /* depth and stencil buffers */
+    bool db;                    /* tested or written */
+    HD5770Surf zs, ss;
+    unsigned zfmt;              /* 1 Z_16, 2 Z_24, 3 Z_32_FLOAT, 0 none */
+    bool has_s;
+    uint32_t dctl, rctl, srm[2];
+    float zclear, zmin, zmax;
+    uint32_t sclear;
+    bool zexport, sexport;      /* the pixel shader exports depth, stencil */
+    HD5770Span span_z, span_s;
+    uint32_t z_mtx, z_mty, s_mtx, s_mty;
+    uint64_t z_mbase, s_mbase;
+    /* culling and facing */
+    unsigned cull;              /* bit 0 front, bit 1 back */
+    bool face_cw, prov_last, front;
+    /* resolve: colour buffer 0 is copied to colour buffer 1 */
+    bool resolve;
+    HD5770Surf rs;
+    unsigned rs_fmt, rs_num, rs_swap;
+    uint32_t rs_mtx, rs_mty;
+    uint64_t rs_mbase;
+    HD5770Span span_rs;
     /* PS input p comes from VS parameter ps_src[p], or a default */
     int ps_src[HD5770_PARAMS];
     float ps_default[HD5770_PARAMS][4];
@@ -159,8 +218,10 @@ typedef struct Draw {
     bool pos_ena;
     /* current primitive, for the pixel shader's interpolation */
     const Vtx *tv[3];
+    const Vtx *tvp;             /* provoking vertex: flat inputs */
     float area;
     int px, py;                 /* current pixel */
+    int wy0, wy1;               /* rows the CPU rasteriser visited */
     HD5770Thread *nt;           /* scratch thread of neighbour runs */
     float b0, b1, b2;           /* barycentrics of the current pixel */
     float pw;                   /* 1/sum, perspective */
@@ -431,6 +492,49 @@ static float half_to_float(uint16_t h)
     return v.f;
 }
 
+/* a float as a half, rounded to nearest even */
+static uint16_t float_to_half(float f)
+{
+    HD5770Val v;
+    uint32_t x, s, m;
+    int e;
+
+    v.f = f;
+    x = v.u;
+    s = (x >> 16) & 0x8000;
+    e = (int)((x >> 23) & 0xff) - 127 + 15;
+    m = x & 0x7fffff;
+    if (((x >> 23) & 0xff) == 0xff) {
+        return s | 0x7c00 | (m ? 0x200 | (m >> 13) : 0);
+    }
+    if (e >= 31) {
+        return s | 0x7c00;
+    }
+    if (e <= 0) {
+        uint32_t sh, r, h;
+
+        if (e < -10) {
+            return s;
+        }
+        m |= 0x800000;
+        sh = 14 - e;
+        h = m >> sh;
+        r = m & ((1u << sh) - 1);
+        if (r > (1u << (sh - 1)) || (r == (1u << (sh - 1)) && (h & 1))) {
+            h++;
+        }
+        return s | h;
+    }
+    {
+        uint32_t h = s | (e << 10) | (m >> 13), r = m & 0x1fff;
+
+        if (r > 0x1000 || (r == 0x1000 && (h & 1))) {
+            h++;
+        }
+        return h;
+    }
+}
+
 /* one component of an element to a shader value */
 static HD5770Val comp_value(uint32_t c, unsigned bits, bool is_float,
                             bool is_signed, unsigned num)
@@ -603,9 +707,23 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
         d->st->gap_mode[t->s.mode]++;
         return false;
     }
+    if (t->dim == 6) {
+        /*
+         * 2D_MSAA: sample 0 of a 2D texture. Apple's depth copies give
+         * single-sample depth buffers four samples here.
+         */
+        if (r[5] & 0xf) {
+            d->st->gap_misc[HD5770_GAP_MSAA]++;
+        }
+        t->dim = 1;
+    }
     if (t->dim != 1 && t->dim != 0) {
         d->st->gap_misc[HD5770_GAP_TEX_DIM]++;
         return false;
+    }
+    if (t->dim == 1 && (r[5] & 0xf) > (r[4] >> 28) && ((sm[0] >> 15) & 3)) {
+        /* mipmapped: level BASE_LEVEL is sampled */
+        d->st->gap_misc[HD5770_GAP_MIP]++;
     }
     if (t->dim == 0) {
         t->h = 1;
@@ -876,10 +994,10 @@ static float interp(void *opaque, unsigned p, unsigned chan, bool flat)
     if (src < 0) {
         return d->ps_default[p][chan];
     }
-    a = d->tv[0]->param[src][chan].f;
     if (flat || d->ps_flat[p]) {
-        return a;
+        return d->tvp->param[src][chan].f;
     }
+    a = d->tv[0]->param[src][chan].f;
     b = d->tv[1]->param[src][chan].f;
     c = d->tv[2]->param[src][chan].f;
     if (d->persp) {
@@ -911,13 +1029,14 @@ static void interp_n(void *opaque, const HD5770Lanes *l, unsigned p,
         }
         return;
     }
-    a = d->tv[0]->param[src][chan].f;
     if (flat || d->ps_flat[p]) {
+        a = d->tvp->param[src][chan].f;
         for (x = 0; x < n; x++) {
             out[x].f = a;
         }
         return;
     }
+    a = d->tv[0]->param[src][chan].f;
     b = d->tv[1]->param[src][chan].f;
     c = d->tv[2]->param[src][chan].f;
     if (d->persp) {
@@ -949,10 +1068,11 @@ static unsigned swap_src(unsigned swap, unsigned n, unsigned i)
     return m[n - 1][swap][i];
 }
 
-static bool rt_setup(Draw *d)
+/* colour buffer cb as the draw's render target */
+static bool rt_setup(Draw *d, unsigned cb)
 {
     HD5770Gfx *g = d->g;
-    uint32_t base = CB_COLOR0_BASE;
+    uint32_t base = CB_COLOR0_BASE + cb * CB_COLOR_STRIDE;
     uint32_t info = CTX(g, base + 0x10), attrib = CTX(g, base + 0x14);
     uint32_t pitch = CTX(g, base + 0x4), slice = CTX(g, base + 0x8);
     unsigned i;
@@ -961,7 +1081,7 @@ static bool rt_setup(Draw *d)
     if (!d->rt_fmt) {
         return false;
     }
-    for (i = 1; i < 8; i++) {
+    for (i = 1; i < 8 && !cb; i++) {
         if ((CTX(g, base + i * CB_COLOR_STRIDE + 0x10) >> 2) & 0x3f &&
             (CTX(g, CB_TARGET_MASK) >> (4 * i)) & 0xf) {
             d->st->gap_misc[HD5770_GAP_MRT]++;
@@ -975,7 +1095,7 @@ static bool rt_setup(Draw *d)
     d->rt_float = d->rt_num == 7;
     d->rt_blend = !((info >> 20) & 1);
     d->st->rt_fmt[d->rt_fmt]++;
-    if (!d->rt_bpe || d->rt_bpe > 8 ||
+    if (!d->rt_bpe || (d->rt_bpe > 8 && d->rt_num != 4) ||
         !(d->rt_num == 0 || d->rt_num == 4 || d->rt_num == 7) ||
         (d->rt_float && !hd5770_fmt_is_float(d->rt_fmt) &&
          d->rt_fmt != HD5770_FMT_32_FLOAT)) {
@@ -1109,15 +1229,62 @@ static void put_pixel(Draw *d, int x, int y, const HD5770Val *col)
 
         hd5770_fmt_unpack(d->rt_fmt, p, old, b);
     }
-    if (d->rt_num == 4 || d->rt_float) {
-        /* integer and float targets: no blending */
+    if (d->rt_num == 4) {
+        /* integer targets: no blending */
         for (i = 0; i < n; i++) {
             unsigned s = d->rt_src[i];
 
             c[i] = (d->wmask >> s) & 1 ? col[s].u : old[i];
-            if (d->rt_float && bits[i] == 16) {
-                d->st->gap_fmt[d->rt_fmt]++;
+        }
+        hd5770_fmt_pack(d->rt_fmt, p, c);
+        return;
+    }
+    if (d->rt_float) {
+        /* float targets: blending without clamps */
+        HD5770Val out[4];
+
+        for (i = 0; i < 4; i++) {
+            out[i] = col[i];
+            src[i] = col[i].f;
+            dst[i] = i == 3 ? 1.0f : 0.0f;
+        }
+        for (i = 0; i < n; i++) {
+            HD5770Val o;
+
+            o.u = old[i];
+            dst[d->rt_src[i]] = bits[i] == 16 ? half_to_float(old[i]) : o.f;
+        }
+        if (d->blend & (1u << 30) && d->rt_blend) {
+            unsigned csrc = d->blend & 0x1f, cfn = (d->blend >> 5) & 7;
+            unsigned cdst = (d->blend >> 8) & 0x1f;
+            unsigned asrc = csrc, afn = cfn, adst = cdst;
+
+            if ((d->blend >> 29) & 1) {
+                asrc = (d->blend >> 16) & 0x1f;
+                afn = (d->blend >> 21) & 7;
+                adst = (d->blend >> 24) & 0x1f;
             }
+            for (i = 0; i < 4; i++) {
+                unsigned fs = i == 3 ? asrc : csrc, fd = i == 3 ? adst : cdst;
+                unsigned fn = i == 3 ? afn : cfn;
+
+                out[i].f = combine(fn, src[i],
+                                   blend_factor(fs, src, dst, d->blend_const,
+                                                i, &ok),
+                                   dst[i],
+                                   blend_factor(fd, src, dst, d->blend_const,
+                                                i, &ok), &ok);
+            }
+            d->st->blend_on++;
+            if (!ok) {
+                d->st->gap_misc[HD5770_GAP_BLEND_FUNC]++;
+            }
+        }
+        for (i = 0; i < n; i++) {
+            unsigned s = d->rt_src[i];
+
+            c[i] = !((d->wmask >> s) & 1) ? old[i] :
+                   bits[i] == 16 ? float_to_half(out[s].f) : out[s].u;
         }
         hd5770_fmt_pack(d->rt_fmt, p, c);
         return;
@@ -1185,6 +1352,288 @@ static void put_pixel(Draw *d, int x, int y, const HD5770Val *col)
 }
 
 /* ---------------------------------------------------------------- */
+/* Depth and stencil                                                */
+
+static bool db_cmp(unsigned fn, uint32_t a, uint32_t b)
+{
+    switch (fn) {
+    case 0:
+        return false;
+    case 1:
+        return a < b;
+    case 2:
+        return a == b;
+    case 3:
+        return a <= b;
+    case 4:
+        return a > b;
+    case 5:
+        return a != b;
+    case 6:
+        return a >= b;
+    default:
+        return true;
+    }
+}
+
+static bool db_cmpf(unsigned fn, float a, float b)
+{
+    switch (fn) {
+    case 0:
+        return false;
+    case 1:
+        return a < b;
+    case 2:
+        return a == b;
+    case 3:
+        return a <= b;
+    case 4:
+        return a > b;
+    case 5:
+        return a != b;
+    case 6:
+        return a >= b;
+    default:
+        return true;
+    }
+}
+
+static uint32_t stencil_op(unsigned op, uint32_t v, uint32_t ref)
+{
+    switch (op) {
+    case 0:
+        return v;
+    case 1:
+        return 0;
+    case 2:
+        return ref;
+    case 3:
+        return v < 255 ? v + 1 : 255;
+    case 4:
+        return v ? v - 1 : 0;
+    case 5:
+        return ~v & 0xff;
+    case 6:
+        return (v + 1) & 0xff;
+    default:
+        return (v - 1) & 0xff;
+    }
+}
+
+/* the depth of a fragment as the buffer stores it */
+static uint32_t db_zbits(unsigned zfmt, float z)
+{
+    HD5770Val v;
+
+    switch (zfmt) {
+    case 1:
+        return (uint32_t)rintf(z * 65535.0f);
+    case 2:
+        return (uint32_t)rintf(z * 16777215.0f);
+    default:
+        v.f = z;
+        return v.u;
+    }
+}
+
+/*
+ * The stencil and depth tests of the fragment at (x, y) with depth z;
+ * the buffers are updated as the tests say. sref is the stencil
+ * reference the shader exported, or -1. True: the colour is written.
+ */
+static bool db_test(Draw *d, int x, int y, float z, int sref)
+{
+    uint32_t dctl = d->dctl;
+    bool front = d->front || !(dctl & DC_BACKFACE);
+    uint32_t srm = d->srm[front ? 0 : 1];
+    uint8_t *zp = NULL, *sp = NULL;
+    uint32_t znew = 0, zold = 0;
+    bool zpass = true, spass = true;
+
+    d->st->db_tests++;
+    if (d->zfmt) {
+        uint64_t off = surf_off(&d->zs, &d->z_mtx, &d->z_mty, &d->z_mbase,
+                                x, y);
+
+        zp = hd5770_span_ptr(&d->g->mem, &d->span_z, d->zs.base + off,
+                             d->zs.bpe, true);
+    }
+    if (zp) {
+        float zf = d->rctl & RC_DEPTH_CLEAR ? d->zclear : z;
+        HD5770Val o;
+
+        zf = fminf(fmaxf(zf, d->zmin), d->zmax);
+        znew = db_zbits(d->zfmt, zf);
+        if (d->zfmt == 1) {
+            zold = lduw_le_p(zp);
+        } else {
+            zold = ldl_le_p(zp);
+        }
+        if (d->zfmt == 2) {
+            zold &= 0xffffff;
+        }
+        o.u = zold;
+        if (dctl & DC_Z) {
+            zpass = d->zfmt == 3 ? db_cmpf((dctl >> 4) & 7, zf, o.f)
+                                 : db_cmp((dctl >> 4) & 7, znew, zold);
+        }
+    }
+    if (d->has_s) {
+        uint64_t off = surf_off(&d->ss, &d->s_mtx, &d->s_mty, &d->s_mbase,
+                                x, y);
+
+        sp = hd5770_span_ptr(&d->g->mem, &d->span_s, d->ss.base + off, 1,
+                             true);
+    }
+    if (sp) {
+        uint32_t sold = *sp, snew, ref, wm = (srm >> 16) & 0xff;
+
+        ref = d->rctl & RC_STENCIL_CLEAR ? d->sclear
+              : sref >= 0 ? (uint32_t)sref & 0xff : srm & 0xff;
+        if (dctl & DC_STENCIL) {
+            uint32_t m = (srm >> 8) & 0xff;
+            unsigned op;
+
+            spass = db_cmp(front ? (dctl >> 8) & 7 : (dctl >> 20) & 7,
+                           ref & m, sold & m);
+            op = !spass ? (front ? dctl >> 11 : dctl >> 23) :
+                 !zpass ? (front ? dctl >> 17 : dctl >> 29) :
+                          (front ? dctl >> 14 : dctl >> 26);
+            snew = stencil_op(op & 7, sold, ref);
+        } else {
+            snew = ref;
+        }
+        *sp = (sold & ~wm) | (snew & wm);
+    }
+    if (zp && zpass && spass && (dctl & DC_Z_WRITE)) {
+        if (d->zfmt == 1) {
+            stw_le_p(zp, znew);
+        } else if (d->zfmt == 2) {
+            stl_le_p(zp, znew | (ldl_le_p(zp) & 0xff000000u));
+        } else {
+            stl_le_p(zp, znew);
+        }
+    }
+    if (!(zpass && spass)) {
+        d->st->db_fails++;
+        return false;
+    }
+    return true;
+}
+
+/* the depth buffer and stencil buffer of the draw, if it uses them */
+static void db_setup(Draw *d)
+{
+    HD5770Gfx *g = d->g;
+    uint32_t zinfo = CTX(g, DB_Z_INFO), sinfo = CTX(g, DB_STENCIL_INFO);
+    uint32_t size = CTX(g, DB_DEPTH_SIZE);
+    HD5770Surf s;
+
+    d->dctl = CTX(g, DB_DEPTH_CONTROL);
+    d->rctl = CTX(g, DB_RENDER_CONTROL);
+    d->zfmt = zinfo & 3;
+    d->has_s = sinfo & 1;
+    if (!(d->dctl & (DC_Z | DC_Z_WRITE)) && !(d->rctl & RC_DEPTH_CLEAR)) {
+        d->zfmt = 0;
+    }
+    if (!(d->dctl & DC_STENCIL) && !(d->rctl & RC_STENCIL_CLEAR)) {
+        d->has_s = false;
+    }
+    if (d->rctl & RC_COPY) {
+        /* depth/stencil copy to colour buffer 0 */
+        d->st->gap_misc[HD5770_GAP_DEPTH]++;
+    }
+    if (!d->zfmt && !d->has_s) {
+        return;
+    }
+    memset(&s, 0, sizeof(s));
+    s.pitch = ((size & 0x7ff) + 1) * 8;
+    s.height = (((size >> 11) & 0x7ff) + 1) * 8;
+    s.mode = (zinfo >> 4) & 0xf;
+    s.banks = 2u << ((zinfo >> 12) & 3);
+    s.bankw = 1u << ((zinfo >> 16) & 3);
+    s.bankh = 1u << ((zinfo >> 20) & 3);
+    s.mtilea = 1u << ((zinfo >> 24) & 3);
+    s.nondisp = true;
+    hd5770_surf_set_addr_config(&s, addr_config(g));
+    if (!hd5770_surf_mode_ok(s.mode)) {
+        d->st->gap_mode[s.mode]++;
+        d->zfmt = 0;
+        d->has_s = false;
+        return;
+    }
+    d->zs = s;
+    d->zs.base = (uint64_t)CTX(g, DB_Z_WRITE_BASE) << 8;
+    d->zs.bpe = d->zfmt == 1 ? 2 : 4;
+    d->zs.tile_split = 64u << ((zinfo >> 8) & 7);
+    hd5770_surf_prep(&d->zs);
+    d->ss = s;
+    d->ss.base = (uint64_t)CTX(g, DB_STENCIL_WRITE_BASE) << 8;
+    d->ss.bpe = 1;
+    d->ss.tile_split = 64u << ((sinfo >> 8) & 7);
+    hd5770_surf_prep(&d->ss);
+    d->srm[0] = CTX(g, DB_STENCILREFMASK);
+    d->srm[1] = CTX(g, DB_STENCILREFMASK_BF);
+    memcpy(&d->zclear, &g->ctx[(DB_DEPTH_CLEAR - 0x28000) / 4], 4);
+    d->sclear = CTX(g, DB_STENCIL_CLEAR) & 0xff;
+    memcpy(&d->zmin, &g->ctx[(PA_SC_VPORT_ZMIN_0 - 0x28000) / 4], 4);
+    memcpy(&d->zmax, &g->ctx[(PA_SC_VPORT_ZMAX_0 - 0x28000) / 4], 4);
+    d->zmin = fmaxf(d->zmin, 0.0f);
+    d->zmax = fminf(d->zmax, 1.0f);
+    if (!(d->zmin <= d->zmax)) {
+        d->zmin = 0.0f;
+        d->zmax = 1.0f;
+    }
+    d->zexport = CTX(g, DB_SHADER_CONTROL) & 1;
+    d->sexport = (CTX(g, DB_SHADER_CONTROL) >> 1) & 1;
+    d->z_mtx = d->z_mty = d->s_mtx = d->s_mty = UINT32_MAX;
+    d->x1 = MIN(d->x1, (int)s.pitch);
+    d->y1 = MIN(d->y1, (int)s.height);
+    d->db = true;
+}
+
+/* resolve: colour buffer 1 gets colour buffer 0 (one sample) */
+static void resolve_pixel(Draw *d, int x, int y)
+{
+    uint64_t so = surf_off(&d->rs, &d->rs_mtx, &d->rs_mty, &d->rs_mbase,
+                           x, y);
+    uint8_t *sp = hd5770_span_ptr(&d->g->mem, &d->span_rs, d->rs.base + so,
+                                  d->rs.bpe, false);
+    HD5770Val col[4];
+    uint32_t c[4];
+    unsigned bits[4], i, n;
+
+    if (!sp) {
+        return;
+    }
+    if (d->rs_fmt == d->rt_fmt && d->rs_num == d->rt_num &&
+        d->rs_swap == d->rt_swap) {
+        uint64_t off = surf_off(&d->rt, &d->rt_mtx, &d->rt_mty, &d->rt_mbase,
+                                x, y);
+        uint8_t *p = hd5770_span_ptr(&d->g->mem, &d->span_rt,
+                                     d->rt.base + off, d->rt_bpe, true);
+
+        if (p) {
+            memcpy(p, sp, d->rt_bpe);
+            d->st->pixels++;
+        }
+        return;
+    }
+    hd5770_fmt_unpack(d->rs_fmt, sp, c, bits);
+    n = hd5770_fmt_comps(d->rs_fmt);
+    col[0].f = col[1].f = col[2].f = 0.0f;
+    col[3].f = 1.0f;
+    for (i = 0; i < n; i++) {
+        unsigned s = swap_src(d->rs_swap, n, i);
+
+        col[s] = comp_value(c[i], bits[i], d->rs_num == 7, false,
+                            d->rs_num == 4 ? HD5770_NUM_INT : HD5770_NUM_NORM);
+    }
+    put_pixel(d, x, y, col);
+    d->st->pixels++;
+}
+
+/* ---------------------------------------------------------------- */
 /* Rasteriser                                                       */
 
 static bool alpha_pass(Draw *d, float a)
@@ -1240,6 +1689,7 @@ static void ps_setup(Draw *d, int x, int y, HD5770Thread *t)
     memset(t->color, 0, sizeof(t->color));
     t->color_mask = 0;
     t->killed = false;
+    t->depth_written = false;
     if (d->pos_ena) {
         t->r[d->pos_gpr][0].f = x + d->pix_center;
         t->r[d->pos_gpr][1].f = y + d->pix_center;
@@ -1285,9 +1735,19 @@ static bool clip_pass(Draw *d, int x, int y)
     return (d->cliprule >> idx) & 1;
 }
 
+/* the interpolated depth at barycentrics b0, b1, b2 */
+static inline float frag_z(const Draw *d, float b0, float b1, float b2)
+{
+    return d->tv[0]->z * b0 + d->tv[1]->z * b1 + d->tv[2]->z * b2;
+}
+
 static void shade(Draw *d, int x, int y, HD5770Thread *t)
 {
     if (d->cliprule != 0xffff && !clip_pass(d, x, y)) {
+        return;
+    }
+    if (d->resolve) {
+        resolve_pixel(d, x, y);
         return;
     }
     d->px = x;
@@ -1301,10 +1761,21 @@ static void shade(Draw *d, int x, int y, HD5770Thread *t)
         d->st->kills++;
         return;
     }
-    if (!(t->color_mask & 1)) {
+    if (d->alpha_test && (t->color_mask & 1) &&
+        !alpha_pass(d, t->color[0][3].f)) {
         return;
     }
-    if (d->alpha_test && !alpha_pass(d, t->color[0][3].f)) {
+    if (d->db) {
+        bool exp = t->depth_written;
+        float z = exp && d->zexport ? t->depth.f
+                                    : frag_z(d, d->b0, d->b1, d->b2);
+
+        if (!db_test(d, x, y, z, exp && d->sexport ? (int)(t->stencil.u & 0xff)
+                                                   : -1)) {
+            return;
+        }
+    }
+    if (!d->color || !(t->color_mask & 1)) {
         return;
     }
     put_pixel(d, x, y, t->color[0]);
@@ -1347,13 +1818,17 @@ static void lanes_flush(Draw *d)
             d->st->kills++;
             continue;
         }
-        if (!l->color0) {
-            continue;
-        }
         for (k = 0; k < 4; k++) {
             col[k] = l->color[k][x];
         }
-        if (d->alpha_test && !alpha_pass(d, col[3].f)) {
+        if (l->color0 && d->alpha_test && !alpha_pass(d, col[3].f)) {
+            continue;
+        }
+        if (d->db && !db_test(d, d->lx[x], d->ly[x],
+                              frag_z(d, l->b0[x], l->b1[x], l->b2[x]), -1)) {
+            continue;
+        }
+        if (!d->color || !l->color0) {
             continue;
         }
         put_pixel(d, d->lx[x], d->ly[x], col);
@@ -1420,6 +1895,10 @@ static void raster_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
     maxx = MIN(d->x1 - 1, (int)ceilf(MAX(a->x, MAX(b->x, c->x)) - pc));
     miny = MAX(d->y0, (int)floorf(MIN(a->y, MIN(b->y, c->y)) - pc));
     maxy = MIN(d->y1 - 1, (int)ceilf(MAX(a->y, MAX(b->y, c->y)) - pc));
+    if (minx <= maxx && miny <= maxy) {
+        d->wy0 = MIN(d->wy0, miny);
+        d->wy1 = MAX(d->wy1, maxy);
+    }
     d->tv[0] = v0;
     d->tv[1] = v1;
     d->tv[2] = v2;
@@ -1503,6 +1982,10 @@ static bool vs_run(Draw *d, uint32_t index, Vtx *v, HD5770Thread *t)
     z = t->pos[2].f;
     w = t->pos[3].f;
     if (!(vte & (1u << 8))) {
+        if (!(w > 0.0f)) {
+            /* behind the eye: not clipped */
+            d->st->gap_misc[HD5770_GAP_CLIP]++;
+        }
         if (w == 0.0f) {
             w = 1.0f;
         }
@@ -1585,6 +2068,26 @@ static void ps_inputs(Draw *d)
 typedef void TriFn(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
                    HD5770Thread *t);
 
+/*
+ * A triangle of the draw: its facing, culling, the provoking vertex pv
+ * (flat inputs; with PROVOKING_VTX_LAST, else the first vertex), then
+ * tri().
+ */
+static void emit(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
+                 const Vtx *pv, HD5770Thread *t, TriFn *tri)
+{
+    float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
+    bool cw = FACE_CW_IS_AREA_POS ? area > 0 : area < 0;
+
+    d->front = d->face_cw ? cw : !cw;
+    if (d->cull & (d->front ? 1 : 2)) {
+        d->st->culled++;
+        return;
+    }
+    d->tvp = d->prov_last ? pv : a;
+    tri(d, a, b, c, t);
+}
+
 /* the primitives of a draw as triangles, in order */
 static void assemble(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
                      HD5770Thread *t, TriFn *tri)
@@ -1609,37 +2112,46 @@ static void assemble(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
                                        vb[i + 1].param[p][k].f;
                 }
             }
-            tri(d, &vb[i], &vb[i + 1], &vb[i + 2], t);
-            tri(d, &vb[i], &vb[i + 2], &v3, t);
+            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 2], t, tri);
+            emit(d, &vb[i], &vb[i + 2], &v3, &vb[i + 2], t, tri);
             st->prims++;
         }
         break;
     case PRIM_QUADLIST:
         for (i = 0; i + 4 <= nv && d->ok; i += 4) {
-            tri(d, &vb[i], &vb[i + 1], &vb[i + 2], t);
-            tri(d, &vb[i], &vb[i + 2], &vb[i + 3], t);
+            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 3], t, tri);
+            emit(d, &vb[i], &vb[i + 2], &vb[i + 3], &vb[i + 3], t, tri);
+            st->prims++;
+        }
+        break;
+    case PRIM_QUADSTRIP:
+        /* quad i: vertices 2i, 2i + 1, 2i + 3, 2i + 2 */
+        for (i = 0; i + 4 <= nv && d->ok; i += 2) {
+            emit(d, &vb[i], &vb[i + 1], &vb[i + 3], &vb[i + 3], t, tri);
+            emit(d, &vb[i], &vb[i + 3], &vb[i + 2], &vb[i + 3], t, tri);
             st->prims++;
         }
         break;
     case PRIM_TRILIST:
         for (i = 0; i + 3 <= nv && d->ok; i += 3) {
-            tri(d, &vb[i], &vb[i + 1], &vb[i + 2], t);
+            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 2], t, tri);
             st->prims++;
         }
         break;
     case PRIM_TRISTRIP:
         for (i = 2; i < nv && d->ok; i++) {
             if (i & 1) {
-                tri(d, &vb[i - 1], &vb[i - 2], &vb[i], t);
+                emit(d, &vb[i - 1], &vb[i - 2], &vb[i], &vb[i], t, tri);
             } else {
-                tri(d, &vb[i - 2], &vb[i - 1], &vb[i], t);
+                emit(d, &vb[i - 2], &vb[i - 1], &vb[i], &vb[i], t, tri);
             }
             st->prims++;
         }
         break;
     case PRIM_TRIFAN:
+    case PRIM_POLYGON:
         for (i = 2; i < nv && d->ok; i++) {
-            tri(d, &vb[0], &vb[i - 1], &vb[i], t);
+            emit(d, &vb[0], &vb[i - 1], &vb[i], &vb[i], t, tri);
             st->prims++;
         }
         break;
@@ -1683,9 +2195,11 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
         int src = d->ps_src[p];
 
         for (q = 0; q < 3; q++) {
+            const Vtx *vq = d->ps_flat[p] ? d->tvp : v[q];
+
             for (k = 0; k < 4; k++) {
                 float f = src < 0 ? d->ps_default[p][k]
-                                  : v[q]->param[src][k].f;
+                                  : vq->param[src][k].f;
 
                 g_array_append_val(d->gprm, f);
             }
@@ -1694,7 +2208,7 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
 }
 
 enum {
-    GFB_PROG, GFB_SMALL, GFB_RT, GFB_TEX, GFB_VB, GFB_BACKEND,
+    GFB_PROG, GFB_SMALL, GFB_RT, GFB_TEX, GFB_VB, GFB_BACKEND, GFB_DB,
 };
 
 /* texture unit u of a request: the CPU path's Tex, in VRAM */
@@ -1825,11 +2339,27 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         return false;
     }
     g->gst.offered++;
+    if (d->db || d->resolve || !d->color) {
+        g->gst.fallback[GFB_DB]++;
+        return false;
+    }
+    if (d->rt_bpe > 8) {
+        g->gst.fallback[GFB_RT]++;
+        return false;
+    }
     if (!d->lanes) {
         g->gst.fallback[GFB_PROG]++;
         return false;
     }
     ir = hd5770_prog_ir(d->ps);
+    if (d->prov_last) {
+        for (i = 0; i < ir->ninsts; i++) {
+            if (ir->insts[i].interp && ir->insts[i].flat) {
+                g->gst.fallback[GFB_PROG]++;
+                return false;
+            }
+        }
+    }
     q = g_new0(HD5770GpuDraw, 1);
     if (!gpu_surf(g, &d->rt, true, &q->rt)) {
         g->gst.fallback[GFB_RT]++;
@@ -1976,7 +2506,7 @@ static void lanes_setup(Draw *d)
     unsigned nconst, nres, i;
     bool grad;
 
-    if (!hd5770_prog_lanes(d->ps, &nconst, &grad)) {
+    if (d->resolve || !hd5770_prog_lanes(d->ps, &nconst, &grad)) {
         return;
     }
     hd5770_prog_resources(d->ps, ids, &nres, ARRAY_SIZE(ids));
@@ -2007,7 +2537,8 @@ static void lanes_setup(Draw *d)
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
 {
     HD5770GfxStats *st = g->st;
-    unsigned op = (b[0] >> 8) & 0xff, prim, i, nv, reason = HD5770_SKIP_MAX;
+    unsigned op = (b[0] >> 8) & 0xff, prim, i, nv, mode;
+    unsigned reason = HD5770_SKIP_MAX;
     uint32_t count, cctl;
     int64_t t0 = get_clock();
     Draw *d;
@@ -2029,21 +2560,19 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     count = b[1];
     prim = CFG(g, VGT_PRIMITIVE_TYPE) & 0x3f;
     cctl = CTX(g, CB_COLOR_CONTROL);
-    if (((cctl >> 4) & 7) != 1) {
-        reason = ((cctl >> 4) & 7) ? HD5770_SKIP_DISABLED
-                                   : HD5770_SKIP_NOCOLOR;
+    mode = (cctl >> 4) & 7;
+    if (mode != CB_DISABLE && mode != CB_NORMAL && mode != CB_RESOLVE) {
+        reason = HD5770_SKIP_DISABLED;
         goto out;
     }
     if (((cctl >> 16) & 0xff) != 0xcc) {
         st->gap_misc[HD5770_GAP_ROP]++;
     }
-    if (CTX(g, DB_DEPTH_CONTROL) & 3) {
-        st->gap_misc[HD5770_GAP_DEPTH]++;
-    }
     d->cliprule = CTX(g, PA_SC_CLIPRECT_RULE) & 0xffff;
     if (prim != PRIM_RECTLIST && prim != PRIM_QUADLIST &&
         prim != PRIM_TRILIST && prim != PRIM_TRISTRIP &&
-        prim != PRIM_TRIFAN) {
+        prim != PRIM_TRIFAN && prim != PRIM_QUADSTRIP &&
+        prim != PRIM_POLYGON) {
         st->gap_prim[prim]++;
         reason = HD5770_SKIP_PRIM;
         goto out;
@@ -2073,11 +2602,60 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         d->cr[i][2] = (br & 0x7fff) + wx;
         d->cr[i][3] = ((br >> 16) & 0x7fff) + wy;
     }
-    if (!rt_setup(d)) {
-        reason = HD5770_SKIP_RT;
+    db_setup(d);
+    if (mode == CB_RESOLVE) {
+        /* colour buffer 0 to colour buffer 1, one sample */
+        if (!rt_setup(d, 0)) {
+            reason = HD5770_SKIP_RT;
+            goto out;
+        }
+        d->rs = d->rt;
+        d->rs_fmt = d->rt_fmt;
+        d->rs_num = d->rt_num;
+        d->rs_swap = d->rt_swap;
+        d->rs_mtx = d->rs_mty = UINT32_MAX;
+        if (CTX(g, PA_SC_AA_CONFIG) & 7 || !rt_setup(d, 1)) {
+            reason = HD5770_SKIP_RT;
+            goto out;
+        }
+        d->resolve = true;
+        d->color = true;
+        d->db = false;
+        st->resolves++;
+    } else if (mode == CB_NORMAL && !(d->rctl & RC_COLOR_DISABLE)) {
+        d->color = rt_setup(d, 0);
+        if (!d->color && !d->db) {
+            reason = HD5770_SKIP_RT;
+            goto out;
+        }
+    }
+    if (!d->color && !d->db) {
+        reason = HD5770_SKIP_NOCOLOR;
         goto out;
     }
+    if (CTX(g, PA_SC_AA_CONFIG) & 7) {
+        st->gap_misc[HD5770_GAP_MSAA]++;
+    }
+    {
+        uint32_t sc = CTX(g, PA_SU_SC_MODE_CNTL);
+
+        d->cull = prim == PRIM_RECTLIST ? 0 : sc & 3;
+        d->face_cw = (sc >> 2) & 1;
+        d->prov_last = (sc >> 19) & 1;
+        if (sc & (7u << 11)) {
+            st->gap_misc[HD5770_GAP_POLY_OFFSET]++;
+        }
+        if (CTX(g, SPI_PS_IN_CONTROL_1) & (1u << 8)) {
+            st->gap_misc[HD5770_GAP_FACE]++;
+        }
+    }
     d->wmask = CTX(g, CB_TARGET_MASK) & CTX(g, CB_SHADER_MASK) & 0xf;
+    if (d->resolve) {
+        d->wmask = 0xf;
+    }
+    if (!d->wmask) {
+        d->color = false;
+    }
     d->blend = CTX(g, CB_BLEND0_CONTROL);
     memcpy(d->blend_const, &g->ctx[(CB_BLEND_RED - 0x28000) / 4],
            sizeof(d->blend_const));
@@ -2085,7 +2663,11 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     d->alpha_func = CTX(g, SX_ALPHA_TEST_CONTROL) & 7;
     memcpy(&d->alpha_ref, &g->ctx[(SX_ALPHA_REF - 0x28000) / 4], 4);
     d->pix_center = (CTX(g, PA_SU_VTX_CNTL) & 1) ? 0.5f : 0.0f;
-    if (d->x0 >= d->x1 || d->y0 >= d->y1 || !d->wmask) {
+    if (d->resolve) {
+        d->blend = 0;
+        d->alpha_test = false;
+    }
+    if (d->x0 >= d->x1 || d->y0 >= d->y1 || (!d->color && !d->db)) {
         reason = HD5770_SKIP_MAX;
         st->drawn++;
         goto out;
@@ -2152,18 +2734,38 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     taken = gpu_draw(d, vb, nv, prim, t);
     gpu_lock(g, false);
     if (!taken) {
-        uint64_t off;
+        const HD5770Surf *ws[3] = { d->color ? &d->rt : NULL,
+                                    d->db && d->zfmt ? &d->zs : NULL,
+                                    d->db && d->has_s ? &d->ss : NULL };
 
-        /* the CPU writes the target: after queued draws that touch it */
-        if (vram_off(g, d->rt.base, hd5770_surf_size(&d->rt), &off)) {
-            hd5770_gfx_touch(g, off, hd5770_surf_size(&d->rt));
-        } else if (g->ram_pend) {
-            hd5770_gfx_sync(g);
+        /* the CPU writes the targets: after queued draws that touch them */
+        for (i = 0; i < 3; i++) {
+            uint64_t off;
+
+            if (!ws[i]) {
+                continue;
+            }
+            if (vram_off(g, ws[i]->base, hd5770_surf_size(ws[i]), &off)) {
+                hd5770_gfx_touch(g, off, hd5770_surf_size(ws[i]));
+            } else if (g->ram_pend) {
+                hd5770_gfx_sync(g);
+            }
         }
+        if (d->resolve) {
+            pend_check(g, d->rs.base, hd5770_surf_size(&d->rs));
+        }
+        d->wy0 = INT_MAX;
+        d->wy1 = -1;
         assemble(d, vb, nv, prim, t, raster_tri);
-        if (d->ok && d->g->mem.dirty) {
-            d->g->mem.dirty(d->g->mem.opaque, d->rt.base,
-                            hd5770_surf_size(&d->rt));
+        for (i = 0; i < 3 && d->ok && d->g->mem.dirty && d->wy1 >= d->wy0;
+             i++) {
+            uint64_t lo, hi;
+
+            if (ws[i]) {
+                /* the rows drawn */
+                hd5770_surf_rows(ws[i], d->wy0, d->wy1 + 1, &lo, &hi);
+                d->g->mem.dirty(d->g->mem.opaque, lo, hi - lo);
+            }
         }
     }
     if (d->ok) {
@@ -2226,10 +2828,12 @@ static const char *const skip_names[HD5770_SKIP_MAX] = {
 };
 
 static const char *const misc_names[HD5770_GAP_MISC_MAX] = {
-    "depth/stencil on", "more render targets", "clip rects",
+    "depth/stencil copy to colour", "more render targets", "clip rects",
     "ROP/endian/CB metadata", "blend function", "kcache mode",
     "vertex count", "relative index mode", "texture dimension",
     "predicated ALU", "program layout (clause range, ALU slots)",
+    "multisampling", "vertices with w <= 0", "mipmaps (base level drawn)",
+    "front face input", "polygon offset",
 };
 
 static void gap_list(GString *out, const char *name, const uint64_t *v,
@@ -2289,10 +2893,13 @@ void hd5770_gfx_stats(HD5770Gfx *g, GString *out)
         "3D: draws %" PRIu64 " drawn %" PRIu64 " skipped %" PRIu64
         " prims %" PRIu64 " verts %" PRIu64 " pixels %" PRIu64 "\n"
         "3D: blended %" PRIu64 " tex fetches %" PRIu64 " vtx fetches %" PRIu64
-        " kills %" PRIu64 " ms in draws %" PRIu64 "\n",
+        " kills %" PRIu64 " ms in draws %" PRIu64 "\n"
+        "3D: culled %" PRIu64 " depth/stencil tests %" PRIu64 " failed %"
+        PRIu64 " resolves %" PRIu64 "\n",
         st->draws, st->drawn, st->skipped, st->prims, st->verts, st->pixels,
         st->blend_on, st->tex_fetch, st->vtx_fetch, st->kills,
-        st->ns / 1000000);
+        st->ns / 1000000, st->culled, st->db_tests, st->db_fails,
+        st->resolves);
     g_string_append(out, "colour formats drawn:");
     for (i = 0; i < 64; i++) {
         if (st->rt_fmt[i]) {
@@ -2333,14 +2940,15 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
     g_string_append_printf(out,
         "gpu: %s offered %" PRIu64 " taken %" PRIu64 " fallback: program %"
         PRIu64 " small %" PRIu64 " target %" PRIu64 " texture %" PRIu64
-        " vertex buffer %" PRIu64 " backend %" PRIu64 "\n"
+        " vertex buffer %" PRIu64 " backend %" PRIu64 " depth/resolve %"
+        PRIu64 "\n"
         "gpu: syncs %" PRIu64 " (on access %" PRIu64 ") verified %" PRIu64
         " differing draws %" PRIu64 " bytes %" PRIu64 " (>1: %" PRIu64
         ") max %" PRIu64 "\n",
         g->gpu_mode == HD5770_GPU_VERIFY ? "verify" : "on", t->offered,
         t->taken, t->fallback[GFB_PROG], t->fallback[GFB_SMALL],
         t->fallback[GFB_RT], t->fallback[GFB_TEX], t->fallback[GFB_VB],
-        t->fallback[GFB_BACKEND], t->syncs, t->touch_syncs, t->verified,
+        t->fallback[GFB_BACKEND], t->fallback[GFB_DB], t->syncs, t->touch_syncs, t->verified,
         t->vdiff_draws, t->vdiff_bytes, t->vdiff_big, t->vmax);
     g->gpu->ops->stats(g->gpu->b, out);
 }

@@ -1276,6 +1276,7 @@ static void run_export(Run *r, const CfInst *cf)
                 r->t->color_mask |= 1u << (base + i);
             } else if (type == 0 && base + i == 61) {
                 r->t->depth = v[0];
+                r->t->stencil = v[1];
                 r->t->depth_written = true;
             }
         } else if (type == 1) {
@@ -1873,6 +1874,10 @@ static LaneProg *lane_compile(const HD5770Prog *p)
             unsigned gpr = (cf->w0 >> 15) & 0x7f;
             HD5770IRExport *e;
 
+            /* the DB export (depth, stencil reference) is not modelled */
+            if (type == 0 && base == 61) {
+                goto fail;
+            }
             /* colour 0 is the burst's first register when base is 0 */
             if (type != 0 || base != 0) {
                 break;

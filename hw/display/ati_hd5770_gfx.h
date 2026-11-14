@@ -161,9 +161,10 @@ typedef struct HD5770GfxStats {
     uint64_t skip_reason[16];
     uint64_t gap_alu_op2[256], gap_alu_op3[32], gap_cf[256];
     uint64_t gap_tex[32], gap_vtx[32], gap_fmt[64], gap_tex_fmt[64];
-    uint64_t gap_vtx_fmt[64], gap_mode[16], gap_prim[64], gap_misc[16];
+    uint64_t gap_vtx_fmt[64], gap_mode[16], gap_prim[64], gap_misc[32];
     uint64_t gap_export[8], gap_src_sel;
     uint64_t blend_on, tex_fetch, vtx_fetch, kills;
+    uint64_t culled, db_tests, db_fails, resolves;
     uint64_t rt_fmt[64];
     uint64_t ns;                /* host time in draws */
     HD5770ShaderInfo sh[HD5770_SHADER_SLOTS];
@@ -181,7 +182,9 @@ enum {
     HD5770_GAP_DEPTH, HD5770_GAP_MRT, HD5770_GAP_SCISSOR_RECTS,
     HD5770_GAP_ROP, HD5770_GAP_BLEND_FUNC, HD5770_GAP_KCACHE,
     HD5770_GAP_LOOP, HD5770_GAP_REL, HD5770_GAP_TEX_DIM,
-    HD5770_GAP_PRED, HD5770_GAP_DECODE, HD5770_GAP_MISC_MAX,
+    HD5770_GAP_PRED, HD5770_GAP_DECODE, HD5770_GAP_MSAA, HD5770_GAP_CLIP,
+    HD5770_GAP_MIP, HD5770_GAP_FACE, HD5770_GAP_POLY_OFFSET,
+    HD5770_GAP_MISC_MAX,
 };
 
 /* ---------------------------------------------------------------- */
