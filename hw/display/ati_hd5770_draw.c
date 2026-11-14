@@ -1704,7 +1704,8 @@ static bool db_test(Draw *d, int x, int y, float z, int sref)
         }
         *sp = (sold & ~wm) | (snew & wm);
     }
-    if (zp && zpass && spass && (dctl & DC_Z_WRITE)) {
+    /* Z_WRITE_ENABLE writes only with Z_ENABLE */
+    if (zp && zpass && spass && (dctl & DC_Z) && (dctl & DC_Z_WRITE)) {
         if (d->zfmt == 1) {
             stw_le_p(zp, znew);
         } else if (d->zfmt == 2) {

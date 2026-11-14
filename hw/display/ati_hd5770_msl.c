@@ -942,7 +942,7 @@ const char hd5770_msl_lib[] =
 "        }\n"
 "        *sp = (uchar)((sold & ~wm) | (snew & wm));\n"
 "    }\n"
-"    if (zp && zpass && spass && (dctl & 4)) {\n"
+"    if (zp && zpass && spass && (dctl & 6) == 6) {\n"
 "        if (u.zfmt == 1) {\n"
 "            *(device ushort *)zp = (ushort)znew;\n"
 "        } else if (u.zfmt == 2) {\n"

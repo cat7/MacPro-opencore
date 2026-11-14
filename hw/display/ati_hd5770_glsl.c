@@ -1337,7 +1337,7 @@ const char hd5770_glsl_lib[] =
 "        }\n"
 "        hd_store_sub(soff, 1u, (sold & ~wm) | (snew & wm));\n"
 "    }\n"
-"    if (zfmt != 0u && zpass && spass && (dctl & 4u) != 0u) {\n"
+"    if (zfmt != 0u && zpass && spass && (dctl & 6u) == 6u) {\n"
 "        if (zfmt == 1u) {\n"
 "            hd_store_sub(zoff, 2u, znew);\n"
 "        } else if (zfmt == 2u) {\n"
