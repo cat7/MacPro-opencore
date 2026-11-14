@@ -2531,6 +2531,13 @@ static void gpu_req_free(HD5770GpuDraw *q)
 }
 
 /*
+ * Draws with depth or stencil cover at least this many pixels to go to
+ * the host GPU: smaller ones (pieces of a model, a few hundred pixels
+ * each) cost more in round trips and barriers than on the CPU.
+ */
+#define HD5770_DB_MIN_PIXELS    16384
+
+/*
  * Rows y0..y1 of the draw's target, depth or stencil plane are in VRAM
  * ranges queued draws use: drawing them on the CPU would wait for the GPU.
  */
@@ -2694,8 +2701,9 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         area += (uint64_t)(q->tri[i].x1 - q->tri[i].x0 + 1) *
                 (q->tri[i].y1 - q->tri[i].y0 + 1);
     }
-    if (area < g->gpu->ops->min_pixels && g->gpu_mode == HD5770_GPU_ON &&
-        !gpu_queued(g, d, y0, y1)) {
+    if (g->gpu_mode == HD5770_GPU_ON &&
+        (d->db ? area < HD5770_DB_MIN_PIXELS
+               : area < g->gpu->ops->min_pixels && !gpu_queued(g, d, y0, y1))) {
         g->gst.fallback[GFB_SMALL]++;
         goto out;
     }
