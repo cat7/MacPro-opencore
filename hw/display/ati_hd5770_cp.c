@@ -410,6 +410,22 @@ static int cp_dma(ATIHD5770State *s, const uint32_t *b)
     return 0;
 }
 
+/*
+ * The host GPU wait at a packet boundary. On the engine thread it runs
+ * with the BQL released, as a draw does, so the main loop and the vCPUs
+ * are not held for the GPU's execution time.
+ */
+static void cp_gfx_sync(ATIHD5770State *s)
+{
+    if (s->eng_on && qemu_thread_is_self(&s->eng_thread) && bql_locked()) {
+        bql_unlock();
+        hd5770_gfx_sync(&s->gfx3d);
+        bql_lock();
+    } else {
+        hd5770_gfx_sync(&s->gfx3d);
+    }
+}
+
 static void gap(ATIHD5770State *s, unsigned op)
 {
     s->cp.gap_op[op & 0xff]++;
@@ -445,7 +461,7 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
     }
     if (op_signals(op)) {
         /* what the guest may learn from it follows the draws before it */
-        hd5770_gfx_sync(&s->gfx3d);
+        cp_gfx_sync(s);
     }
     switch (op) {
     case OP_INDIRECT_BUFFER:
