@@ -327,6 +327,8 @@ void ati_hd5770_mc_fetch(ATIHD5770State *s, uint64_t mc, void *buf,
                          unsigned len);
 void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
                          unsigned len);
+void ati_hd5770_mc_post(ATIHD5770State *s, uint64_t mc, const void *buf,
+                        unsigned len);
 uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
 void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);

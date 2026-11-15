@@ -114,8 +114,8 @@ void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data)
     stl_le_p(v + 4, src_data & 0xfffffff);
     stl_le_p(v + 8, 0);
     stl_le_p(v + 12, 0);
-    ati_hd5770_mc_write(s, ((uint64_t)s->regs[EG_IH_RB_BASE >> 2] << 8) + wptr,
-                        v, 16);
+    ati_hd5770_mc_post(s, ((uint64_t)s->regs[EG_IH_RB_BASE >> 2] << 8) + wptr,
+                       v, 16);
     s->regs[EG_IH_RB_WPTR >> 2] = next |
         (s->regs[EG_IH_RB_WPTR >> 2] & EG_IH_RB_WPTR_OVERFLOW);
     if (cntl & EG_IH_WPTR_WRITEBACK_ENABLE) {
@@ -124,7 +124,7 @@ void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data)
                       << 32) | (s->regs[EG_IH_RB_WPTR_ADDR_LO >> 2] & ~3u);
 
         stl_le_p(w, s->regs[EG_IH_RB_WPTR >> 2]);
-        ati_hd5770_mc_write(s, a, w, 4);
+        ati_hd5770_mc_post(s, a, w, 4);
     }
     trace_ati_hd5770_ih_push(src_id, src_data, wptr);
     if (msi_enabled(PCI_DEVICE(s)) && s->ih_level) {
