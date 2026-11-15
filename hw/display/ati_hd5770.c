@@ -481,6 +481,97 @@ void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     reg_write(s, off, val);
 }
 
+/*
+ * REGISTER ACCESS. With the command processor thread the register BARs
+ * are dispatched without the BQL, and an access takes what its register
+ * needs:
+ * - GRBM_STATUS, CP_STAT and CP_RB_RPTR, the engine's progress, are read
+ *   with no lock;
+ * - the other engine registers (ati_hd5770_engine_reg(): config, GRBM,
+ *   CP, scratch and RLC blocks) take reg_lock. The command processor
+ *   holds it while it runs packets and drops it for the length of a draw,
+ *   of a wait for the host GPU and of anything that needs the BQL, so an
+ *   access waits at most for the register work of one packet, never for
+ *   a draw;
+ * - everything else -- display, interrupts, memory controller, HDP, DMA
+ *   engine, SMC, clocks, PCIe -- takes the BQL, as before.
+ * Without the thread the BARs keep the BQL and reg_lock is taken inside
+ * it. LOCK ORDER: BQL -> reg_lock -> eng_lock; the command processor
+ * releases reg_lock before it takes the BQL.
+ */
+static bool status_reg(ATIHD5770State *s, uint32_t off)
+{
+    return s->accel && (off == EG_GRBM_STATUS || off == EG_CP_STAT ||
+                        off == EG_CP_RB_RPTR);
+}
+
+static uint32_t reg_read_locked(ATIHD5770State *s, uint32_t off)
+{
+    uint32_t val;
+    bool lock;
+
+    off &= ATI_HD5770_MMIO_SIZE - 4;
+    if (status_reg(s, off)) {
+        return reg_read(s, off);
+    }
+    if (ati_hd5770_engine_reg(off)) {
+        lock = !ati_hd5770_reg_held();
+        if (lock) {
+            ati_hd5770_reg_lock(s);
+        }
+        val = reg_read(s, off);
+        if (lock) {
+            ati_hd5770_reg_unlock(s);
+        }
+        return val;
+    }
+    lock = !bql_locked();
+    if (lock) {
+        bql_lock();
+    }
+    val = reg_read(s, off);
+    if (lock) {
+        bql_unlock();
+    }
+    return val;
+}
+
+/* a write of size bytes at byte shift of register off */
+static void reg_write_locked(ATIHD5770State *s, uint32_t off, uint32_t data,
+                             unsigned shift, unsigned size, bool merge)
+{
+    bool engine, lock;
+
+    off &= ATI_HD5770_MMIO_SIZE - 4;
+    engine = ati_hd5770_engine_reg(off);
+    lock = engine ? !ati_hd5770_reg_held() : !bql_locked();
+    if (lock) {
+        if (engine) {
+            ati_hd5770_reg_lock(s);
+        } else {
+            bql_lock();
+        }
+    }
+    if (size < 4) {
+        data = deposit32(merge ? s->regs[off >> 2] : 0, shift * 8, size * 8,
+                         data);
+    }
+    reg_write(s, off, data);
+    if (lock) {
+        if (engine) {
+            ati_hd5770_reg_unlock(s);
+        } else {
+            bql_unlock();
+        }
+    }
+}
+
+void ati_hd5770_reg_write_locked(ATIHD5770State *s, uint32_t off,
+                                 uint32_t val)
+{
+    reg_write_locked(s, off, val, 0, 4, true);
+}
+
 /* MM_INDEX / MM_DATA reach the whole register file through 0x00/0x04 */
 static uint64_t ati_hd5770_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -488,11 +579,12 @@ static uint64_t ati_hd5770_mmio_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t base = addr & ~3u, val;
 
     if (base == EG_MM_DATA) {
-        uint32_t idx = s->regs[EG_MM_INDEX >> 2] & 0x7fffffff;
+        uint32_t idx = qatomic_read(&s->regs[EG_MM_INDEX >> 2]) & 0x7fffffff;
 
-        val = idx >= 8 && idx < ATI_HD5770_MMIO_SIZE ? reg_read(s, idx) : 0;
+        val = idx >= 8 && idx < ATI_HD5770_MMIO_SIZE ?
+              reg_read_locked(s, idx) : 0;
     } else {
-        val = reg_read(s, base);
+        val = reg_read_locked(s, base);
     }
     return extract64(val, (addr & 3) * 8, size * 8);
 }
@@ -501,22 +593,17 @@ static void ati_hd5770_mmio_write(void *opaque, hwaddr addr, uint64_t data,
                                   unsigned size)
 {
     ATIHD5770State *s = opaque;
-    uint32_t base = addr & ~3u, val = data;
+    uint32_t base = addr & ~3u;
 
-    if (size < 4) {
-        uint32_t old = base == EG_MM_DATA ? 0 : s->regs[base >> 2];
-
-        val = deposit32(old, (addr & 3) * 8, size * 8, data);
-    }
     if (base == EG_MM_DATA) {
-        uint32_t idx = s->regs[EG_MM_INDEX >> 2] & 0x7fffffff;
+        uint32_t idx = qatomic_read(&s->regs[EG_MM_INDEX >> 2]) & 0x7fffffff;
 
         if (idx >= 8 && idx < ATI_HD5770_MMIO_SIZE) {
-            reg_write(s, idx, val);
+            reg_write_locked(s, idx, data, addr & 3, size, false);
         }
         return;
     }
-    reg_write(s, base, val);
+    reg_write_locked(s, base, data, addr & 3, size, true);
 }
 
 static const MemoryRegionOps ati_hd5770_mmio_ops = {
@@ -861,7 +948,11 @@ static void ati_hd5770_reset_hold(Object *obj, ResetType type)
     ATIHD5770State *s = ATI_HD5770(obj);
     uint64_t top = s->vram_size - 1;
 
+    /* the engine first: it stops at a packet boundary, idle */
+    ati_hd5770_cp_reset(s);
+    ati_hd5770_reg_lock(s);
     memset(s->regs, 0, sizeof(s->regs));
+    ati_hd5770_reg_unlock(s);
     memset(s->pcie_ind, 0, sizeof(s->pcie_ind));
     memset(s->pcie_port, 0, sizeof(s->pcie_port));
     memset(s->cg_ind, 0, sizeof(s->cg_ind));
@@ -876,7 +967,6 @@ static void ati_hd5770_reset_hold(Object *obj, ResetType type)
     }
     s->hw_cursor_sum = 0;
     s->ih_level = false;
-    ati_hd5770_cp_reset(s);
     ati_hd5770_dce4_reset(s);
     ati_hd5770_hdp_update(s);
     ati_hd5770_update_irq(s);
@@ -959,6 +1049,11 @@ static void ati_hd5770_realize(PCIDevice *dev, Error **errp)
     s->cursor_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    ati_hd5770_cursor_timer, s);
     ati_hd5770_cp_init(s);
+    if (s->eng_on) {
+        /* REGISTER ACCESS above */
+        memory_region_enable_lockless_io(&s->mmio);
+        memory_region_enable_lockless_io(&s->io);
+    }
     ati_hd5770_dce4_init(s);
     ati_hd5770_disp_init(s);
 }

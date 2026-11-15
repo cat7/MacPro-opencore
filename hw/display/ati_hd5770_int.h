@@ -15,7 +15,9 @@
  * (ati_hd5770_draw.c, _sh.c, _surf.c) into VRAM and system memory; the
  * display path detiles a tiled scanout surface.
  *
- * Everything runs on the BQL.
+ * With the command processor thread the register BARs are dispatched
+ * without the BQL (REGISTER ACCESS in ati_hd5770.c); the rest runs on
+ * the BQL.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -96,6 +98,8 @@ typedef struct HD5770CPStats {
     uint64_t draws, resets, ucode_pfp, ucode_me, ucode_rlc, skipped;
     uint64_t type0_regs, set_regs, load_regs, shadow_writes;
     uint64_t bad_header;
+    uint64_t bql_regs;          /* stream register accesses that took the BQL */
+    uint32_t bql_reg_last;
 } HD5770CPStats;
 
 typedef struct HD5770DMAStats {
@@ -263,10 +267,16 @@ struct ATIHD5770State {
     QEMUTimer *cp_timer;        /* re-polls stalled waits */
     /*
      * Command processor thread: see ENGINE THREAD in ati_hd5770_cp.c.
-     * eng_kick, eng_busy, eng_quit under eng_lock; eng_hold under the BQL.
+     * eng_kick, eng_busy, eng_quit under eng_lock; eng_hold set under the
+     * BQL, read by the thread at packet boundaries.
      */
     bool cp_thread;             /* property */
     bool eng_on;
+    /*
+     * The engine registers (ati_hd5770_engine_reg()) and the command
+     * processor's state; see REGISTER ACCESS in ati_hd5770.c.
+     */
+    QemuMutex reg_lock;
     QemuThread eng_thread;
     QemuMutex eng_lock;
     QemuCond eng_cond, eng_idle_cond;
@@ -303,6 +313,9 @@ struct ATIHD5770State {
 void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data);
 uint32_t ati_hd5770_reg_read(ATIHD5770State *s, uint32_t off);
 void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+/* with the lock the register needs (REGISTER ACCESS in ati_hd5770.c) */
+void ati_hd5770_reg_write_locked(ATIHD5770State *s, uint32_t off,
+                                 uint32_t val);
 void ati_hd5770_update_irq(ATIHD5770State *s);
 bool ati_hd5770_mc_to_vram(ATIHD5770State *s, uint64_t mc, uint64_t *off);
 void ati_hd5770_cursor_update(ATIHD5770State *s);
@@ -346,6 +359,10 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
 void ati_hd5770_cp_drain(ATIHD5770State *s);
+bool ati_hd5770_engine_reg(uint32_t off);
+void ati_hd5770_reg_lock(ATIHD5770State *s);
+void ati_hd5770_reg_unlock(ATIHD5770State *s);
+bool ati_hd5770_reg_held(void);
 void ati_hd5770_gpu_sync(ATIHD5770State *s);
 void ati_hd5770_cp_gaps(ATIHD5770State *s, GString *out);
 void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out);

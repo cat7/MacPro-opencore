@@ -114,11 +114,16 @@ static void mc_resolve(ATIHD5770State *s, uint64_t mc, MCSpan *sp)
     sp->len = 0x1000 - (mc & 0xfff);
 }
 
+/*
+ * An access after the queued draws that may touch its bytes waits for the
+ * host GPU (ati_hd5770_gpu_sync(): without reg_lock, and on the engine
+ * thread or a vCPU without the BQL). MC_POST does not wait: the interrupt
+ * ring, which no draw uses.
+ */
 enum {
-    MC_SYNC,        /* after the queued draws */
-    MC_FETCH,       /* a read nothing holds state across: a wait for the
-                       host GPU may release the BQL (ati_hd5770_gpu_sync) */
-    MC_POST,        /* the interrupt ring: no wait for draws in guest RAM */
+    MC_SYNC,
+    MC_FETCH,
+    MC_POST,
 };
 
 static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
@@ -145,11 +150,10 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
                 memset(p, 0, n);
             }
         } else if (sp.vram) {
-            if (mode == MC_FETCH &&
+            if (mode != MC_POST &&
                 hd5770_gfx_pending(&s->gfx3d, sp.addr, n)) {
                 ati_hd5770_gpu_sync(s);
             }
-            hd5770_gfx_touch(&s->gfx3d, sp.addr, n);
             if (write) {
                 memcpy(vram_ptr(s) + sp.addr, p, n);
                 memory_region_set_dirty(&s->vram, sp.addr, n);
@@ -159,11 +163,7 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
         } else {
             if (s->gfx3d.ram_pend && mode != MC_POST) {
                 /* queued draws write guest RAM */
-                if (mode == MC_FETCH) {
-                    ati_hd5770_gpu_sync(s);
-                } else {
-                    hd5770_gfx_sync(&s->gfx3d);
-                }
+                ati_hd5770_gpu_sync(s);
             }
             if (write) {
                 pci_dma_write(PCI_DEVICE(s), sp.addr, p, n);
@@ -368,6 +368,22 @@ static uint64_t hdp_byte(ATIHD5770State *s, uint64_t addr)
            o % sf->bpe;
 }
 
+/*
+ * Before a CPU access through a window: the engine idle and the host GPU
+ * done with the window's surface (both waits without the BQL).
+ */
+static void hdp_settle(ATIHD5770State *s, uint64_t addr)
+{
+    unsigned n;
+
+    ati_hd5770_cp_drain(s);
+    if (hdp_find(s, addr, &n) &&
+        hd5770_gfx_pending(&s->gfx3d, s->hdp_lo[n],
+                           s->hdp_hi[n] - s->hdp_lo[n])) {
+        ati_hd5770_gpu_sync(s);
+    }
+}
+
 static uint64_t hdp_read(void *opaque, hwaddr addr, unsigned size)
 {
     ATIHD5770State *s = opaque;
@@ -376,12 +392,11 @@ static uint64_t hdp_read(void *opaque, hwaddr addr, unsigned size)
     unsigned i;
 
     s->hdp_accesses++;
-    ati_hd5770_cp_drain(s);
+    hdp_settle(s, addr);
     for (i = 0; i < size; i++) {
         uint64_t a = hdp_byte(s, addr + i);
 
         if (a < s->vram_size) {
-            hd5770_gfx_touch(&s->gfx3d, a, 1);
             val |= (uint64_t)v[a] << (8 * i);
         }
     }
@@ -395,12 +410,11 @@ static void hdp_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     unsigned i;
 
     s->hdp_accesses++;
-    ati_hd5770_cp_drain(s);
+    hdp_settle(s, addr);
     for (i = 0; i < size; i++) {
         uint64_t a = hdp_byte(s, addr + i);
 
         if (a < s->vram_size) {
-            hd5770_gfx_touch(&s->gfx3d, a, 1);
             v[a] = val >> (8 * i);
             memory_region_set_dirty(&s->vram, a, 1);
         }

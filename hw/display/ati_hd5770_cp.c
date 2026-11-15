@@ -5,10 +5,10 @@
  * the CP is modelled at packet level. A CP_RB_WPTR write runs the ring
  * from the read pointer to the write pointer (on the command processor
  * thread, see ENGINE THREAD below, or with cp-thread=off on the calling
- * thread), with the BQL: type-0 packets and SET_CONFIG_REG write registers, the other
- * SET_* packets fill the register file at 0x28000-0x3ffff (and its
- * shadow in memory when CONTEXT_CONTROL enables it), LOAD_* fill it from
- * memory, indirect buffers nest two deep. Fences, timestamps, memory
+ * thread), with reg_lock: type-0 packets and SET_CONFIG_REG write
+ * registers, the other SET_* packets fill the register file at
+ * 0x28000-0x3ffff (and its shadow in memory when CONTEXT_CONTROL enables
+ * it), LOAD_* fill it from memory, indirect buffers nest two deep. Fences, timestamps, memory
  * writes and semaphores complete at once; EVENT_WRITE_EOP raises IH
  * source 181 when CP_INT_CNTL enables time stamp interrupts. A
  * WAIT_REG_MEM or a semaphore wait whose condition is false stalls the
@@ -32,6 +32,7 @@
 #include "qemu/error-report.h"
 #include "system/ramblock.h"
 #include "hw/pci/pci_device.h"
+#include "hw/core/cpu.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_gpu.h"
 #include "ati_hd5770_regs.h"
@@ -190,6 +191,58 @@ static uint64_t addr40(uint32_t lo, uint32_t hi, uint32_t align_mask)
 /* ---------------------------------------------------------------- */
 /* Register file                                                    */
 
+/* this thread holds reg_lock; one device per thread at a time */
+static __thread bool reg_held;
+
+void ati_hd5770_reg_lock(ATIHD5770State *s)
+{
+    qemu_mutex_lock(&s->reg_lock);
+    reg_held = true;
+}
+
+void ati_hd5770_reg_unlock(ATIHD5770State *s)
+{
+    reg_held = false;
+    qemu_mutex_unlock(&s->reg_lock);
+}
+
+bool ati_hd5770_reg_held(void)
+{
+    return reg_held;
+}
+
+/* the registers of the engines, under reg_lock: config, GRBM, CP, RLC */
+bool ati_hd5770_engine_reg(uint32_t off)
+{
+    return (off >= EG_CONFIG_REG_FIRST && off < EG_CONFIG_REG_END) ||
+           (off >= 0xc100 && off < 0xc200) ||
+           (off >= EG_RLC_FIRST && off <= EG_RLC_LAST);
+}
+
+/*
+ * The BQL for the command processor: reg_lock is released first (LOCK
+ * ORDER in ati_hd5770.c) and taken back after. Returns whether the BQL
+ * was taken here.
+ */
+static bool cp_bql_enter(ATIHD5770State *s)
+{
+    if (bql_locked()) {
+        return false;
+    }
+    assert(reg_held);
+    ati_hd5770_reg_unlock(s);
+    bql_lock();
+    return true;
+}
+
+static void cp_bql_leave(ATIHD5770State *s, bool taken)
+{
+    if (taken) {
+        bql_unlock();
+        ati_hd5770_reg_lock(s);
+    }
+}
+
 static void gfx_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 {
     uint32_t i = (off - EG_GFX_FIRST) >> 2;
@@ -211,7 +264,16 @@ static void gfx_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 static void cp_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 {
     if (off < ATI_HD5770_MMIO_SIZE) {
-        ati_hd5770_reg_write(s, off, val);
+        if (ati_hd5770_engine_reg(off)) {
+            ati_hd5770_reg_write(s, off, val);
+        } else {
+            bool bql = cp_bql_enter(s);
+
+            ati_hd5770_reg_write(s, off, val);
+            s->cp.bql_regs += bql;
+            s->cp.bql_reg_last = off;
+            cp_bql_leave(s, bql);
+        }
     } else if (off >= EG_GFX_FIRST && off < EG_GFX_END) {
         gfx_write(s, off, val);
     }
@@ -220,7 +282,18 @@ static void cp_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 static uint32_t cp_reg_read(ATIHD5770State *s, uint32_t off)
 {
     if (off < ATI_HD5770_MMIO_SIZE) {
-        return ati_hd5770_reg_read(s, off);
+        uint32_t v;
+        bool bql;
+
+        if (ati_hd5770_engine_reg(off)) {
+            return ati_hd5770_reg_read(s, off);
+        }
+        bql = cp_bql_enter(s);
+        v = ati_hd5770_reg_read(s, off);
+        s->cp.bql_regs += bql;
+        s->cp.bql_reg_last = off;
+        cp_bql_leave(s, bql);
+        return v;
     } else if (off >= EG_GFX_FIRST && off < EG_GFX_END) {
         return s->gfx[(off - EG_GFX_FIRST) >> 2];
     }
@@ -229,7 +302,6 @@ static uint32_t cp_reg_read(ATIHD5770State *s, uint32_t off)
 
 static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
 {
-    hd5770_gfx_sync(&s->gfx3d);
     if (s->regs[EG_SCRATCH_UMSK >> 2] & (1u << n)) {
         ati_hd5770_mc_wr32(s, ((uint64_t)s->regs[EG_SCRATCH_ADDR >> 2] << 8) +
                            4 * n, val);
@@ -242,10 +314,13 @@ static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
 
 static void cp_irq(ATIHD5770State *s, uint32_t stat, uint32_t src)
 {
-    hd5770_gfx_sync(&s->gfx3d);
+    ati_hd5770_gpu_sync(s);
     s->regs[EG_CP_INT_STATUS >> 2] |= stat;
     if (s->regs[EG_CP_INT_CNTL >> 2] & stat) {
+        bool bql = cp_bql_enter(s);
+
         ati_hd5770_ih_push(s, src, 0);
+        cp_bql_leave(s, bql);
     }
 }
 
@@ -411,19 +486,30 @@ static int cp_dma(ATIHD5770State *s, const uint32_t *b)
 }
 
 /*
- * The host GPU wait at a packet boundary, at a fetch and when the engine
- * goes idle. On the engine thread it runs with the BQL released, as a
- * draw does, so the main loop and the vCPUs are not held for the GPU's
- * execution time.
+ * A wait for the host GPU: at a packet boundary, a memory access, when the
+ * engine goes idle. It runs without reg_lock, and on the engine thread or
+ * a vCPU without the BQL, as a draw does: the vCPUs and the main loop are
+ * not held for the GPU's execution time.
  */
 void ati_hd5770_gpu_sync(ATIHD5770State *s)
 {
-    if (s->eng_on && qemu_thread_is_self(&s->eng_thread) && bql_locked()) {
+    bool reg = reg_held;
+    bool bql = bql_locked() &&
+               ((s->eng_on && qemu_thread_is_self(&s->eng_thread)) ||
+                current_cpu);
+
+    if (reg) {
+        ati_hd5770_reg_unlock(s);
+    }
+    if (bql) {
         bql_unlock();
-        hd5770_gfx_sync(&s->gfx3d);
+    }
+    hd5770_gfx_sync(&s->gfx3d);
+    if (bql) {
         bql_lock();
-    } else {
-        hd5770_gfx_sync(&s->gfx3d);
+    }
+    if (reg) {
+        ati_hd5770_reg_lock(s);
     }
 }
 
@@ -449,10 +535,10 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         if (s->eng_on) {
             int64_t t0 = get_clock();
 
-            /* the vCPUs and the main loop go on meanwhile */
-            bql_unlock();
+            /* register accesses go on meanwhile */
+            ati_hd5770_reg_unlock(s);
             hd5770_gfx_draw(&s->gfx3d, b, n);
-            bql_lock();
+            ati_hd5770_reg_lock(s);
             s->eng_draw_ns += get_clock() - t0;
         } else {
             hd5770_gfx_draw(&s->gfx3d, b, n);
@@ -766,7 +852,7 @@ static void cp_run(ATIHD5770State *s)
         uint32_t avail, h, n, skip = 0;
         int r;
 
-        if (s->eng_hold) {
+        if (qatomic_read(&s->eng_hold)) {
             /* stopped between two packets; a kick resumes */
             break;
         }
@@ -833,20 +919,22 @@ static void cp_run(ATIHD5770State *s)
 /*
  * ENGINE THREAD (cp-thread=on). The ring runs on a thread of its own: a
  * kick (CP_RB_WPTR, ME_CNTL, the poll of a stalled wait) only wakes it.
- * The thread takes the BQL to run the ring and drops it for the length
- * of each draw, so packets and their side effects -- registers, memory
- * writes, fences, interrupts -- happen in ring order with the BQL held,
- * and a fence written after a draw is written once the draw is in
- * memory. GRBM_STATUS and CP_STAT read busy until the thread has run out
+ * The thread runs the ring with reg_lock, not the BQL, and drops it for
+ * the length of each draw and of each wait for the host GPU, so packets
+ * and their side effects -- registers, memory writes, fences, interrupts
+ * -- happen in ring order, and a fence written after a draw is written
+ * once the draw is in memory. A register the BQL owns (REGISTER ACCESS
+ * in ati_hd5770.c) and an interrupt take the BQL, reg_lock released
+ * first. GRBM_STATUS and CP_STAT read busy until the thread has run out
  * of work.
  *
- * eng_hold (BQL) stops the ring at the next packet boundary: set while
- * the VM is stopped and for a reset, it leaves read pointer and indirect
- * buffer state consistent for migration. cp_wait_idle() waits for the
- * thread with the BQL released.
+ * eng_hold (set under the BQL) stops the ring at the next packet
+ * boundary: set while the VM is stopped and for a reset, it leaves read
+ * pointer and indirect buffer state consistent for migration.
+ * cp_wait_idle() waits for the thread with the BQL released.
  *
- * LOCK ORDER: BQL -> eng_lock; the thread holds no eng_lock while it
- * takes the BQL.
+ * LOCK ORDER: BQL -> reg_lock -> eng_lock; the thread holds no eng_lock
+ * while it takes reg_lock.
  */
 static void cp_kick(ATIHD5770State *s)
 {
@@ -911,12 +999,12 @@ static void *cp_thread_fn(void *opaque)
         s->eng_kick = false;
         qemu_mutex_unlock(&s->eng_lock);
 
-        bql_lock();
-        if (!s->eng_hold) {
+        ati_hd5770_reg_lock(s);
+        if (!qatomic_read(&s->eng_hold)) {
             cp_run(s);
             s->eng_runs++;
         }
-        bql_unlock();
+        ati_hd5770_reg_unlock(s);
 
         qemu_mutex_lock(&s->eng_lock);
         if (!s->eng_kick) {
@@ -936,10 +1024,10 @@ static void cp_vm_state(void *opaque, bool running, RunState state)
     ATIHD5770State *s = opaque;
 
     if (running) {
-        s->eng_hold = false;
+        qatomic_set(&s->eng_hold, false);
         cp_kick(s);
     } else {
-        s->eng_hold = true;
+        qatomic_set(&s->eng_hold, true);
         cp_wait_idle(s);
     }
 }
@@ -969,7 +1057,7 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
 {
     switch (off) {
     case EG_CP_RB_RPTR:
-        *val = s->cp_rptr;
+        *val = qatomic_read(&s->cp_rptr);
         return true;
     case EG_GRBM_STATUS:
         *val = s->cp_stalled || qatomic_read(&s->eng_busy)
@@ -1016,6 +1104,10 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         return true;
     }
     if (off >= EG_SCRATCH_REG0 && off <= EG_SCRATCH_REG7) {
+        if (cp_in_stream) {
+            /* from a command stream: after the draws before it */
+            ati_hd5770_gpu_sync(s);
+        }
         s->regs[off >> 2] = val;
         scratch_writeback(s, (off - EG_SCRATCH_REG0) >> 2, val);
         return true;
@@ -1178,6 +1270,10 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         c->skipped, c->resets, c->draws, c->type0_regs, c->set_regs,
         c->load_regs, c->shadow_writes, c->ucode_pfp, c->ucode_me,
         c->ucode_rlc, s->mc.gart, s->mc.gart_invalid, s->mc.tlb_inval);
+    g_string_append_printf(out, " lockless mmio %s, stream register "
+                           "accesses with the BQL %" PRIu64 " (last 0x%x)\n",
+                           s->mmio.lockless_io ? "on" : "off",
+                           s->cp.bql_regs, s->cp.bql_reg_last);
     g_string_append_printf(out, " thread %s runs %" PRIu64 " idle waits %"
                            PRIu64 " draw ms %" PRIu64 " scanout redraws %"
                            PRIu64 " (async %s, frames %" PRIu64
@@ -1224,9 +1320,9 @@ void ati_hd5770_cp_reset(ATIHD5770State *s)
 {
     bool hold = s->eng_hold;
 
-    s->eng_hold = true;
+    qatomic_set(&s->eng_hold, true);
     cp_wait_idle(s);
-    s->eng_hold = hold;
+    ati_hd5770_reg_lock(s);
     if (s->cp_timer) {
         timer_del(s->cp_timer);
     }
@@ -1244,6 +1340,8 @@ void ati_hd5770_cp_reset(ATIHD5770State *s)
     memset(s->cp_shadow_base, 0, sizeof(s->cp_shadow_base));
     memset(s->alu_const, 0, HD5770_ALU_CONST_DWORDS * 4);
     ati_hd5770_dma_reset(s);
+    ati_hd5770_reg_unlock(s);
+    qatomic_set(&s->eng_hold, hold);
 }
 
 static void gpu_lock_cb(HD5770Gfx *g, bool on)
@@ -1344,6 +1442,7 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     hd5770_gfx_init(&s->gfx3d);
     ati_hd5770_mc_gfx_init(s);
     qemu_rec_mutex_init(&s->gpu_mutex);
+    qemu_mutex_init(&s->reg_lock);
     s->gfx3d.lock = gpu_lock_cb;
     s->gfx3d.lock_opaque = s;
     gpu_open(s);
@@ -1362,7 +1461,7 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
 void ati_hd5770_cp_fini(ATIHD5770State *s)
 {
     if (s->eng_on) {
-        s->eng_hold = true;
+        qatomic_set(&s->eng_hold, true);
         cp_wait_idle(s);
         qemu_mutex_lock(&s->eng_lock);
         s->eng_quit = true;
@@ -1375,6 +1474,7 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
         qemu_mutex_destroy(&s->eng_lock);
         s->eng_on = false;
     }
+    qemu_mutex_destroy(&s->reg_lock);
     if (s->gfx3d.gpu) {
         hd5770_gfx_sync(&s->gfx3d);
         s->gfx3d.gpu->ops->close(s->gfx3d.gpu->b);

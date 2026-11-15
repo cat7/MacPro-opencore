@@ -175,7 +175,7 @@ static int dma_exec(ATIHD5770State *s, const uint32_t *b, uint64_t tail_mc,
         return DMA_DONE;
     }
     case DMA_SRBM_WRITE:
-        ati_hd5770_reg_write(s, (b[1] & 0xffff) << 2, b[2]);
+        ati_hd5770_reg_write_locked(s, (b[1] & 0xffff) << 2, b[2]);
         return DMA_DONE;
     case DMA_IB:
         *ib_base = addr40(b[1] & ~0x1fu, b[2]);
@@ -228,14 +228,17 @@ void ati_hd5770_dma_run(ATIHD5770State *s)
     if (s->dma_running || !(cntl & EG_DMA_RB_ENABLE)) {
         return;
     }
-    /* copies follow the 3D engine's draws */
-    hd5770_gfx_sync(&s->gfx3d);
-    s->dma_running = true;
-    s->dma_stalled = false;
     bytes = 4u << MIN((cntl >> 1) & 0x1f, 22u);
     mask = bytes - 1;
     base = (uint64_t)s->regs[EG_DMA_RB_BASE >> 2] << 8;
     wptr = s->regs[EG_DMA_RB_WPTR >> 2] & mask & ~3u;
+    if (((s->dma_rptr & mask & ~3u) == wptr)) {
+        return;
+    }
+    /* copies follow the 3D engine's draws */
+    s->dma_running = true;
+    ati_hd5770_gpu_sync(s);
+    s->dma_stalled = false;
     rptr0 = s->dma_rptr;
     s->dma_rptr &= mask & ~3u;
 
