@@ -411,11 +411,12 @@ static int cp_dma(ATIHD5770State *s, const uint32_t *b)
 }
 
 /*
- * The host GPU wait at a packet boundary. On the engine thread it runs
- * with the BQL released, as a draw does, so the main loop and the vCPUs
- * are not held for the GPU's execution time.
+ * The host GPU wait at a packet boundary, at a fetch and when the engine
+ * goes idle. On the engine thread it runs with the BQL released, as a
+ * draw does, so the main loop and the vCPUs are not held for the GPU's
+ * execution time.
  */
-static void cp_gfx_sync(ATIHD5770State *s)
+void ati_hd5770_gpu_sync(ATIHD5770State *s)
 {
     if (s->eng_on && qemu_thread_is_self(&s->eng_thread) && bql_locked()) {
         bql_unlock();
@@ -461,7 +462,7 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
     }
     if (op_signals(op)) {
         /* what the guest may learn from it follows the draws before it */
-        cp_gfx_sync(s);
+        ati_hd5770_gpu_sync(s);
     }
     switch (op) {
     case OP_INDIRECT_BUFFER:
@@ -685,7 +686,7 @@ static void fetch(ATIHD5770State *s, uint64_t base, uint32_t idx,
         if (mask) {
             c = MIN(c, mask + 1 - idx);
         }
-        ati_hd5770_mc_read(s, base + (uint64_t)idx * 4, buf + done, c * 4);
+        ati_hd5770_mc_fetch(s, base + (uint64_t)idx * 4, buf + done, c * 4);
         done += c;
         idx = mask ? (idx + c) & mask : idx + c;
     }
@@ -816,7 +817,7 @@ static void cp_run(ATIHD5770State *s)
         }
     }
     /* the engine goes idle with its draws in memory */
-    hd5770_gfx_sync(&s->gfx3d);
+    ati_hd5770_gpu_sync(s);
     if (s->cp_rptr != rptr0) {
         rptr_writeback(s);
     }

@@ -241,6 +241,8 @@ void hd5770_gfx_fini(HD5770Gfx *g);
 void hd5770_gfx_sync(HD5770Gfx *g);
 /* about to access VRAM bytes [off, off + len) on the CPU */
 void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len);
+/* whether queued draws may write VRAM bytes [off, off + len) */
+bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len);
 void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out);
 /* a draw packet, b[0] its header, n dwords */
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n);

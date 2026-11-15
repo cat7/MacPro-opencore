@@ -327,6 +327,26 @@ void hd5770_gfx_sync(HD5770Gfx *g)
     gpu_lock(g, false);
 }
 
+bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len)
+{
+    bool hit = false;
+    unsigned i;
+
+    if (!g->gpu) {
+        return false;
+    }
+    gpu_lock(g, true);
+    for (i = 0; i < g->npend; i++) {
+        if (off < g->pend[i][1] && g->pend[i][0] < off + len) {
+            g->gst.touch_syncs++;
+            hit = true;
+            break;
+        }
+    }
+    gpu_lock(g, false);
+    return hit;
+}
+
 void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
 {
     unsigned i;

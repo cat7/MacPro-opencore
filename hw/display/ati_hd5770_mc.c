@@ -114,8 +114,12 @@ static void mc_resolve(ATIHD5770State *s, uint64_t mc, MCSpan *sp)
     sp->len = 0x1000 - (mc & 0xfff);
 }
 
+/*
+ * fetch: a read that nothing holds state across, so a wait for the host
+ * GPU may release the BQL (ati_hd5770_gpu_sync)
+ */
 static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
-                      bool write)
+                      bool write, bool fetch)
 {
     uint8_t *p = buf;
 
@@ -138,6 +142,9 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
                 memset(p, 0, n);
             }
         } else if (sp.vram) {
+            if (fetch && hd5770_gfx_pending(&s->gfx3d, sp.addr, n)) {
+                ati_hd5770_gpu_sync(s);
+            }
             hd5770_gfx_touch(&s->gfx3d, sp.addr, n);
             if (write) {
                 memcpy(vram_ptr(s) + sp.addr, p, n);
@@ -148,7 +155,11 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
         } else {
             if (s->gfx3d.ram_pend) {
                 /* queued draws write guest RAM */
-                hd5770_gfx_sync(&s->gfx3d);
+                if (fetch) {
+                    ati_hd5770_gpu_sync(s);
+                } else {
+                    hd5770_gfx_sync(&s->gfx3d);
+                }
             }
             if (write) {
                 pci_dma_write(PCI_DEVICE(s), sp.addr, p, n);
@@ -166,20 +177,26 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
 void ati_hd5770_mc_read(ATIHD5770State *s, uint64_t mc, void *buf,
                         unsigned len)
 {
-    mc_access(s, mc, buf, len, false);
+    mc_access(s, mc, buf, len, false, false);
+}
+
+void ati_hd5770_mc_fetch(ATIHD5770State *s, uint64_t mc, void *buf,
+                         unsigned len)
+{
+    mc_access(s, mc, buf, len, false, true);
 }
 
 void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
                          unsigned len)
 {
-    mc_access(s, mc, (void *)buf, len, true);
+    mc_access(s, mc, (void *)buf, len, true, false);
 }
 
 uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc)
 {
     uint8_t b[4];
 
-    mc_access(s, mc, b, 4, false);
+    mc_access(s, mc, b, 4, false, false);
     return ldl_le_p(b);
 }
 
@@ -188,7 +205,7 @@ void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val)
     uint8_t b[4];
 
     stl_le_p(b, val);
-    mc_access(s, mc, b, 4, true);
+    mc_access(s, mc, b, 4, true, false);
 }
 
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val)
@@ -196,7 +213,7 @@ void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val)
     uint8_t b[8];
 
     stq_le_p(b, val);
-    mc_access(s, mc, b, 8, true);
+    mc_access(s, mc, b, 8, true, false);
 }
 
 /* VM block registers with behaviour; the rest are stored */

@@ -323,6 +323,8 @@ void ati_hd5770_dce4_set_pixclk(ATIHD5770State *s, unsigned crtc,
 /* ati_hd5770_mc.c */
 void ati_hd5770_mc_read(ATIHD5770State *s, uint64_t mc, void *buf,
                         unsigned len);
+void ati_hd5770_mc_fetch(ATIHD5770State *s, uint64_t mc, void *buf,
+                         unsigned len);
 void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
                          unsigned len);
 uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
@@ -342,6 +344,7 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
 void ati_hd5770_cp_drain(ATIHD5770State *s);
+void ati_hd5770_gpu_sync(ATIHD5770State *s);
 void ati_hd5770_cp_gaps(ATIHD5770State *s, GString *out);
 void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out);
 uint64_t ati_hd5770_gpu_clock(void);
