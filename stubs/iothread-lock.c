@@ -18,6 +18,11 @@ void bql_lock_impl(const char *file, int line)
 {
 }
 
+bool bql_trylock_impl(const char *file, int line)
+{
+    return true;
+}
+
 void bql_unlock(void)
 {
     assert(!bql_unlock_blocked);
