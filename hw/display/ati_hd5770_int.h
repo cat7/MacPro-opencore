@@ -30,6 +30,7 @@
 #include "hw/display/edid.h"
 #include "qemu/timer.h"
 #include "qemu/thread.h"
+#include "qapi/qapi-types-common.h"
 #include "qom/object.h"
 #include "ati_r580_edid.h"
 #include "ati_hd5770_gfx.h"
@@ -123,6 +124,24 @@ typedef struct ATIHD5770Mode {
     HD5770Surf surf;            /* layout of a tiled surface */
 } ATIHD5770Mode;
 
+/*
+ * One frame for the display worker to convert, filled on the main loop
+ * while the worker is idle; see "ASYNC DISPLAY" in ati_hd5770.c.
+ */
+typedef struct ATIHD5770DispJob {
+    ATIHD5770Mode mode;
+    struct DisplaySurface *ds;
+    const uint8_t *vram;
+    uint8_t palette[256][3];
+} ATIHD5770DispJob;
+
+enum {
+    ATI_HD5770_DISP_IDLE,       /* job is the main loop's */
+    ATI_HD5770_DISP_QUEUED,     /* job is the worker's from here ... */
+    ATI_HD5770_DISP_RUNNING,
+    ATI_HD5770_DISP_DONE,       /* ... until the hand-over takes it back */
+};
+
 struct ATIHD5770State {
     PCIDevice parent_obj;
 
@@ -183,6 +202,23 @@ struct ATIHD5770State {
     /* scanout of CRTC 0 */
     ATIHD5770Mode mode;
     bool force_redraw;
+
+    /*
+     * Display worker; see "ASYNC DISPLAY" in ati_hd5770.c. disp_state and
+     * disp_quit are under disp_lock; disp_job belongs to whoever
+     * disp_state says; disp_tick_missed and the counters to the BQL.
+     */
+    OnOffAuto async_display;    /* property */
+    bool disp_on;
+    QemuThread disp_thread;
+    QemuMutex disp_lock;
+    QemuCond disp_cond;
+    QEMUBH *disp_bh;
+    unsigned disp_state;
+    bool disp_quit;
+    bool disp_tick_missed;
+    ATIHD5770DispJob disp_job;
+    uint64_t disp_frames, disp_deferred;
     uint32_t xres, yres;
 
     /* hardware cursor of CRTC 0 */

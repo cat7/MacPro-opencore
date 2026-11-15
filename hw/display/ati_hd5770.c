@@ -21,6 +21,7 @@
 #include "system/dma.h"
 #include "system/memory.h"
 #include "ui/console.h"
+#include "system/qtest.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_regs.h"
 #include "trace.h"
@@ -556,12 +557,10 @@ static void tiled_row(const uint8_t *vram, const ATIHD5770Mode *m, uint32_t y,
  * CRTC 0's surface into the console. The LUT is a per-channel gamma
  * table in every depth; 8bpp indexes it with the pixel.
  */
-static void ati_hd5770_draw(ATIHD5770State *s, DisplaySurface *ds,
-                            const ATIHD5770Mode *m)
+static void ati_hd5770_draw(const uint8_t *vram, const uint8_t (*pal)[3],
+                            DisplaySurface *ds, const ATIHD5770Mode *m)
 {
-    const uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     const uint8_t *lin = vram + m->fb_offset, *src;
-    const uint8_t (*pal)[3] = (const uint8_t (*)[3])s->palette;
     g_autofree uint8_t *row = m->tiled ? g_malloc(m->width * m->bpp) : NULL;
     g_autofree uint64_t *off = m->tiled ? g_new(uint64_t, m->width) : NULL;
     uint32_t x, y;
@@ -615,21 +614,21 @@ static void ati_hd5770_draw(ATIHD5770State *s, DisplaySurface *ds,
     }
 }
 
-static bool ati_hd5770_update_display(void *opaque)
+/*
+ * The refresh up to the conversion: dirty snapshot, mode, palette and
+ * surface. False when CRTC 0 shows nothing (the last frame stays).
+ */
+static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
+                                       ATIHD5770Mode *mode, bool *redraw)
 {
-    ATIHD5770State *s = opaque;
-    ATIHD5770Mode mode;
     DisplaySurface *ds;
     DirtyBitmapSnapshot *snap;
-    bool redraw;
-    uint64_t len;
 
     snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
                                                    DIRTY_MEMORY_VGA);
-    if (!ati_hd5770_dce4_scanout(s, &mode)) {
-        /* CRTC 0 off or blanked: the last frame stays */
+    if (!ati_hd5770_dce4_scanout(s, mode)) {
         g_free(snap);
-        return true;
+        return false;
     }
     memcpy(s->palette, ati_hd5770_dce4_lut(s), sizeof(s->palette));
     if (s->regs[EG_GRPH_LUT_10BIT_BYPASS_CONTROL >> 2] &
@@ -640,31 +639,190 @@ static bool ati_hd5770_update_display(void *opaque)
             s->palette[i][0] = s->palette[i][1] = s->palette[i][2] = i;
         }
     }
-    redraw = s->force_redraw || s->lut_drawn != s->lut_gen;
+    *redraw = s->force_redraw || s->lut_drawn != s->lut_gen;
     s->lut_drawn = s->lut_gen;
     ds = qemu_console_surface(s->con);
-    if (!ds || surface_width(ds) != (int)mode.width ||
-        surface_height(ds) != (int)mode.height) {
-        trace_ati_hd5770_surface(mode.width, mode.height, mode.bpp,
-                                 mode.pitch, mode.fb_offset);
-        ds = qemu_create_displaysurface(mode.width, mode.height);
+    if (!ds || surface_width(ds) != (int)mode->width ||
+        surface_height(ds) != (int)mode->height) {
+        trace_ati_hd5770_surface(mode->width, mode->height, mode->bpp,
+                                 mode->pitch, mode->fb_offset);
+        ds = qemu_create_displaysurface(mode->width, mode->height);
         qemu_console_set_surface(s->con, ds);
-        redraw = true;
+        *redraw = true;
     }
-    if (memcmp(&s->mode, &mode, sizeof(mode))) {
-        redraw = true;
+    if (memcmp(&s->mode, mode, sizeof(*mode))) {
+        *redraw = true;
     }
-    len = mode.fb_len;
-    if (memory_region_snapshot_get_dirty(&s->vram, snap, mode.fb_offset,
-                                         len)) {
-        redraw = true;
+    if (memory_region_snapshot_get_dirty(&s->vram, snap, mode->fb_offset,
+                                         mode->fb_len)) {
+        *redraw = true;
     }
     g_free(snap);
-    s->mode = mode;
+    s->mode = *mode;
+    return true;
+}
+
+/*
+ * ASYNC DISPLAY (async-display=on). The conversion of the scanned-out
+ * VRAM into the console's 32bpp surface runs on a worker thread; the
+ * main loop keeps the dirty snapshot, the mode, the surface and the
+ * cursor, and hands the worker a job (mode, surface, palette copy). A
+ * bottom half publishes the frame, then runs a refresh tick that found
+ * the worker busy. One job at most is in flight; a busy tick takes no
+ * snapshot, so its dirty bits stay for the next one. The surface is
+ * replaced only by the refresh while the worker is idle.
+ *
+ * LOCK ORDER: BQL -> disp_lock, a leaf. The worker takes no other lock
+ * and waits only for disp_cond.
+ */
+static void ati_hd5770_disp_post(ATIHD5770State *s, const ATIHD5770Mode *mode)
+{
+    ATIHD5770DispJob *j = &s->disp_job;
+
+    j->mode = *mode;
+    j->ds = qemu_console_surface(s->con);
+    j->vram = memory_region_get_ram_ptr(&s->vram);
+    memcpy(j->palette, s->palette, sizeof(j->palette));
+    qemu_mutex_lock(&s->disp_lock);
+    s->disp_state = ATI_HD5770_DISP_QUEUED;
+    qemu_cond_signal(&s->disp_cond);
+    qemu_mutex_unlock(&s->disp_lock);
+}
+
+static bool ati_hd5770_update_async(ATIHD5770State *s)
+{
+    ATIHD5770Mode mode;
+    bool redraw;
+    unsigned state;
+
+    qemu_mutex_lock(&s->disp_lock);
+    state = s->disp_state;
+    qemu_mutex_unlock(&s->disp_lock);
+    if (state != ATI_HD5770_DISP_IDLE) {
+        s->disp_tick_missed = true;
+        s->disp_deferred++;
+        ati_hd5770_cursor_update(s);
+        return false;
+    }
+    if (!ati_hd5770_refresh_prepare(s, &mode, &redraw)) {
+        return true;
+    }
+    if (!redraw) {
+        ati_hd5770_cursor_update(s);
+        return true;
+    }
+    s->force_redraw = false;
+    s->redraws++;
+    ati_hd5770_disp_post(s, &mode);
+    return false;
+}
+
+static void ati_hd5770_disp_handover(void *opaque)
+{
+    ATIHD5770State *s = opaque;
+
+    qemu_mutex_lock(&s->disp_lock);
+    if (s->disp_state != ATI_HD5770_DISP_DONE) {
+        qemu_mutex_unlock(&s->disp_lock);
+        return;
+    }
+    s->disp_state = ATI_HD5770_DISP_IDLE;
+    qemu_mutex_unlock(&s->disp_lock);
+
+    if (qemu_console_surface(s->con) == s->disp_job.ds) {
+        s->disp_frames++;
+        ati_hd5770_dce4_cursor_apply(s);
+        qemu_console_update_full(s->con);
+    } else {
+        s->force_redraw = true;
+    }
+    if (s->disp_tick_missed) {
+        s->disp_tick_missed = false;
+        if (!ati_hd5770_update_async(s)) {
+            return;
+        }
+    }
+    qemu_console_hw_update_done(s->con);
+}
+
+static void *ati_hd5770_disp_thread(void *opaque)
+{
+    ATIHD5770State *s = opaque;
+    ATIHD5770DispJob *j = &s->disp_job;
+
+    qemu_mutex_lock(&s->disp_lock);
+    for (;;) {
+        while (s->disp_state != ATI_HD5770_DISP_QUEUED && !s->disp_quit) {
+            qemu_cond_wait(&s->disp_cond, &s->disp_lock);
+        }
+        if (s->disp_quit) {
+            break;
+        }
+        s->disp_state = ATI_HD5770_DISP_RUNNING;
+        qemu_mutex_unlock(&s->disp_lock);
+
+        ati_hd5770_draw(j->vram, (const uint8_t (*)[3])j->palette, j->ds,
+                        &j->mode);
+
+        qemu_mutex_lock(&s->disp_lock);
+        s->disp_state = ATI_HD5770_DISP_DONE;
+        qemu_bh_schedule(s->disp_bh);
+    }
+    qemu_mutex_unlock(&s->disp_lock);
+    return NULL;
+}
+
+static void ati_hd5770_disp_init(ATIHD5770State *s)
+{
+    s->disp_on = s->async_display == ON_OFF_AUTO_ON ||
+                 (s->async_display == ON_OFF_AUTO_AUTO && !qtest_enabled());
+    if (!s->disp_on) {
+        return;
+    }
+    qemu_mutex_init(&s->disp_lock);
+    qemu_cond_init(&s->disp_cond);
+    s->disp_state = ATI_HD5770_DISP_IDLE;
+    s->disp_bh = qemu_bh_new(ati_hd5770_disp_handover, s);
+    qemu_thread_create(&s->disp_thread, "ati-hd5770-disp",
+                       ati_hd5770_disp_thread, s, QEMU_THREAD_JOINABLE);
+}
+
+static void ati_hd5770_disp_fini(ATIHD5770State *s)
+{
+    if (!s->disp_on) {
+        return;
+    }
+    qemu_mutex_lock(&s->disp_lock);
+    s->disp_quit = true;
+    qemu_cond_signal(&s->disp_cond);
+    qemu_mutex_unlock(&s->disp_lock);
+    qemu_thread_join(&s->disp_thread);
+    qemu_bh_delete(s->disp_bh);
+    s->disp_bh = NULL;
+    qemu_cond_destroy(&s->disp_cond);
+    qemu_mutex_destroy(&s->disp_lock);
+    s->disp_on = false;
+}
+
+static bool ati_hd5770_update_display(void *opaque)
+{
+    ATIHD5770State *s = opaque;
+    ATIHD5770Mode mode;
+    bool redraw;
+
+    if (s->disp_on) {
+        return ati_hd5770_update_async(s);
+    }
+    if (!ati_hd5770_refresh_prepare(s, &mode, &redraw)) {
+        /* CRTC 0 off or blanked: the last frame stays */
+        return true;
+    }
     if (redraw) {
         s->force_redraw = false;
         s->redraws++;
-        ati_hd5770_draw(s, ds, &mode);
+        ati_hd5770_draw(memory_region_get_ram_ptr(&s->vram),
+                        (const uint8_t (*)[3])s->palette,
+                        qemu_console_surface(s->con), &mode);
         ati_hd5770_dce4_cursor_apply(s);
         qemu_console_update_full(s->con);
     } else {
@@ -802,12 +960,14 @@ static void ati_hd5770_realize(PCIDevice *dev, Error **errp)
                                    ati_hd5770_cursor_timer, s);
     ati_hd5770_cp_init(s);
     ati_hd5770_dce4_init(s);
+    ati_hd5770_disp_init(s);
 }
 
 static void ati_hd5770_exit(PCIDevice *dev)
 {
     ATIHD5770State *s = ATI_HD5770(dev);
 
+    ati_hd5770_disp_fini(s);
     ati_hd5770_dce4_fini(s);
     ati_hd5770_cp_fini(s);
     timer_free(s->cursor_timer);
@@ -914,6 +1074,8 @@ static const Property ati_hd5770_properties[] = {
     DEFINE_PROP_BOOL("msi", ATIHD5770State, msi, true),
     DEFINE_PROP_BOOL("accel", ATIHD5770State, accel, false),
     DEFINE_PROP_BOOL("cp-thread", ATIHD5770State, cp_thread, true),
+    DEFINE_PROP_ON_OFF_AUTO("async-display", ATIHD5770State, async_display,
+                            ON_OFF_AUTO_AUTO),
     DEFINE_PROP_STRING("gpu", ATIHD5770State, gpu_prop),
     DEFINE_PROP_UINT32("device-id", ATIHD5770State, device_id,
                        PCI_DEVICE_ID_ATI_JUNIPER_XT),
