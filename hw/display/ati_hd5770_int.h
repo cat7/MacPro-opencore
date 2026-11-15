@@ -277,10 +277,22 @@ struct ATIHD5770State {
      * processor's state; see REGISTER ACCESS in ati_hd5770.c.
      */
     QemuMutex reg_lock;
+    /* FENCES in ati_hd5770_cp.c */
+    bool fx_on;
+    QemuMutex fx_lock;
+    QemuCond fx_cond;
+    GQueue fx_q;
+    struct HD5770Fence *fx_cur;
+    unsigned fx_depth;
+    int fx_out;
+    uint64_t fx_retired;
+    QEMUBH *fx_bh;
+    uint64_t fx_records, fx_now, fx_settles, fx_bh_runs;
     QemuThread eng_thread;
     QemuMutex eng_lock;
     QemuCond eng_cond, eng_idle_cond;
     bool eng_kick, eng_busy, eng_quit;
+    bool eng_running;           /* the thread is in a run; eng_lock */
     bool eng_hold;
     VMChangeStateEntry *eng_vmse;
     uint64_t eng_runs, eng_waits, eng_draw_ns;
@@ -341,6 +353,8 @@ void ati_hd5770_mc_fetch(ATIHD5770State *s, uint64_t mc, void *buf,
 void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,
                          unsigned len);
 void ati_hd5770_mc_post(ATIHD5770State *s, uint64_t mc, const void *buf,
+                        unsigned len);
+void ati_hd5770_mc_peek(ATIHD5770State *s, uint64_t mc, void *buf,
                         unsigned len);
 uint32_t ati_hd5770_mc_rd32(ATIHD5770State *s, uint64_t mc);
 void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);

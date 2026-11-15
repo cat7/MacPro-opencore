@@ -322,9 +322,31 @@ void hd5770_gfx_sync(HD5770Gfx *g)
         g->gpu->ops->sync(g->gpu->b);
         g->npend = 0;
         g->ram_pend = false;
+        g->ram_wpend = false;
         g->gst.syncs++;
     }
     gpu_lock(g, false);
+}
+
+bool hd5770_gfx_busy(HD5770Gfx *g)
+{
+    return g->gpu && (g->npend || g->ram_pend);
+}
+
+uint64_t hd5770_gfx_fence(HD5770Gfx *g)
+{
+    uint64_t t;
+
+    gpu_lock(g, true);
+    t = g->gpu->ops->fence(g->gpu->b);
+    if (!t) {
+        /* everything queued is in memory */
+        g->npend = 0;
+        g->ram_pend = false;
+        g->ram_wpend = false;
+    }
+    gpu_lock(g, false);
+    return t;
 }
 
 bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len)
@@ -2797,6 +2819,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         pend_add(g, rng[i][0], rng[i][1]);
     }
     g->ram_pend |= q->rt.space;
+    g->ram_wpend |= q->rt.space;
     for (i = 0; i < q->ntex; i++) {
         /* guest RAM the GPU reads is not tracked by range */
         g->ram_pend |= q->tex[i].surf.space;

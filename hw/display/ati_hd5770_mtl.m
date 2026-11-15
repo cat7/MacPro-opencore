@@ -14,6 +14,16 @@
  * Programs are compiled on first use and kept by the hash of their
  * words.
  *
+ * COMPLETION. Each committed command buffer is a record holding the
+ * ranges its draws wrote. Its completed handler retires only a
+ * contiguous prefix of completed records (the order handlers run in is
+ * not the order the GPU finished in): it reports their ranges with
+ * done() and then retires the fences (ati_hd5770_gpu.h) whose command
+ * buffers are all retired. sync() waits for every record and reports
+ * the ranges itself. rlock keeps reports and retirements in order; flock
+ * guards the record and fence queues. Neither is held while waiting for
+ * the GPU.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -92,6 +102,19 @@ QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 152);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 416);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
+/* a committed command buffer */
+typedef struct MtlCb {
+    uint64_t seq;
+    id<MTLCommandBuffer> cb;
+    GArray *ranges, *ram_ranges;
+    bool done;                  /* its completed handler ran */
+} MtlCb;
+
+/* a fence: retired once command buffers up to cbseq are */
+typedef struct MtlFence {
+    uint64_t ticket, cbseq;
+} MtlFence;
+
 /* a pixel box one dispatch wrote, or bytes it read */
 typedef struct MtlAcc {
     uint64_t lo, hi;            /* VRAM bytes */
@@ -137,6 +160,14 @@ typedef struct HD5770Mtl {
     uint64_t compiles, compile_ns, wait_ns, encode_ns;
     uint64_t gpu_ns;            /* atomic: command buffers on the GPU */
     int building;               /* atomic: programs being compiled */
+    /* COMPLETION above */
+    GMutex flock, rlock;
+    GQueue cbs;                 /* MtlCb, oldest first, not yet retired */
+    GQueue fences;              /* MtlFence, oldest first */
+    uint64_t cb_seq;            /* last committed */
+    uint64_t cb_retired;        /* every record up to it retired */
+    uint64_t tickets, fences_retired;
+    int handlers;               /* atomic: completed handlers to come */
 } HD5770Mtl;
 
 static void mtl_exact_math(MTLCompileOptions *o)
@@ -252,8 +283,102 @@ static void mtl_flush(HD5770Mtl *m)
     m->dispatches++;
 }
 
+/* the ranges a retired record's draws wrote, reported; the record freed */
+static void mtl_report(HD5770Mtl *m, MtlCb *r)
+{
+    guint i;
+
+    for (i = 0; i + 1 < r->ranges->len; i += 2) {
+        m->pub.done(m->pub.opaque, g_array_index(r->ranges, uint64_t, i),
+                    g_array_index(r->ranges, uint64_t, i + 1));
+    }
+    for (i = 0; i + 1 < r->ram_ranges->len && m->pub.done_ram; i += 2) {
+        m->pub.done_ram(m->pub.opaque,
+                        g_array_index(r->ram_ranges, uint64_t, i),
+                        g_array_index(r->ram_ranges, uint64_t, i + 1));
+    }
+    g_array_free(r->ranges, true);
+    g_array_free(r->ram_ranges, true);
+    [r->cb release];
+    g_free(r);
+}
+
+/*
+ * The completed prefix of the records, out of the queue (flock held):
+ * a record counts as completed when its handler ran, or with `status`
+ * when the command buffer says so.
+ */
+static GSList *mtl_take_done(HD5770Mtl *m, bool status)
+{
+    GSList *l = NULL;
+    MtlCb *r;
+
+    while ((r = g_queue_peek_head(&m->cbs)) &&
+           (r->done || (status && r->cb.status >= MTLCommandBufferStatusCompleted))) {
+        g_queue_pop_head(&m->cbs);
+        m->cb_retired = r->seq;
+        l = g_slist_prepend(l, r);
+    }
+    return g_slist_reverse(l);
+}
+
+/* a command buffer's completed handler: COMPLETION above */
+static void mtl_retire(HD5770Mtl *m, uint64_t seq)
+{
+    GSList *done, *l, *tickets = NULL;
+    MtlFence *f;
+    GList *e;
+
+    g_mutex_lock(&m->rlock);
+    g_mutex_lock(&m->flock);
+    for (e = m->cbs.head; e; e = e->next) {
+        MtlCb *r = e->data;
+
+        if (r->seq == seq) {
+            r->done = true;
+            break;
+        }
+    }
+    if (!m->pub.retired) {
+        /* no fences: sync() reports */
+        g_mutex_unlock(&m->flock);
+        g_mutex_unlock(&m->rlock);
+        return;
+    }
+    done = mtl_take_done(m, false);
+    while ((f = g_queue_peek_head(&m->fences)) && f->cbseq <= m->cb_retired) {
+        g_queue_pop_head(&m->fences);
+        tickets = g_slist_prepend(tickets, f);
+    }
+    tickets = g_slist_reverse(tickets);
+    g_mutex_unlock(&m->flock);
+    if (done || tickets) {
+        if (m->pub.thread) {
+            m->pub.thread(m->pub.opaque, true);
+        }
+        for (l = done; l; l = l->next) {
+            mtl_report(m, l->data);
+        }
+        for (l = tickets; l; l = l->next) {
+            f = l->data;
+            m->pub.retired(m->pub.opaque, f->ticket);
+            qatomic_set(&m->fences_retired, f->ticket);
+            g_free(f);
+        }
+        if (m->pub.thread) {
+            m->pub.thread(m->pub.opaque, false);
+        }
+    }
+    g_slist_free(done);
+    g_slist_free(tickets);
+    g_mutex_unlock(&m->rlock);
+}
+
 static void mtl_end(HD5770Mtl *m)
 {
+    MtlCb *r;
+    uint64_t seq;
+
     if (m->enc) {
         mtl_flush(m);
         [m->enc endEncoding];
@@ -261,9 +386,22 @@ static void mtl_end(HD5770Mtl *m)
         m->enc = nil;
     }
     if (m->cb) {
+        r = g_new0(MtlCb, 1);
+        r->cb = [m->cb retain];
+        r->ranges = m->ranges;
+        r->ram_ranges = m->ram_ranges;
+        m->ranges = g_array_new(false, false, sizeof(uint64_t));
+        m->ram_ranges = g_array_new(false, false, sizeof(uint64_t));
+        g_mutex_lock(&m->flock);
+        r->seq = seq = ++m->cb_seq;
+        g_queue_push_tail(&m->cbs, r);
+        g_mutex_unlock(&m->flock);
+        qatomic_inc(&m->handlers);
         [m->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             qatomic_add(&m->gpu_ns,
                         (uint64_t)((cb.GPUEndTime - cb.GPUStartTime) * 1e9));
+            mtl_retire(m, seq);
+            qatomic_dec(&m->handlers);
         }];
         [m->cb commit];
         [m->last release];
@@ -277,34 +415,64 @@ static void mtl_end(HD5770Mtl *m)
 static void mtl_sync(void *opaque)
 {
     HD5770Mtl *m = opaque;
+    GSList *done, *l;
+    GList *e;
     int64_t t0;
-    guint i;
 
     @autoreleasepool {
         mtl_end(m);
-        if (m->last) {
-            t0 = get_clock();
-            [m->last waitUntilCompleted];
-            m->wait_ns += get_clock() - t0;
-            [m->last release];
-            m->last = nil;
+        t0 = get_clock();
+        /* every record still queued, without the locks */
+        g_mutex_lock(&m->flock);
+        e = g_queue_peek_tail_link(&m->cbs);
+        l = NULL;
+        for (; e; e = e->prev) {
+            l = g_slist_prepend(l, [((MtlCb *)e->data)->cb retain]);
         }
+        g_mutex_unlock(&m->flock);
+        for (done = l; done; done = done->next) {
+            id<MTLCommandBuffer> c = done->data;
+
+            [c waitUntilCompleted];
+            [c release];
+        }
+        g_slist_free(l);
+        m->wait_ns += get_clock() - t0;
+        [m->last release];
+        m->last = nil;
     }
     m->st_used = 0;
     m->syncs++;
-    for (i = 0; i + 1 < m->ranges->len; i += 2) {
-        m->pub.done(m->pub.opaque, g_array_index(m->ranges, uint64_t, i),
-                    g_array_index(m->ranges, uint64_t, i + 1));
+    g_mutex_lock(&m->rlock);
+    g_mutex_lock(&m->flock);
+    done = mtl_take_done(m, true);
+    g_mutex_unlock(&m->flock);
+    for (l = done; l; l = l->next) {
+        mtl_report(m, l->data);
     }
-    g_array_set_size(m->ranges, 0);
-    for (i = 0; i + 1 < m->ram_ranges->len; i += 2) {
-        if (m->pub.done_ram) {
-            m->pub.done_ram(m->pub.opaque,
-                            g_array_index(m->ram_ranges, uint64_t, i),
-                            g_array_index(m->ram_ranges, uint64_t, i + 1));
-        }
+    g_slist_free(done);
+    g_mutex_unlock(&m->rlock);
+}
+
+/* FENCES in ati_hd5770_gpu.h */
+static uint64_t mtl_fence(void *opaque)
+{
+    HD5770Mtl *m = opaque;
+    MtlFence *f;
+    uint64_t t = 0;
+
+    @autoreleasepool {
+        mtl_end(m);
     }
-    g_array_set_size(m->ram_ranges, 0);
+    g_mutex_lock(&m->flock);
+    if (m->cb_retired < m->cb_seq || !g_queue_is_empty(&m->fences)) {
+        f = g_new(MtlFence, 1);
+        f->ticket = t = ++m->tickets;
+        f->cbseq = m->cb_seq;
+        g_queue_push_tail(&m->fences, f);
+    }
+    g_mutex_unlock(&m->flock);
+    return t;
 }
 
 static void mtl_surf(HD5770Mtl *m, GSurf *g, const HD5770GpuSurf *s)
@@ -829,6 +997,8 @@ static void mtl_stats(void *opaque, GString *out)
         qatomic_read(&m->gpu_ns) / 1000000, m->wait_ns / 1000000,
         m->encode_ns / 1000000, g_hash_table_size(m->progs), m->compiles,
         qatomic_read(&m->compile_ns) / 1000000);
+    g_string_append_printf(out, "metal: fences %" PRIu64 " retired %" PRIu64
+                           "\n", m->tickets, qatomic_read(&m->fences_retired));
 }
 
 static void mtl_prog_free(gpointer p)
@@ -844,11 +1014,20 @@ static void mtl_close(void *opaque)
     HD5770Mtl *m = opaque;
 
     mtl_sync(m);
-    while (qatomic_read(&m->building)) {
+    while (qatomic_read(&m->building) || qatomic_read(&m->handlers)) {
         g_usleep(1000);
     }
     @autoreleasepool {
         g_hash_table_destroy(m->progs);
+        {
+            MtlFence *f;
+
+            while ((f = g_queue_pop_head(&m->fences))) {
+                g_free(f);
+            }
+        }
+        g_mutex_clear(&m->flock);
+        g_mutex_clear(&m->rlock);
         g_array_free(m->ranges, true);
         g_array_free(m->tiles, true);
         g_array_free(m->ram_ranges, true);
@@ -890,6 +1069,7 @@ static const HD5770GpuOps mtl_ops = {
     .stats = mtl_stats,
     .close = mtl_close,
     .ram = mtl_ram,
+    .fence = mtl_fence,
 };
 
 HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
@@ -939,6 +1119,10 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
     m->ranges = g_array_new(false, false, sizeof(uint64_t));
     m->tiles = g_array_new(false, false, sizeof(uint32_t));
     m->ram_ranges = g_array_new(false, false, sizeof(uint64_t));
+    g_mutex_init(&m->flock);
+    g_mutex_init(&m->rlock);
+    g_queue_init(&m->cbs);
+    g_queue_init(&m->fences);
     m->pub.ops = &mtl_ops;
     m->pub.b = m;
     return &m->pub;

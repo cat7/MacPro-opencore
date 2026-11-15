@@ -225,7 +225,8 @@ typedef struct HD5770Gfx {
     uint8_t *ram;
     uint64_t ram_size;
     bool (*ram_for)(struct HD5770Gfx *g, uint8_t *host);
-    bool ram_pend;              /* queued draws write guest RAM */
+    bool ram_pend;              /* queued draws use guest RAM */
+    bool ram_wpend;             /* queued draws write guest RAM */
     /* VRAM ranges queued draws read or write, [lo, hi) */
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;
@@ -239,6 +240,10 @@ void hd5770_gfx_init(HD5770Gfx *g);
 void hd5770_gfx_fini(HD5770Gfx *g);
 /* everything the backend has queued is in VRAM */
 void hd5770_gfx_sync(HD5770Gfx *g);
+/* draws were queued since the last sync */
+bool hd5770_gfx_busy(HD5770Gfx *g);
+/* a fence the backend completes (FENCES in ati_hd5770_gpu.h): its ticket */
+uint64_t hd5770_gfx_fence(HD5770Gfx *g);
 /* about to access VRAM bytes [off, off + len) on the CPU */
 void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len);
 /* whether queued draws may write VRAM bytes [off, off + len) */

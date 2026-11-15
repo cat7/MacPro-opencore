@@ -312,15 +312,307 @@ static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
 /* ---------------------------------------------------------------- */
 /* Interrupts and fences                                            */
 
-static void cp_irq(ATIHD5770State *s, uint32_t stat, uint32_t src)
+/*
+ * FENCES. What a command stream lets the guest learn -- a fence or a
+ * timestamp in memory, a semaphore signal, a scratch register, an
+ * interrupt -- follows the draws queued before it. With a backend that
+ * completes fences (FENCES in ati_hd5770_gpu.h) and the engine thread,
+ * a packet with such effects issued while draws are outstanding records
+ * them and the command processor runs on; the backend retires the
+ * record from its own thread once the draws are in memory. Records are
+ * applied in ring order, with the BQL: by the backend's thread when the
+ * BQL is free, else by fx_bh on the main loop or by a thread waiting for
+ * them. A packet that reads what a record may change waits for the
+ * records first (fx_settle()). eng_busy stays set until every record is
+ * applied; a run that leaves draws queued ends with an empty record.
+ * Without fences the command processor waits for the host GPU before
+ * such a packet and applies its effects itself.
+ *
+ * fx_q and fx_cond under fx_lock; fx_retired (the last ticket the
+ * backend retired) and fx_out (records not yet applied) are atomics.
+ * LOCK ORDER: eng_lock -> fx_lock; the backend's thread takes the BQL
+ * only by trylock.
+ */
+enum { FX_WR32, FX_WR64, FX_CLOCK, FX_SEM, FX_SCRATCH, FX_IRQ };
+
+#define FX_MAX                  8
+
+typedef struct HD5770Effect {
+    uint8_t kind;
+    uint32_t a;                 /* FX_SEM set to 1; FX_SCRATCH, FX_IRQ */
+    uint64_t addr, val;
+} HD5770Effect;
+
+struct HD5770Fence {
+    uint64_t ticket;            /* 0: nothing was outstanding */
+    unsigned n;
+    HD5770Effect e[FX_MAX];
+};
+
+/* with the BQL, or on the command processor with reg_lock */
+static void fx_apply(ATIHD5770State *s, const HD5770Effect *e)
 {
-    ati_hd5770_gpu_sync(s);
-    s->regs[EG_CP_INT_STATUS >> 2] |= stat;
-    if (s->regs[EG_CP_INT_CNTL >> 2] & stat) {
+    uint8_t b[8];
+    uint32_t v;
+
+    switch (e->kind) {
+    case FX_WR32:
+        stl_le_p(b, e->val);
+        ati_hd5770_mc_post(s, e->addr, b, 4);
+        break;
+    case FX_WR64:
+        stq_le_p(b, e->val);
+        ati_hd5770_mc_post(s, e->addr, b, 8);
+        break;
+    case FX_CLOCK:
+        stq_le_p(b, ati_hd5770_gpu_clock());
+        ati_hd5770_mc_post(s, e->addr, b, 8);
+        break;
+    case FX_SEM:
+        ati_hd5770_mc_peek(s, e->addr, b, 4);
+        v = e->a ? 1 : ldl_le_p(b) + 1;
+        stl_le_p(b, v);
+        ati_hd5770_mc_post(s, e->addr, b, 4);
+        break;
+    case FX_SCRATCH:
+        qatomic_set(&s->regs[(EG_SCRATCH_REG0 >> 2) + e->a], e->val);
+        if (qatomic_read(&s->regs[EG_SCRATCH_UMSK >> 2]) & (1u << e->a)) {
+            stl_le_p(b, e->val);
+            ati_hd5770_mc_post(s, ((uint64_t)s->regs[EG_SCRATCH_ADDR >> 2]
+                                   << 8) + 4 * e->a, b, 4);
+            s->cp.scratch_wb++;
+        }
+        break;
+    case FX_IRQ:
+        qatomic_or(&s->regs[EG_CP_INT_STATUS >> 2], e->a);
+        if (qatomic_read(&s->regs[EG_CP_INT_CNTL >> 2]) & e->a) {
+            if (bql_locked()) {
+                ati_hd5770_ih_push(s, e->val, 0);
+            } else {
+                bool bql = cp_bql_enter(s);
+
+                ati_hd5770_ih_push(s, e->val, 0);
+                cp_bql_leave(s, bql);
+            }
+        }
+        break;
+    }
+}
+
+/* an effect of the current packet: recorded, or applied now */
+static void fx_add(ATIHD5770State *s, uint8_t kind, uint64_t addr,
+                   uint64_t val, uint32_t a)
+{
+    HD5770Effect e = { .kind = kind, .a = a, .addr = addr, .val = val };
+    struct HD5770Fence *f = s->fx_cur;
+
+    if (f) {
+        assert(f->n < FX_MAX);
+        f->e[f->n++] = e;
+    } else {
+        fx_apply(s, &e);
+    }
+}
+
+static bool fx_ready(ATIHD5770State *s)
+{
+    struct HD5770Fence *f;
+    bool r;
+
+    qemu_mutex_lock(&s->fx_lock);
+    f = g_queue_peek_head(&s->fx_q);
+    r = f && f->ticket <= qatomic_read(&s->fx_retired);
+    qemu_mutex_unlock(&s->fx_lock);
+    return r;
+}
+
+/* eng_busy off once the thread is out of work and every record applied */
+static void cp_idle_check(ATIHD5770State *s)
+{
+    qemu_mutex_lock(&s->eng_lock);
+    if (!s->eng_running && !s->eng_kick && !qatomic_read(&s->fx_out) &&
+        s->eng_busy) {
+        qatomic_set(&s->eng_busy, false);
+        qemu_cond_broadcast(&s->eng_idle_cond);
+    }
+    qemu_mutex_unlock(&s->eng_lock);
+}
+
+/* the retired records at the head of the queue, applied; with the BQL */
+static void fx_drain(ATIHD5770State *s)
+{
+    struct HD5770Fence *f;
+    unsigned i;
+
+    for (;;) {
+        qemu_mutex_lock(&s->fx_lock);
+        f = g_queue_peek_head(&s->fx_q);
+        if (!f || f->ticket > qatomic_read(&s->fx_retired)) {
+            qemu_mutex_unlock(&s->fx_lock);
+            return;
+        }
+        g_queue_pop_head(&s->fx_q);
+        qemu_mutex_unlock(&s->fx_lock);
+        for (i = 0; i < f->n; i++) {
+            fx_apply(s, &f->e[i]);
+        }
+        g_free(f);
+        qemu_mutex_lock(&s->fx_lock);
+        qatomic_dec(&s->fx_out);
+        qemu_cond_broadcast(&s->fx_cond);
+        qemu_mutex_unlock(&s->fx_lock);
+        if (!qatomic_read(&s->fx_out)) {
+            cp_idle_check(s);
+        }
+    }
+}
+
+static void fx_bh_cb(void *opaque)
+{
+    ATIHD5770State *s = opaque;
+
+    s->fx_bh_runs++;
+    fx_drain(s);
+}
+
+/* the backend's thread: FENCES in ati_hd5770_gpu.h */
+static void gpu_retired_cb(void *opaque, uint64_t ticket)
+{
+    ATIHD5770State *s = opaque;
+
+    qatomic_set(&s->fx_retired, ticket);
+    if (bql_trylock()) {
+        fx_drain(s);
+        bql_unlock();
+        return;
+    }
+    qemu_bh_schedule(s->fx_bh);
+    qemu_mutex_lock(&s->fx_lock);
+    qemu_cond_broadcast(&s->fx_cond);
+    qemu_mutex_unlock(&s->fx_lock);
+    qemu_mutex_lock(&s->eng_lock);
+    qemu_cond_broadcast(&s->eng_idle_cond);
+    qemu_mutex_unlock(&s->eng_lock);
+}
+
+static void gpu_thread_cb(void *opaque, bool enter)
+{
+    if (enter) {
+        rcu_register_thread();
+    } else {
+        rcu_unregister_thread();
+    }
+}
+
+/* the record of a packet, issued as a fence of the backend */
+static void fx_issue(ATIHD5770State *s, struct HD5770Fence *f)
+{
+    f->ticket = hd5770_gfx_fence(&s->gfx3d);
+    if (!f->ticket && !qatomic_read(&s->fx_out)) {
+        /* nothing outstanding after all */
+        unsigned i;
+
+        for (i = 0; i < f->n; i++) {
+            fx_apply(s, &f->e[i]);
+        }
+        g_free(f);
+        s->fx_now++;
+        return;
+    }
+    qemu_mutex_lock(&s->fx_lock);
+    qatomic_inc(&s->fx_out);
+    g_queue_push_tail(&s->fx_q, f);
+    qemu_mutex_unlock(&s->fx_lock);
+    s->fx_records++;
+    if (!f->ticket) {
         bool bql = cp_bql_enter(s);
 
-        ati_hd5770_ih_push(s, src, 0);
+        fx_drain(s);
         cp_bql_leave(s, bql);
+    }
+}
+
+/*
+ * Around a packet that may have effects: they are recorded while draws
+ * or records are outstanding. Nests; without fences, waits for the host
+ * GPU instead.
+ */
+static void fx_begin(ATIHD5770State *s)
+{
+    if (s->fx_depth++) {
+        return;
+    }
+    if (!s->fx_on) {
+        ati_hd5770_gpu_sync(s);
+        return;
+    }
+    if (hd5770_gfx_busy(&s->gfx3d) || qatomic_read(&s->fx_out)) {
+        s->fx_cur = g_new0(struct HD5770Fence, 1);
+    }
+}
+
+static void fx_end(ATIHD5770State *s)
+{
+    struct HD5770Fence *f = s->fx_cur;
+
+    if (--s->fx_depth || !f) {
+        return;
+    }
+    s->fx_cur = NULL;
+    if (!f->n) {
+        g_free(f);
+        return;
+    }
+    fx_issue(s, f);
+}
+
+/*
+ * Before a packet reads memory or registers a record may change: every
+ * record applied (reg_lock released while waiting).
+ */
+static void fx_settle(ATIHD5770State *s)
+{
+    if (!qatomic_read(&s->fx_out)) {
+        return;
+    }
+    s->fx_settles++;
+    ati_hd5770_reg_unlock(s);
+    while (qatomic_read(&s->fx_out)) {
+        bool ready;
+
+        qemu_mutex_lock(&s->fx_lock);
+        ready = g_queue_peek_head(&s->fx_q) &&
+                ((struct HD5770Fence *)g_queue_peek_head(&s->fx_q))->ticket <=
+                qatomic_read(&s->fx_retired);
+        if (!ready && qatomic_read(&s->fx_out)) {
+            qemu_cond_wait(&s->fx_cond, &s->fx_lock);
+        }
+        qemu_mutex_unlock(&s->fx_lock);
+        if (ready) {
+            bql_lock();
+            fx_drain(s);
+            bql_unlock();
+        }
+    }
+    ati_hd5770_reg_lock(s);
+}
+
+/* the same before a register read: the registers records write */
+static void fx_settle_reg(ATIHD5770State *s, uint32_t off)
+{
+    if ((off >= EG_SCRATCH_REG0 && off <= EG_SCRATCH_REG7) ||
+        off == EG_CP_INT_STATUS) {
+        fx_settle(s);
+    }
+}
+
+/* the end of a run: the engine stays busy until its draws are in memory */
+static void fx_run_end(ATIHD5770State *s)
+{
+    if (!s->fx_on) {
+        ati_hd5770_gpu_sync(s);
+    } else if (hd5770_gfx_busy(&s->gfx3d)) {
+        fx_issue(s, g_new0(struct HD5770Fence, 1));
     }
 }
 
@@ -345,14 +637,14 @@ static void eop(ATIHD5770State *s, const uint32_t *b)
 
     switch (dsel) {
     case 1:
-        ati_hd5770_mc_wr32(s, addr, b[4]);
+        fx_add(s, FX_WR32, addr, b[4], 0);
         break;
     case 2:
-        ati_hd5770_mc_wr64(s, addr, b[4] | (uint64_t)b[5] << 32);
+        fx_add(s, FX_WR64, addr, b[4] | (uint64_t)b[5] << 32, 0);
         break;
     case 3:
     case 4:
-        ati_hd5770_mc_wr64(s, addr, ati_hd5770_gpu_clock());
+        fx_add(s, FX_CLOCK, addr, 0, 0);
         break;
     default:
         break;
@@ -365,7 +657,7 @@ static void eop(ATIHD5770State *s, const uint32_t *b)
         } else {
             s->cp.eop_masked++;
         }
-        cp_irq(s, EG_CP_TIME_STAMP_INT, HD5770_IH_SRC_CP_EOP);
+        fx_add(s, FX_IRQ, 0, HD5770_IH_SRC_CP_EOP, EG_CP_TIME_STAMP_INT);
     }
 }
 
@@ -382,7 +674,7 @@ static void event_write(ATIHD5770State *s, const uint32_t *b, uint32_t n)
     addr = addr40(b[2], b[3], 7);
     if (index == 1) {
         for (i = 0; i < NUM_BACKENDS; i++) {
-            ati_hd5770_mc_wr64(s, addr + 16 * i, 1ull << 63);
+            fx_add(s, FX_WR64, addr + 16 * i, 1ull << 63, 0);
         }
     } else {
         /* pipeline / streamout statistics: not written */
@@ -420,7 +712,11 @@ static void set_regs(ATIHD5770State *s, unsigned cls, const uint32_t *b,
 
         cp_reg_write(s, base + idx * 4, b[i]);
         if (shadowing) {
-            ati_hd5770_mc_wr32(s, shadow + idx * 4, b[i]);
+            /* the CP's copy of the register: no wait for draws */
+            uint8_t v[4];
+
+            stl_le_p(v, b[i]);
+            ati_hd5770_mc_post(s, shadow + idx * 4, v, 4);
             s->cp.shadow_writes++;
         }
     }
@@ -520,8 +816,8 @@ static void gap(ATIHD5770State *s, unsigned op)
 }
 
 /* one type-3 packet: b[0] header, n dwords in all */
-static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
-                    unsigned level, uint32_t *skip)
+static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
+                       unsigned level, uint32_t *skip)
 {
     unsigned op = (b[0] >> 8) & 0xff;
 
@@ -545,10 +841,6 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         }
         ati_hd5770_mc_unmap_all(s);
         return PKT_DONE;
-    }
-    if (op_signals(op)) {
-        /* what the guest may learn from it follows the draws before it */
-        ati_hd5770_gpu_sync(s);
     }
     switch (op) {
     case OP_INDIRECT_BUFFER:
@@ -578,7 +870,7 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         return PKT_DONE;
     case OP_EVENT_WRITE_EOS:
         if (n >= 5 && (b[3] >> 29) == 2) {
-            ati_hd5770_mc_wr32(s, addr40(b[2], b[3], 3), b[4]);
+            fx_add(s, FX_WR32, addr40(b[2], b[3], 3), b[4], 0);
         }
         return PKT_DONE;
     case OP_MEM_WRITE:
@@ -586,11 +878,11 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
             uint64_t a = addr40(b[1], b[2], 3);
 
             if (b[2] & (1u << 16)) {
-                ati_hd5770_mc_wr64(s, a, ati_hd5770_gpu_clock());
+                fx_add(s, FX_CLOCK, a, 0, 0);
             } else if (b[2] & (1u << 18)) {
-                ati_hd5770_mc_wr32(s, a, b[3]);
+                fx_add(s, FX_WR32, a, b[3], 0);
             } else {
-                ati_hd5770_mc_wr64(s, a, b[3] | (uint64_t)b[4] << 32);
+                fx_add(s, FX_WR64, a, b[3] | (uint64_t)b[4] << 32, 0);
             }
         }
         return PKT_DONE;
@@ -600,8 +892,13 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         if (n < 7) {
             return PKT_DONE;
         }
-        v = (b[1] & (1u << 4)) ? ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3))
-                               : cp_reg_read(s, (b[2] & 0xffff) << 2);
+        if (b[1] & (1u << 4)) {
+            fx_settle(s);
+            v = ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3));
+        } else {
+            fx_settle_reg(s, (b[2] & 0xffff) << 2);
+            v = cp_reg_read(s, (b[2] & 0xffff) << 2);
+        }
         if (!compare(b[1], v & b[5], b[4])) {
             trace_ati_hd5770_cp_wait(b[1], b[2], v, b[4], b[5]);
             return PKT_STALL;
@@ -615,11 +912,16 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         if (n < 9) {
             return PKT_DONE;
         }
-        v = (b[1] & (1u << 4)) ? ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3))
-                               : cp_reg_read(s, (b[2] & 0xffff) << 2);
+        if (b[1] & (1u << 4)) {
+            fx_settle(s);
+            v = ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3));
+        } else {
+            fx_settle_reg(s, (b[2] & 0xffff) << 2);
+            v = cp_reg_read(s, (b[2] & 0xffff) << 2);
+        }
         if (compare(b[1], v & b[5], b[4])) {
             if (b[1] & (1u << 8)) {
-                ati_hd5770_mc_wr32(s, addr40(b[6], b[7], 3), b[8]);
+                fx_add(s, FX_WR32, addr40(b[6], b[7], 3), b[8], 0);
             } else {
                 cp_reg_write(s, (b[6] & 0xffff) << 2, b[8]);
             }
@@ -634,20 +936,22 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
             return PKT_DONE;
         }
         a = addr40(b[1], b[2], 7);
-        v = ati_hd5770_mc_rd32(s, a);
         if ((b[2] >> 29) == 7) {
+            fx_settle(s);
+            v = ati_hd5770_mc_rd32(s, a);
             if (!v) {
                 return PKT_STALL;
             }
             ati_hd5770_mc_wr32(s, a, v - 1);
             s->cp.sem_wait++;
         } else {
-            ati_hd5770_mc_wr32(s, a, (b[2] & (1u << 20)) ? 1 : v + 1);
+            fx_add(s, FX_SEM, a, 0, !!(b[2] & (1u << 20)));
             s->cp.sem_signal++;
         }
         return PKT_DONE;
     }
     case OP_COND_EXEC:
+        fx_settle(s);
         if (n >= 4 && !ati_hd5770_mc_rd32(s, addr40(b[1], b[2], 3))) {
             *skip = b[n - 1] & 0x3fff;
             return PKT_SKIP;
@@ -681,25 +985,33 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         return PKT_DONE;
     case OP_COPY_DW:
         if (n >= 6) {
-            uint32_t v = (b[1] & 1)
-                ? ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3))
-                : cp_reg_read(s, (b[2] & 0xffff) << 2);
+            uint32_t v;
 
+            if (b[1] & 1) {
+                fx_settle(s);
+                v = ati_hd5770_mc_rd32(s, addr40(b[2], b[3], 3));
+            } else {
+                fx_settle_reg(s, (b[2] & 0xffff) << 2);
+                v = cp_reg_read(s, (b[2] & 0xffff) << 2);
+            }
             if (b[1] & 2) {
-                ati_hd5770_mc_wr32(s, addr40(b[4], b[5], 3), v);
+                fx_add(s, FX_WR32, addr40(b[4], b[5], 3), v, 0);
             } else {
                 cp_reg_write(s, (b[4] & 0xffff) << 2, v);
             }
         }
         return PKT_DONE;
     case OP_CP_DMA:
+        /* a copy the guest sees: after the draws and records before it */
+        fx_settle(s);
+        ati_hd5770_gpu_sync(s);
         if (n >= 6 && cp_dma(s, b) < 0) {
             gap(s, op);
         }
         return PKT_DONE;
     case OP_STRMOUT_BUFFER_UPDATE:
         if (n >= 4 && (b[1] & 1)) {
-            ati_hd5770_mc_wr32(s, addr40(b[2], b[3], 3), 0);
+            fx_add(s, FX_WR32, addr40(b[2], b[3], 3), 0, 0);
         }
         return PKT_DONE;
     default:
@@ -708,6 +1020,22 @@ static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         }
         return PKT_DONE;
     }
+}
+
+static int cp_type3(ATIHD5770State *s, const uint32_t *b, uint32_t n,
+                    unsigned level, uint32_t *skip)
+{
+    unsigned op = (b[0] >> 8) & 0xff;
+    int r;
+
+    if (!op_signals(op)) {
+        return cp_type3_op(s, b, n, level, skip);
+    }
+    /* what the guest may learn from it follows the draws before it */
+    fx_begin(s);
+    r = cp_type3_op(s, b, n, level, skip);
+    fx_end(s);
+    return r;
 }
 
 /* packet length in dwords from its header, 0 if malformed */
@@ -781,14 +1109,18 @@ static void fetch(ATIHD5770State *s, uint64_t base, uint32_t idx,
     }
 }
 
+/* what the CP has fetched: no wait for draws */
 static void rptr_writeback(ATIHD5770State *s)
 {
+    uint8_t b[4];
+
     if (s->regs[EG_CP_RB_CNTL >> 2] & EG_CP_RB_NO_UPDATE) {
         return;
     }
-    ati_hd5770_mc_wr32(s, addr40(s->regs[EG_CP_RB_RPTR_ADDR >> 2],
+    stl_le_p(b, s->cp_rptr);
+    ati_hd5770_mc_post(s, addr40(s->regs[EG_CP_RB_RPTR_ADDR >> 2],
                                  s->regs[EG_CP_RB_RPTR_ADDR_HI >> 2], 3),
-                       s->cp_rptr);
+                       b, 4);
     s->cp.rptr_wb++;
 }
 
@@ -903,7 +1235,7 @@ static void cp_run(ATIHD5770State *s)
         }
     }
     /* the engine goes idle with its draws in memory */
-    ati_hd5770_gpu_sync(s);
+    fx_run_end(s);
     if (s->cp_rptr != rptr0) {
         rptr_writeback(s);
     }
@@ -949,26 +1281,32 @@ static void cp_kick(ATIHD5770State *s)
     qemu_mutex_unlock(&s->eng_lock);
 }
 
-/* with the BQL, which is released while waiting */
+/*
+ * With the BQL, which is released while waiting; retired records are
+ * applied here meanwhile (FENCES).
+ */
 static void cp_wait_idle(ATIHD5770State *s)
 {
     if (!s->eng_on || qemu_thread_is_self(&s->eng_thread)) {
         return;
     }
-    qemu_mutex_lock(&s->eng_lock);
-    while (s->eng_busy) {
+    for (;;) {
+        fx_drain(s);
+        qemu_mutex_lock(&s->eng_lock);
+        if (!s->eng_busy) {
+            qemu_mutex_unlock(&s->eng_lock);
+            return;
+        }
         qemu_mutex_unlock(&s->eng_lock);
         bql_unlock();
         qemu_mutex_lock(&s->eng_lock);
-        while (s->eng_busy) {
+        while (s->eng_busy && !fx_ready(s)) {
             qemu_cond_wait(&s->eng_idle_cond, &s->eng_lock);
         }
+        s->eng_waits++;
         qemu_mutex_unlock(&s->eng_lock);
         bql_lock();
-        qemu_mutex_lock(&s->eng_lock);
-        s->eng_waits++;
     }
-    qemu_mutex_unlock(&s->eng_lock);
 }
 
 /*
@@ -997,6 +1335,7 @@ static void *cp_thread_fn(void *opaque)
             break;
         }
         s->eng_kick = false;
+        s->eng_running = true;
         qemu_mutex_unlock(&s->eng_lock);
 
         ati_hd5770_reg_lock(s);
@@ -1007,7 +1346,8 @@ static void *cp_thread_fn(void *opaque)
         ati_hd5770_reg_unlock(s);
 
         qemu_mutex_lock(&s->eng_lock);
-        if (!s->eng_kick) {
+        s->eng_running = false;
+        if (!s->eng_kick && !qatomic_read(&s->fx_out)) {
             qatomic_set(&s->eng_busy, false);
             qemu_cond_broadcast(&s->eng_idle_cond);
         }
@@ -1106,10 +1446,13 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     if (off >= EG_SCRATCH_REG0 && off <= EG_SCRATCH_REG7) {
         if (cp_in_stream) {
             /* from a command stream: after the draws before it */
-            ati_hd5770_gpu_sync(s);
+            fx_begin(s);
+            fx_add(s, FX_SCRATCH, 0, val, (off - EG_SCRATCH_REG0) >> 2);
+            fx_end(s);
+        } else {
+            s->regs[off >> 2] = val;
+            scratch_writeback(s, (off - EG_SCRATCH_REG0) >> 2, val);
         }
-        s->regs[off >> 2] = val;
-        scratch_writeback(s, (off - EG_SCRATCH_REG0) >> 2, val);
         return true;
     }
     switch (off) {
@@ -1143,18 +1486,21 @@ bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     case EG_CP_INT_STATUS:
         if (cp_in_stream) {
             /* from a command stream: raise the interrupt the bit names */
+            fx_begin(s);
             if (val & EG_CP_RB_INT) {
-                cp_irq(s, EG_CP_RB_INT, HD5770_IH_SRC_CP_RB);
+                fx_add(s, FX_IRQ, 0, HD5770_IH_SRC_CP_RB, EG_CP_RB_INT);
                 s->cp.rb_irq++;
             }
             if (val & EG_CP_IB1_INT) {
-                cp_irq(s, EG_CP_IB1_INT, HD5770_IH_SRC_CP_IB1);
+                fx_add(s, FX_IRQ, 0, HD5770_IH_SRC_CP_IB1, EG_CP_IB1_INT);
             }
             if (val & EG_CP_IB2_INT) {
-                cp_irq(s, EG_CP_IB2_INT, HD5770_IH_SRC_CP_IB2);
+                fx_add(s, FX_IRQ, 0, HD5770_IH_SRC_CP_IB2, EG_CP_IB2_INT);
             }
+            fx_end(s);
         } else {
-            s->regs[off >> 2] &= ~val;      /* acknowledge */
+            /* acknowledge */
+            qatomic_and(&s->regs[off >> 2], ~val);
         }
         return true;
     case EG_CP_PFP_UCODE_DATA: {
@@ -1271,9 +1617,15 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
         c->load_regs, c->shadow_writes, c->ucode_pfp, c->ucode_me,
         c->ucode_rlc, s->mc.gart, s->mc.gart_invalid, s->mc.tlb_inval);
     g_string_append_printf(out, " lockless mmio %s, stream register "
-                           "accesses with the BQL %" PRIu64 " (last 0x%x)\n",
+                           "accesses with the BQL %" PRIu64 " (last 0x%x)\n"
+                           " fences %s: records %" PRIu64 " outstanding %d "
+                           "at once %" PRIu64 " waited for %" PRIu64
+                           " applied on the main loop %" PRIu64 "\n",
                            s->mmio.lockless_io ? "on" : "off",
-                           s->cp.bql_regs, s->cp.bql_reg_last);
+                           s->cp.bql_regs, s->cp.bql_reg_last,
+                           s->fx_on ? "backend" : "device", s->fx_records,
+                           qatomic_read(&s->fx_out), s->fx_now,
+                           s->fx_settles, s->fx_bh_runs);
     g_string_append_printf(out, " thread %s runs %" PRIu64 " idle waits %"
                            PRIu64 " draw ms %" PRIu64 " scanout redraws %"
                            PRIu64 " (async %s, frames %" PRIu64
@@ -1446,8 +1798,18 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     s->gfx3d.lock = gpu_lock_cb;
     s->gfx3d.lock_opaque = s;
     gpu_open(s);
+    qemu_mutex_init(&s->fx_lock);
+    qemu_cond_init(&s->fx_cond);
+    g_queue_init(&s->fx_q);
     if (s->accel && s->cp_thread) {
         s->eng_on = true;
+        if (s->gfx3d.gpu && s->gfx3d.gpu->ops->fence) {
+            /* FENCES above */
+            s->fx_on = true;
+            s->fx_bh = qemu_bh_new(fx_bh_cb, s);
+            s->gfx3d.gpu->retired = gpu_retired_cb;
+            s->gfx3d.gpu->thread = gpu_thread_cb;
+        }
         s->eng_hold = !runstate_is_running();
         qemu_mutex_init(&s->eng_lock);
         qemu_cond_init(&s->eng_cond);
@@ -1480,6 +1842,13 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
         s->gfx3d.gpu->ops->close(s->gfx3d.gpu->b);
         s->gfx3d.gpu = NULL;
     }
+    if (s->fx_bh) {
+        qemu_bh_delete(s->fx_bh);
+        s->fx_bh = NULL;
+    }
+    s->fx_on = false;
+    qemu_cond_destroy(&s->fx_cond);
+    qemu_mutex_destroy(&s->fx_lock);
     timer_free(s->cp_timer);
     s->cp_timer = NULL;
     g_free(s->gfx);

@@ -118,7 +118,8 @@ static void mc_resolve(ATIHD5770State *s, uint64_t mc, MCSpan *sp)
  * An access after the queued draws that may touch its bytes waits for the
  * host GPU (ati_hd5770_gpu_sync(): without reg_lock, and on the engine
  * thread or a vCPU without the BQL). MC_POST does not wait: the interrupt
- * ring, which no draw uses.
+ * ring, which no draw uses, and fences applied once the draws before
+ * them are in memory.
  */
 enum {
     MC_SYNC,
@@ -161,8 +162,9 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
                 memcpy(p, vram_ptr(s) + sp.addr, n);
             }
         } else {
-            if (s->gfx3d.ram_pend && mode != MC_POST) {
-                /* queued draws write guest RAM */
+            if (mode != MC_POST &&
+                (write ? s->gfx3d.ram_pend : s->gfx3d.ram_wpend)) {
+                /* queued draws use (a write) or write (a read) guest RAM */
                 ati_hd5770_gpu_sync(s);
             }
             if (write) {
@@ -194,6 +196,12 @@ void ati_hd5770_mc_post(ATIHD5770State *s, uint64_t mc, const void *buf,
                         unsigned len)
 {
     mc_access(s, mc, (void *)buf, len, true, MC_POST);
+}
+
+void ati_hd5770_mc_peek(ATIHD5770State *s, uint64_t mc, void *buf,
+                        unsigned len)
+{
+    mc_access(s, mc, buf, len, false, MC_POST);
 }
 
 void ati_hd5770_mc_write(ATIHD5770State *s, uint64_t mc, const void *buf,

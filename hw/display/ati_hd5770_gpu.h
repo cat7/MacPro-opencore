@@ -33,6 +33,20 @@
  * without queueing anything; the device then syncs and draws it on the
  * CPU.
  *
+ * FENCES (added 2026-11-15). A backend with fence() completes the
+ * device's fences itself, so the device does not wait for the GPU before
+ * a fence: fence() commits what is queued and returns a ticket, or 0
+ * when everything queued before it is in memory with its ranges reported
+ * and every earlier ticket retired. The backend then calls retired(opaque, ticket) once
+ * every request queued before that fence() is in memory, done() and
+ * done_ram() having been called for the ranges those requests wrote:
+ * one call at a time, tickets in increasing order, on a thread of the
+ * backend's own (between thread(opaque, true) and thread(opaque, false)
+ * when it is not a thread QEMU created). Those calls must not block on
+ * the device's locks or the BQL. sync() waits for the GPU, not for any
+ * retired() call. Without fence() the device syncs before each fence and
+ * completes it itself.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -182,6 +196,8 @@ typedef struct HD5770GpuOps {
     bool mipmaps;
     /* added 2026-11-14 (M4b): takes programs with GET_TEXTURE_RESINFO */
     bool resinfo;
+    /* added 2026-11-15: FENCES above */
+    uint64_t (*fence)(void *b);
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -192,6 +208,9 @@ typedef struct HD5770Gpu {
     void *opaque;
     /* the same for guest RAM bytes, as offsets in the RAM of ops->ram() */
     void (*done_ram)(void *opaque, uint64_t lo, uint64_t hi);
+    /* added 2026-11-15: FENCES above; NULL while the device uses none */
+    void (*retired)(void *opaque, uint64_t ticket);
+    void (*thread)(void *opaque, bool enter);
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */
