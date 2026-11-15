@@ -153,6 +153,8 @@ typedef struct ALC885Stream {
     int64_t rpos;
     int64_t wpos;
     int64_t start;
+    int64_t backlog_min;
+    int64_t backlog_t0;
     QEMUTimer *timer;
 } ALC885Stream;
 
@@ -347,6 +349,31 @@ static void alc_output_timer(void *opaque)
     }
 }
 
+/*
+ * Both sides run at the nominal rate, so data the backend could not take
+ * after a host delay (its own buffer was full) would stay queued here for
+ * good and leave little room for the next delay. Drop what stayed queued
+ * for a whole second.
+ */
+static void alc_output_trim(ALC885Stream *st)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t excess;
+
+    st->backlog_min = MIN(st->backlog_min, st->wpos - st->rpos);
+    if (now - st->backlog_t0 < NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    excess = st->backlog_min - alc_bytes_per_second(st) / 500;
+    if (excess >= st->frame) {
+        excess -= excess % st->frame;
+        st->rpos += excess;
+        trace_hda_alc885_backlog(st->name, excess);
+    }
+    st->backlog_min = INT64_MAX;
+    st->backlog_t0 = now;
+}
+
 static void alc_output_cb(void *opaque, int avail)
 {
     ALC885Stream *st = opaque;
@@ -364,6 +391,7 @@ static void alc_output_cb(void *opaque, int avail)
             break;
         }
     }
+    alc_output_trim(st);
 }
 
 static void alc_input_timer(void *opaque)
@@ -455,6 +483,8 @@ static void alc_stream_set_running(ALC885Stream *st, bool running)
 
         st->rpos = st->wpos = 0;
         st->start = now;
+        st->backlog_min = INT64_MAX;
+        st->backlog_t0 = now;
         timer_mod_anticipate_ns(st->timer, now + ALC_TICK);
     } else {
         timer_del(st->timer);
