@@ -902,8 +902,14 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             const HD5770GpuTri *t = &d->tri[i];
 
             if (t->x1 >= t->x0 && t->y1 >= t->y0) {
-                /* tiles of at least 8 pixels each way, or a row of 64 */
-                need += 32 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
+                /*
+                 * binned: an entry per 8x8 screen tile it touches; else
+                 * tiles of at least 8 pixels each way, or a row of 64
+                 */
+                need += d->ntri > MTL_BIN_MIN ?
+                        4 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
+                        ((size_t)(t->y1 - t->y0) / 8 + 2) :
+                        32 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
                         ((size_t)(t->y1 - t->y0) / 1 + 2);
                 bx0 = MIN(bx0, t->x0);
                 by0 = MIN(by0, t->y0);

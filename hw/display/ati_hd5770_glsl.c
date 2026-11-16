@@ -1709,6 +1709,25 @@ const char hd5770_glsl_lib[] =
 "    }\n"
 "}\n"
 "\n"
+"/* the depth test alone: whether db() will pass (no stencil, no clear) */\n"
+"bool hd_ztest(uint di, int x, int y, float z)\n"
+"{\n"
+"    uint zfmt = draws[di].zfmt, dctl = draws[di].dctl;\n"
+"    uint zoff = hd_addr(draws[di].zs, uint(x), uint(y));\n"
+"    float zf = hd_fmin(hd_fmax(z, draws[di].zmin), draws[di].zmax);\n"
+"    uint znew = zfmt == 1u ? uint(roundEven(hd_fmul(zf, 65535.0))) :\n"
+"                zfmt == 2u ? uint(roundEven(hd_fmul(zf, 16777215.0))) : U(zf);\n"
+"    uint zold = vram[zoff >> 2u];\n"
+"\n"
+"    if (zfmt == 1u) {\n"
+"        zold = (zold >> ((zoff & 3u) * 8u)) & 0xffffu;\n"
+"    } else if (zfmt == 2u) {\n"
+"        zold &= 0xffffffu;\n"
+"    }\n"
+"    return zfmt == 3u ? hd_dbcmpf((dctl >> 4u) & 7u, zf, F(zold))\n"
+"                      : hd_dbcmp((dctl >> 4u) & 7u, znew, zold);\n"
+"}\n"
+"\n"
 "bool hd_db(uint di, int x, int y, float z, int sref, bool tfront)\n"
 "{\n"
 "    uint dctl = draws[di].dctl, rctl = draws[di].rctl, zfmt = draws[di].zfmt;\n"
@@ -2310,6 +2329,18 @@ char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
         "        float s = hd_sum3(b0, tris[ti].w[0], b1, tris[ti].w[1], b2, tris[ti].w[2]);\n"
         "        pw = s != 0.0 ? hd_div(1.0, s) : 0.0;\n"
         "    }\n");
+    if (!ir->zexport) {
+        /*
+         * the depth test before the program when its answer cannot change:
+         * no depth export, stencil or clear; the test after it writes
+         */
+        g_string_append(o,
+            "    if (draws[di].db != 0u && draws[di].zfmt != 0u && draws[di].has_s == 0u &&\n"
+            "        (draws[di].rctl & 1u) == 0u && (draws[di].dctl & 2u) != 0u &&\n"
+            "        !hd_ztest(di, x, y, hd_sum3(tris[ti].z[0], b0, tris[ti].z[1], b1,\n"
+            "                                    tris[ti].z[2], b2))) {\n"
+            "        return;\n    }\n");
+    }
     g_string_append(o,
         "    uint C[8][4];\n"
         "    for (uint i = 0u; i < 8u; i++) {\n"

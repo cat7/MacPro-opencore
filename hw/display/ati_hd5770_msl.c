@@ -1173,6 +1173,23 @@ const char hd5770_msl_lib[] =
 "    }\n"
 "}\n"
 "\n"
+"/* the depth test alone: whether db() will pass (no stencil, no clear) */\n"
+"static __attribute__((noinline)) bool hd_ztest(device uchar *vram, device uchar *ram,\n"
+"                  device const uchar *st, device const GDraw &u, int x, int y, float z)\n"
+"{\n"
+"    device uchar *zp = hd_at(u.zs, hd_addr(u.zs, x, y), vram, ram, st);\n"
+"    float zf = min(max(z, u.zmin), u.zmax);\n"
+"    uint znew = u.zfmt == 1 ? (uint)rint(zf * 65535.0f) :\n"
+"                u.zfmt == 2 ? (uint)rint(zf * 16777215.0f) : as_type<uint>(zf);\n"
+"    uint zold = u.zfmt == 1 ? (uint)*(device ushort *)zp : *(device uint *)zp;\n"
+"\n"
+"    if (u.zfmt == 2) {\n"
+"        zold &= 0xffffff;\n"
+"    }\n"
+"    return u.zfmt == 3 ? hd_dbcmpf((u.dctl >> 4) & 7, zf, as_type<float>(zold))\n"
+"                       : hd_dbcmp((u.dctl >> 4) & 7, znew, zold);\n"
+"}\n"
+"\n"
 "static __attribute__((noinline)) bool hd_db(device uchar *vram, device uchar *ram,\n"
 "                  device const uchar *st, device const GDraw &u,\n"
 "                  int x, int y, float z, int sref, bool tfront)\n"
@@ -1870,6 +1887,17 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
         g_string_append_printf(o, "    R%u[%u][0] = U(B1_%u);\n"
                                "    R%u[%u][1] = U(B2_%u);\n",
                                q, ir->map[0], q, q, ir->map[0], q);
+    }
+    /*
+     * the depth test before the program when its answer cannot change: no
+     * depth export, stencil or clear; the test after the program writes
+     */
+    if (!ir->zexport) {
+        g_string_append(o,
+            "    if (u.db && u.zfmt && !u.has_s && !(u.rctl & 1) && (u.dctl & 2) &&\n"
+            "        !hd_ztest(vram, ram, st, u, x, y,\n"
+            "                  fma(t.z[2], B2_0, fma(t.z[0], B0_0, t.z[1] * B1_0)))) {\n"
+            "        return true;\n    }\n");
     }
     if (ir->cf) {
         const char *n1 = nq == 3 ? "B0_1, B1_1, B2_1, PW_1, PX_1, PY_1"

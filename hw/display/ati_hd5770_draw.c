@@ -292,7 +292,12 @@ typedef struct Draw {
     Tex tex[TEX_CACHE];
     uint32_t tex_key[TEX_CACHE];
     unsigned n_tex;
+    /* vertex shader constant buffers read so far in this instance */
+    HD5770Val (*kc[16])[4];
+    uint64_t *kc_ok[16];
 } Draw;
+
+#define KC_MAX          4096
 
 /* c / 255.0f, as comp_value() computes it for an 8-bit UNORM component */
 static float unorm8[256];
@@ -1599,11 +1604,37 @@ static void kcache_vs(void *opaque, unsigned buf, unsigned idx,
         memcpy(v, d->g->alu + 1024 + (idx & 255) * 4, 16);
         return;
     }
+    if (buf < 16 && idx < KC_MAX && d->kc_ok[buf] &&
+        (d->kc_ok[buf][idx / 64] >> (idx % 64) & 1)) {
+        memcpy(v, d->kc[buf][idx], 16);
+        return;
+    }
     base = (uint64_t)CTX(d->g, SQ_ALU_CONST_CACHE_VS_0 + 4 * buf)
                     << 8;
 
     pend_check(d->g, base + idx * 16ull, 16);
     hd5770_mem_read(&d->g->mem, base + idx * 16ull, v, 16);
+    if (buf < 16 && idx < KC_MAX) {
+        if (!d->kc_ok[buf]) {
+            d->kc_ok[buf] = g_new0(uint64_t, KC_MAX / 64);
+            d->kc[buf] = g_malloc(KC_MAX * sizeof(*d->kc[buf]));
+        }
+        memcpy(d->kc[buf][idx], v, 16);
+        d->kc_ok[buf][idx / 64] |= 1ull << (idx % 64);
+    }
+}
+
+/* constant buffers may change between instances (the draw writes memory) */
+static void kcache_drop(Draw *d)
+{
+    unsigned k;
+
+    for (k = 0; k < 16; k++) {
+        g_free(d->kc_ok[k]);
+        g_free(d->kc[k]);
+        d->kc_ok[k] = NULL;
+        d->kc[k] = NULL;
+    }
 }
 
 static float interp(void *opaque, unsigned p, unsigned chan, bool flat)
@@ -4190,33 +4221,61 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         }
         nu = nv;
     } else {
-        GHashTable *seen = g_hash_table_new(NULL, NULL);
         bool restart = CTX(g, VGT_MULTI_PRIM_IB_RESET_EN) & 1;
         uint32_t lo = CTX(g, VGT_MIN_VTX_INDX), hi = CTX(g, VGT_MAX_VTX_INDX);
+        uint32_t xmin = UINT32_MAX, xmax = 0, *map = NULL;
+        GHashTable *seen = NULL;
 
-        nu = 0;
+        /* the vertex of each index: a table over the index range if small */
         for (i = 0; i < nv; i++) {
-            uint32_t x = idx[i], u;
-            gpointer pu;
+            uint32_t x = idx[i];
 
             if (restart && x == CTX(g, VGT_MULTI_PRIM_IB_RESET_INDX)) {
                 slot[i] = UINT32_MAX;
                 continue;
             }
-            x += CTX(g, VGT_INDX_OFFSET);
-            x = MIN(MAX(x, lo), hi);
-            pu = g_hash_table_lookup(seen, GUINT_TO_POINTER(x + 1));
-            if (pu) {
-                u = GPOINTER_TO_UINT(pu) - 1;
+            x = MIN(MAX(x + CTX(g, VGT_INDX_OFFSET), lo), hi);
+            slot[i] = x;
+            xmin = MIN(xmin, x);
+            xmax = MAX(xmax, x);
+        }
+        if (xmin <= xmax && (uint64_t)xmax - xmin < 4ull * nv + 65536) {
+            map = g_new0(uint32_t, (size_t)(xmax - xmin) + 1);
+        } else {
+            seen = g_hash_table_new(NULL, NULL);
+        }
+        nu = 0;
+        for (i = 0; i < nv; i++) {
+            uint32_t x = slot[i], u;
+
+            if (restart && idx[i] == CTX(g, VGT_MULTI_PRIM_IB_RESET_INDX)) {
+                continue;
+            }
+            if (map) {
+                u = map[x - xmin];
+                if (!u) {
+                    vid[nu] = x;
+                    u = map[x - xmin] = ++nu;
+                }
+                u--;
             } else {
-                u = nu++;
-                vid[u] = x;
-                g_hash_table_insert(seen, GUINT_TO_POINTER(x + 1),
-                                    GUINT_TO_POINTER(u + 1));
+                gpointer pu = g_hash_table_lookup(seen, GUINT_TO_POINTER(x + 1));
+
+                if (pu) {
+                    u = GPOINTER_TO_UINT(pu) - 1;
+                } else {
+                    u = nu++;
+                    vid[u] = x;
+                    g_hash_table_insert(seen, GUINT_TO_POINTER(x + 1),
+                                        GUINT_TO_POINTER(u + 1));
+                }
             }
             slot[i] = u;
         }
-        g_hash_table_destroy(seen);
+        g_free(map);
+        if (seen) {
+            g_hash_table_destroy(seen);
+        }
     }
     vb = g_new(Vtx, MAX(nu, 1) + 1);
     vp = g_new(Vtx *, MAX(nv, 1));
@@ -4225,6 +4284,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     for (inst = 0; inst < ninst && d->ok; inst++) {
         unsigned s0 = 0, k = 0;
 
+        kcache_drop(d);
         for (i = 0; i < nu; i++) {
             if (!vs_run(d, vid[i], inst, &vb[i], t)) {
                 reason = HD5770_SKIP_SHADER;
@@ -4263,6 +4323,7 @@ out:
     g_free(d->nt);
     g_free(d->lanes);
     g_free(d->kv);
+    kcache_drop(d);
     g_free(d);
     st->ns += get_clock() - t0;
 }

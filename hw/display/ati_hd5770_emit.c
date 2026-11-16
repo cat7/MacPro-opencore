@@ -560,13 +560,19 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
         "    for (uint i = 0u; i < %uu; i++) {\n"
         "        R[i][0] = 0u;\n        R[i][1] = 0u;\n        R[i][2] = 0u;\n"
         "        R[i][3] = 0u;\n    }\n"
-        "    for (uint i = 0u; i < 5u; i++) {\n        P[i] = 0u;\n    }\n"
-        "    if (HD_POSGPR >= 0 && HD_POSGPR < %d) {\n"
-        "        R[HD_POSGPR][0] = U(HPX);\n        R[HD_POSGPR][1] = U(HPY);\n"
-        "        R[HD_POSGPR][2] = U(0.0f);\n        R[HD_POSGPR][3] = U(1.0f);\n"
-        "    }\n"
+        "    for (uint i = 0u; i < 5u; i++) {\n        P[i] = 0u;\n    }\n",
+        ng, ng);
+    /* constant indices only, so the registers can stay registers */
+    for (i = 0; i < ng; i++) {
+        g_string_append_printf(o,
+            "    if (HD_POSGPR == %u) {\n"
+            "        R[%u][0] = U(HPX);\n        R[%u][1] = U(HPY);\n"
+            "        R[%u][2] = U(0.0f);\n        R[%u][3] = U(1.0f);\n"
+            "    }\n", i, i, i, i, i);
+    }
+    g_string_append_printf(o,
         "    R[%u][0] = U(HB1);\n    R[%u][1] = U(HB2);\n",
-        ng, ng, ng, ir->map[0], ir->map[0]);
+        ir->map[0], ir->map[0]);
     g_string_append_printf(o,
         "    int ar[4];\n    ar[0] = 0;\n    ar[1] = 0;\n    ar[2] = 0;\n    ar[3] = 0;\n"
         "    int lidx = 0, sp = 0, lsp = 0, rsp = 0, pc = 0;\n"
