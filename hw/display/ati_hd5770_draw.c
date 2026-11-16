@@ -56,7 +56,11 @@
 #define PA_SC_VPORT_SCISSOR_0_BR        0x28254
 #define PA_SC_VPORT_ZMIN_0              0x282d0
 #define PA_SC_VPORT_ZMAX_0              0x282d4
+#define VGT_MAX_VTX_INDX                0x28400
+#define VGT_MIN_VTX_INDX                0x28404
 #define VGT_INDX_OFFSET                 0x28408
+#define VGT_MULTI_PRIM_IB_RESET_INDX    0x2840c
+#define VGT_MULTI_PRIM_IB_RESET_EN      0x28a94
 #define SX_ALPHA_TEST_CONTROL           0x28410
 #define CB_BLEND_RED                    0x28414
 #define DB_STENCILREFMASK               0x28430
@@ -75,6 +79,9 @@
 #define CB_COLOR_CONTROL                0x28808
 #define DB_SHADER_CONTROL               0x2880c
 #define PA_CL_CLIP_CNTL                 0x28810
+#define PA_SU_POLY_OFFSET_DB_FMT_CNTL   0x28b78
+#define PA_SU_POLY_OFFSET_CLAMP         0x28b7c
+#define PA_SU_POLY_OFFSET_FRONT_SCALE   0x28b80
 #define PA_SU_SC_MODE_CNTL              0x28814
 #define PA_CL_VTE_CNTL                  0x28818
 #define SQ_PGM_START_PS                 0x28840
@@ -92,11 +99,12 @@
 #define SQ_BOOL_CONST_0                 0x3a500
 #define SQ_SAMPLER_0                    0x3c000
 #define SQ_VTX_BASE_VTX_LOC             0x3cff0
+#define SQ_VTX_START_INST_LOC           0x3cff4
 
 #define RES_VS                          176
 #define RES_FS                          992
 #define SAMPLER_VS                      18
-#define MAX_VERTS                       8192
+#define MAX_VERTS                       (1u << 18)
 #define MAX_PROG_DWORDS                 8192
 
 enum {
@@ -153,6 +161,20 @@ typedef struct Tex {
     bool is_float;
     bool unorm8;                /* 8_8_8_8 UNORM */
     unsigned base_lv, levels, depth;    /* BASE_LEVEL, levels from it, depth */
+    /*
+     * Slices (3D depth, array layers, cube faces) follow each other in
+     * a level, slice_bytes apart; z is the slice texel() reads.
+     */
+    unsigned slices, z;
+    float zn;                   /* 3D: z in [0, 1) */
+    /* SAMPLE_C*: DEPTH_COMPARE_FUNCTION + 1 (0 none), reference */
+    unsigned cmp;
+    float ref;
+    uint64_t slice_bytes[HD5770_TEX_LEVELS];
+    /* BC1..BC5: 4x4 blocks are the surface's elements; last one decoded */
+    unsigned bc;
+    uint64_t bc_addr;
+    uint32_t bc_texel[16][4];
     /* the micro tile last addressed */
     uint32_t mtx, mty;
     uint64_t mbase;
@@ -166,9 +188,15 @@ typedef struct Tex {
 
 #define TEX_CACHE 8
 
+/* the fields of one render target in Draw */
+#define MRT_FIRST   offsetof(Draw, rt)
+#define MRT_BYTES   (offsetof(Draw, color) - offsetof(Draw, rt))
+
 /* a vertex after the vertex shader and the viewport */
 typedef struct Vtx {
     float x, y, z, w;           /* window coordinates, w = 1/clip w */
+    float cp[4];                /* clip space position */
+    bool clip;                  /* clipped against the near and far planes */
     HD5770Val param[HD5770_PARAMS][4];
 } Vtx;
 
@@ -176,8 +204,11 @@ typedef struct Vtx {
 typedef struct Draw {
     HD5770Gfx *g;
     HD5770GfxStats *st;
-    HD5770Span span_tex, span_rt, span_vb, span_cb;
-    /* render target */
+    HD5770Span span_tex, span_vb, span_cb;
+    /*
+     * Render target: colour buffer 0, or the one put_pixel() writes.
+     * The fields from rt up to color are one target's (MRT_BYTES).
+     */
     HD5770Surf rt;
     unsigned rt_fmt, rt_num, rt_swap, rt_bpe, rt_comps;
     bool rt_blend, rt_float;
@@ -185,9 +216,13 @@ typedef struct Draw {
     bool rt_unorm8;             /* 8_8_8_8 UNORM */
     uint32_t rt_mtx, rt_mty;    /* the micro tile last addressed */
     uint64_t rt_mbase;
+    HD5770Span span_rt;
     uint32_t wmask;
-    bool color;                 /* colour buffer 0 is written */
     uint32_t blend;
+    bool color;                 /* colour buffer 0 is written */
+    /* more render targets: nmrt targets' fields, export cb[k] to target k */
+    unsigned nmrt, mrt_cb[8];
+    uint8_t *mrt;
     float blend_const[4];
     bool alpha_test;
     unsigned alpha_func;
@@ -209,6 +244,9 @@ typedef struct Draw {
     HD5770Span span_z, span_s;
     uint32_t z_mtx, z_mty, s_mtx, s_mty;
     uint64_t z_mbase, s_mbase;
+    float zoff;                 /* polygon offset of the current triangle */
+    /* clipping against the near and far planes (PA_CL_CLIP_CNTL) */
+    bool clip_on, clip_dx, clip_near, clip_far;
     /* culling and facing */
     unsigned cull;              /* bit 0 front, bit 1 back */
     bool face_cw, prov_last, front;
@@ -693,6 +731,15 @@ static void vfetch_vs(void *opaque, const uint32_t *w, uint32_t index,
 {
     Draw *d = opaque;
 
+    /* FETCH_TYPE: base vertex, start instance or no offset */
+    switch ((w[0] >> 5) & 3) {
+    case 0:
+        index += CTX(d->g, SQ_VTX_BASE_VTX_LOC);
+        break;
+    case 1:
+        index += CTX(d->g, SQ_VTX_START_INST_LOC);
+        break;
+    }
     vfetch_stage(d, w, index, v, stage == HD5770_STAGE_FS ? RES_FS : RES_VS,
                  d->g->alu + 1024);
 }
@@ -709,6 +756,7 @@ static void vfetch_ps(void *opaque, const uint32_t *w, uint32_t index,
 /* Textures                                                       */
 
 static void tex_levels(Tex *t, uint64_t mip_addr);
+static unsigned bc_kind(unsigned fmt);
 
 static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
 {
@@ -739,6 +787,13 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
     t->s.mode = (r[1] >> 28) & 0xf;
     t->s.nondisp = (r[0] >> 5) & 1;
     t->s.bpe = hd5770_fmt_bytes(t->fmt);
+    t->bc = bc_kind(t->fmt);
+    if (t->bc) {
+        /* the elements are 4x4 blocks; PITCH counts texels */
+        t->s.bpe = t->bc == 1 || t->bc == 4 ? 8 : 16;
+        t->s.pitch = MAX(t->s.pitch / 4, 1u);
+        t->s.height = DIV_ROUND_UP(t->h, 4);
+    }
     t->s.mtilea = 1u << ((r[7] >> 6) & 3);
     t->s.bankw = 1u << ((r[7] >> 8) & 3);
     t->s.bankh = 1u << ((r[7] >> 10) & 3);
@@ -775,11 +830,14 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
         }
         t->dim = 1;
     }
-    if (t->dim != 1 && t->dim != 0) {
+    if (t->dim == 7) {
         d->st->gap_misc[HD5770_GAP_TEX_DIM]++;
         return false;
     }
-    if (t->dim == 1 && (r[5] & 0xf) > (r[4] >> 28) && ((sm[0] >> 15) & 3)) {
+    /* 3D: depth slices; CUBE: six faces +X -X +Y -Y +Z -Z; arrays: layers */
+    t->slices = t->dim == 3 ? 6 : t->depth;
+    t->slice_bytes[0] = hd5770_surf_size(&t->s);
+    if (t->dim != 0 && (r[5] & 0xf) > (r[4] >> 28) && ((sm[0] >> 15) & 3)) {
         if (r[4] >> 28) {
             /* a base level other than 0: level 0 is sampled */
             d->st->gap_misc[HD5770_GAP_MIP]++;
@@ -794,10 +852,11 @@ static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
             t->lod_bias = (int32_t)(b << 18) / (float)(1 << 26);
         }
     }
-    if (t->dim == 0) {
+    if (t->dim == 0 || t->dim == 4) {
         t->h = 1;
     }
-    t->comps = hd5770_fmt_comps(t->fmt);
+    t->comps = t->bc ? (t->bc == 4 ? 1 : t->bc == 5 ? 2 : 4)
+                     : hd5770_fmt_comps(t->fmt);
     t->is_float = hd5770_fmt_is_float(t->fmt);
     t->unorm8 = t->fmt == HD5770_FMT_8_8_8_8 && t->num == HD5770_NUM_NORM &&
                 !t->sgn;
@@ -824,24 +883,160 @@ static inline uint64_t surf_off(const HD5770Surf *s, uint32_t *mtx,
     return *mbase + s->eoff[(y & 7) * 8 + (x & 7)];
 }
 
-/* texel (x, y) of level lv as raw components, x and y inside it */
+/* slices of level l: a 3D texture's depth halves with the levels */
+static unsigned tex_slices(const Tex *t, unsigned l)
+{
+    return t->dim == 2 ? MAX(t->slices >> l, 1u) : t->slices;
+}
+
+/* BC1..BC5 (FMT 0x31..0x35) */
+static unsigned bc_kind(unsigned fmt)
+{
+    return fmt >= 0x31 && fmt <= 0x35 ? fmt - 0x30 : 0;
+}
+
+static void bc_565(uint32_t c, uint32_t rgb[3])
+{
+    uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+
+    rgb[0] = (r << 3) | (r >> 2);
+    rgb[1] = (g << 2) | (g >> 4);
+    rgb[2] = (b << 3) | (b >> 2);
+}
+
+/*
+ * The 8-entry interpolated channel of a BC3 alpha / BC4 / BC5 block;
+ * signed (SNORM BC4/BC5): endpoints and results are int8, the extremes
+ * of the 6-value mode -127 and 127.
+ */
+static void bc_chan(const uint8_t *b, uint32_t out[16][4], unsigned c,
+                    bool sgn)
+{
+    int32_t a0 = sgn ? (int8_t)b[0] : b[0], a1 = sgn ? (int8_t)b[1] : b[1];
+    int32_t pal[8];
+    uint64_t bits = 0;
+    unsigned k;
+
+    for (k = 0; k < 6; k++) {
+        bits |= (uint64_t)b[2 + k] << (8 * k);
+    }
+    pal[0] = a0;
+    pal[1] = a1;
+    for (k = 2; k < 8; k++) {
+        if (a0 > a1) {
+            pal[k] = ((8 - k) * a0 + (k - 1) * a1) / 7;
+        } else if (k < 6) {
+            pal[k] = ((6 - k) * a0 + (k - 1) * a1) / 5;
+        } else if (sgn) {
+            pal[k] = k == 6 ? -127 : 127;
+        } else {
+            pal[k] = k == 6 ? 0 : 255;
+        }
+    }
+    for (k = 0; k < 16; k++) {
+        out[k][c] = (uint32_t)pal[(bits >> (3 * k)) & 7];
+    }
+}
+
+/*
+ * One 4x4 block, texels in row order, components 0..3 = R, G, B, A
+ * (BC4: R; BC5: R, G) as 8-bit values.
+ */
+static void bc_decode(unsigned bc, const uint8_t *b, uint32_t out[16][4],
+                      uint32_t sgn)
+{
+    unsigned k, t;
+
+    memset(out, 0, 16 * sizeof(out[0]));
+    if (bc >= 4) {
+        bc_chan(b, out, 0, sgn & 1);
+        if (bc == 5) {
+            bc_chan(b + 8, out, 1, (sgn >> 1) & 1);
+        }
+        return;
+    }
+    {
+        const uint8_t *cb = bc == 1 ? b : b + 8;
+        uint32_t c0 = lduw_le_p(cb), c1 = lduw_le_p(cb + 2);
+        uint32_t idx = ldl_le_p(cb + 4), pal[4][3];
+        bool four = bc != 1 || c0 > c1;
+
+        bc_565(c0, pal[0]);
+        bc_565(c1, pal[1]);
+        for (k = 0; k < 3; k++) {
+            if (four) {
+                pal[2][k] = (2 * pal[0][k] + pal[1][k]) / 3;
+                pal[3][k] = (pal[0][k] + 2 * pal[1][k]) / 3;
+            } else {
+                pal[2][k] = (pal[0][k] + pal[1][k]) / 2;
+                pal[3][k] = 0;
+            }
+        }
+        for (t = 0; t < 16; t++) {
+            unsigned i = (idx >> (2 * t)) & 3;
+
+            for (k = 0; k < 3; k++) {
+                out[t][k] = pal[i][k];
+            }
+            out[t][3] = bc == 1 && !four && i == 3 ? 0 : 255;
+            if (bc == 2) {
+                out[t][3] = ((b[t >> 1] >> ((t & 1) * 4)) & 15) * 17;
+            }
+        }
+        if (bc == 3) {
+            bc_chan(b, out, 3, false);
+        }
+    }
+}
+
+/* texel (x, y) of slice t->z of level lv as raw components, x and y inside it */
 static void texel(Draw *d, Tex *t, unsigned lv, int x, int y,
                   HD5770Val out[4])
 {
     const HD5770Surf *ls = lv ? &t->lv[lv] : &t->s;
-    uint64_t off = lv ? hd5770_surf_offset_fast(ls, x, y)
-                      : surf_off(&t->s, &t->mtx, &t->mty, &t->mbase, x, y);
-    uint8_t *p = hd5770_span_ptr(&d->g->mem, &d->span_tex, ls->base + off,
-                                 t->s.bpe, false);
+    int ex = t->bc ? x >> 2 : x, ey = t->bc ? y >> 2 : y;
+    unsigned z = t->z;
+    uint64_t off;
+    uint8_t *p;
     uint32_t c[4];
     unsigned bits[4], k, n;
     HD5770Val v[6];
 
+    if (t->dim == 2) {
+        /* 3D: the nearest slice of the level */
+        unsigned ns = tex_slices(t, lv);
+
+        z = MIN((unsigned)(t->zn * ns), ns - 1);
+    }
+    off = lv || z ? hd5770_surf_offset_fast(ls, ex, ey)
+                  : surf_off(&t->s, &t->mtx, &t->mty, &t->mbase, ex, ey);
+    off += z * t->slice_bytes[lv];
+    p = hd5770_span_ptr(&d->g->mem, &d->span_tex, ls->base + off, t->s.bpe,
+                        false);
     if (!p) {
         out[0].f = out[1].f = out[2].f = out[3].f = 0.0f;
         return;
     }
-    if (t->unorm8) {
+    if (t->bc) {
+        unsigned i = (y & 3) * 4 + (x & 3);
+
+        if (t->bc_addr != ls->base + off + 1) {
+            bc_decode(t->bc, p, t->bc_texel, t->bc >= 4 ? t->sgn : 0);
+            t->bc_addr = ls->base + off + 1;
+        }
+        for (k = 0; k < 4; k++) {
+            int32_t e = (int32_t)t->bc_texel[i][k];
+
+            /* SNORM: e / 127, -128 reads as -1 */
+            v[k].f = t->bc >= 4 && ((t->sgn >> k) & 1)
+                     ? MAX(e / 127.0f, -1.0f) : unorm8[e & 0xff];
+        }
+        if (t->bc >= 4) {
+            v[1].f = t->bc == 5 ? v[1].f : 0.0f;
+            v[2].f = 0.0f;
+            v[3].f = 1.0f;
+        }
+    } else if (t->unorm8) {
         uint32_t e = ldl_le_p(p);
 
         for (k = 0; k < 4; k++) {
@@ -858,6 +1053,23 @@ static void texel(Draw *d, Tex *t, unsigned lv, int x, int y,
                 v[k].f = k == 3 ? 1.0f : 0.0f;
             }
         }
+    }
+    if (t->cmp) {
+        /* 1 when the reference passes against the fetched value */
+        float f = v[0].f, r = t->ref;
+        bool pass;
+
+        switch (t->cmp - 1) {
+        case 1: pass = r < f; break;
+        case 2: pass = r == f; break;
+        case 3: pass = r <= f; break;
+        case 4: pass = r > f; break;
+        case 5: pass = r != f; break;
+        case 6: pass = r >= f; break;
+        case 7: pass = true; break;
+        default: pass = false; break;
+        }
+        v[0].f = v[1].f = v[2].f = v[3].f = pass ? 1.0f : 0.0f;
     }
     v[4].f = 0.0f;
     v[5].f = 1.0f;
@@ -942,6 +1154,14 @@ static void tex_levels(Tex *t, uint64_t mip_addr)
         HD5770Surf *ls = &t->lv[l];
         uint32_t w = MAX(t->w >> l, 1u), h = MAX(t->h >> l, 1u), pw, ph;
 
+        t->lw[l] = w;
+        t->lh[l] = h;
+        if (t->bc) {
+            /* in blocks */
+            w = DIV_ROUND_UP(w, 4);
+            h = DIV_ROUND_UP(h, 4);
+        }
+
         if (mode == HD5770_ARRAY_2D_TILED_THIN1 && (w < mtw || h < mth)) {
             mode = HD5770_ARRAY_1D_TILED_THIN1;
         }
@@ -969,9 +1189,8 @@ static void tex_levels(Tex *t, uint64_t mip_addr)
         ls->pitch = pw;
         ls->height = ph;
         hd5770_surf_prep(ls);
-        t->lw[l] = w;
-        t->lh[l] = h;
-        off += (uint64_t)pw * ph * bpe;
+        t->slice_bytes[l] = (uint64_t)pw * ph * bpe;
+        off += t->slice_bytes[l] * tex_slices(t, l);
     }
 }
 
@@ -1003,18 +1222,55 @@ static Tex *tex_get(Draw *d, unsigned id, unsigned sid)
     if (!tex_setup(d, id, sid, &d->tex[i])) {
         return NULL;
     }
-    pend_check(d->g, d->tex[i].s.base, hd5770_surf_size(&d->tex[i].s));
+    pend_check(d->g, d->tex[i].s.base,
+               d->tex[i].slice_bytes[0] * d->tex[i].slices);
     if (d->tex[i].mip) {
         unsigned l;
 
         for (l = 1; l <= d->tex[i].last_lv; l++) {
             pend_check(d->g, d->tex[i].lv[l].base,
-                       hd5770_surf_size(&d->tex[i].lv[l]));
+                       d->tex[i].slice_bytes[l] * tex_slices(&d->tex[i], l));
         }
     }
     d->tex_key[i] = key;
     d->n_tex = MAX(d->n_tex, i + 1);
     return &d->tex[i];
+}
+
+/*
+ * The slice a fetch reads: the cube face (z; s and t come in [1, 2] as
+ * the CUBE instruction's tc / |ma| + 1.5 and are made [0, 1]), the array
+ * layer (y of a 1D array, z of a 2D array), the depth of a 3D texture.
+ */
+static void tex_slice(Tex *t, const uint32_t *w, HD5770Val c[4], bool ld)
+{
+    int layer;
+    float zn;
+
+    switch (t->dim) {
+    case 3:
+        layer = c[2].f > 0.0f ? (int)c[2].f : 0;
+        t->z = MIN(layer, 5);
+        c[0].f -= 1.0f;
+        c[1].f -= 1.0f;
+        break;
+    case 4:
+    case 5:
+        layer = ld ? c[t->dim - 3].i : (int)rintf(c[t->dim - 3].f);
+        t->z = MAX(0, MIN(layer, (int)t->slices - 1));
+        break;
+    case 2:
+        if (ld) {
+            zn = (c[2].i + 0.5f) / t->slices;
+        } else {
+            zn = (w[1] >> 30) & 1 ? c[2].f : c[2].f / t->slices;
+        }
+        if (((t->samp[0] >> 6) & 7) == 0) {
+            zn -= floorf(zn);
+        }
+        t->zn = zn > 0.0f ? MIN(zn, 1.0f) : 0.0f;
+        break;
+    }
 }
 
 /* a normalised coordinate in texels of a level, with the half-texel offset */
@@ -1061,13 +1317,14 @@ static void sample_lv(Draw *d, Tex *t, unsigned lv, float u, float vv,
  * (4..7), NULL if not known; they choose the level of a mipmapped
  * texture.
  */
-static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
+static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c0[4],
                          HD5770Val v[4], unsigned base_r, unsigned base_s,
                          const float *dv)
 {
     unsigned op = w[0] & 0x1f, id, sid, k;
     float u, vv;
     Tex *t;
+    HD5770Val c[4];
     int ox = ((int32_t)(w[2] << 27)) >> 27, oy = ((int32_t)(w[2] << 22)) >> 27;
     bool nx = (w[1] >> 28) & 1, ny = (w[1] >> 29) & 1;
 
@@ -1081,6 +1338,18 @@ static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c[4],
         return;
     }
     d->st->tex_fetch++;
+    memcpy(c, c0, sizeof(c));
+    t->z = 0;
+    t->cmp = 0;
+    if (op >= 0x18 && op <= 0x1b) {
+        /* SAMPLE_C*: as SAMPLE*, each texel compared with w */
+        t->cmp = ((t->samp[0] >> 22) & 7) + 1;
+        t->ref = c[3].f;
+        op -= 8;
+    }
+    if (op != 0x04) {
+        tex_slice(t, w, c, op == 0x03);
+    }
     if (op == 0x04) {
         /* GET_TEXTURE_RESINFO: the size of level x, the number of levels */
         unsigned lv = MIN(c[0].u + t->base_lv, 31u);
@@ -1321,13 +1590,6 @@ static bool rt_setup(Draw *d, unsigned cb)
     if (!d->rt_fmt) {
         return false;
     }
-    for (i = 1; i < 8 && !cb; i++) {
-        if ((CTX(g, base + i * CB_COLOR_STRIDE + 0x10) >> 2) & 0x3f &&
-            (CTX(g, CB_TARGET_MASK) >> (4 * i)) & 0xf) {
-            d->st->gap_misc[HD5770_GAP_MRT]++;
-            break;
-        }
-    }
     d->rt_num = (info >> 12) & 7;
     d->rt_swap = (info >> 15) & 3;
     d->rt_bpe = hd5770_fmt_bytes(d->rt_fmt);
@@ -1382,6 +1644,58 @@ static bool rt_setup(Draw *d, unsigned cb)
     d->x1 = MIN(d->x1, (int)d->rt.pitch);
     d->y1 = MIN(d->y1, (int)d->rt.height);
     return true;
+}
+
+/*
+ * Colour buffers 1..7 with a format and a write mask: the draw writes
+ * every such target, export n to colour buffer n, each with its own
+ * write mask and CB_BLENDn_CONTROL.
+ */
+static void mrt_setup(Draw *d)
+{
+    HD5770Gfx *g = d->g;
+    uint32_t mask = CTX(g, CB_TARGET_MASK) & CTX(g, CB_SHADER_MASK);
+    uint8_t *cur = (uint8_t *)d + MRT_FIRST;
+    unsigned i, n = 0;
+
+    for (i = 1; i < 8; i++) {
+        if ((CTX(g, CB_COLOR0_BASE + i * CB_COLOR_STRIDE + 0x10) >> 2) & 0x3f &&
+            (mask >> (4 * i)) & 0xf) {
+            break;
+        }
+    }
+    if (i == 8) {
+        return;
+    }
+    d->mrt = g_malloc(8 * MRT_BYTES);
+    if (d->color) {
+        memcpy(d->mrt, cur, MRT_BYTES);
+        d->mrt_cb[n++] = 0;
+    }
+    for (i = 1; i < 8; i++) {
+        uint32_t m = (mask >> (4 * i)) & 0xf;
+
+        if (!m || !((CTX(g, CB_COLOR0_BASE + i * CB_COLOR_STRIDE + 0x10) >> 2)
+                    & 0x3f) || !rt_setup(d, i)) {
+            continue;
+        }
+        d->wmask = m;
+        d->blend = CTX(g, CB_BLEND0_CONTROL + 4 * i);
+        memcpy(d->mrt + n * MRT_BYTES, cur, MRT_BYTES);
+        d->mrt_cb[n++] = i;
+    }
+    d->nmrt = n;
+    if (n) {
+        memcpy(cur, d->mrt, MRT_BYTES);
+        d->color = true;
+    }
+}
+
+/* render target k of an MRT draw */
+static HD5770Surf *mrt_surf(Draw *d, unsigned k)
+{
+    return (HD5770Surf *)(d->mrt + k * MRT_BYTES + offsetof(Draw, rt) -
+                          MRT_FIRST);
 }
 
 static float blend_factor(unsigned f, const float *src, const float *dst,
@@ -1980,7 +2294,8 @@ static bool clip_pass(Draw *d, int x, int y)
 /* the interpolated depth at barycentrics b0, b1, b2 */
 static inline float frag_z(const Draw *d, float b0, float b1, float b2)
 {
-    return d->tv[0]->z * b0 + d->tv[1]->z * b1 + d->tv[2]->z * b2;
+    return (d->tv[0]->z + d->zoff) * b0 + (d->tv[1]->z + d->zoff) * b1 +
+           (d->tv[2]->z + d->zoff) * b2;
 }
 
 static void shade(Draw *d, int x, int y, HD5770Thread *t)
@@ -2016,6 +2331,23 @@ static void shade(Draw *d, int x, int y, HD5770Thread *t)
                                                    : -1)) {
             return;
         }
+    }
+    if (d->mrt) {
+        uint8_t *cur = (uint8_t *)d + MRT_FIRST;
+        unsigned k;
+
+        for (k = 0; k < d->nmrt; k++) {
+            unsigned cb = d->mrt_cb[k];
+
+            if (t->color_mask & (1u << cb)) {
+                memcpy(cur, d->mrt + k * MRT_BYTES, MRT_BYTES);
+                put_pixel(d, x, y, t->color[cb]);
+                memcpy(d->mrt + k * MRT_BYTES, cur, MRT_BYTES);
+            }
+        }
+        memcpy(cur, d->mrt, MRT_BYTES);
+        d->st->pixels++;
+        return;
     }
     if (!d->color || !(t->color_mask & 1)) {
         return;
@@ -2203,31 +2535,16 @@ static void scissor(Draw *d, uint32_t tl, uint32_t br, bool woff, int wx,
     d->y1 = MIN(d->y1, y1);
 }
 
-static bool vs_run(Draw *d, uint32_t index, Vtx *v, HD5770Thread *t)
+/* R0 on entry: x vertex index, w instance index */
+/* window coordinates of clip space position x, y, z, w */
+static void vtx_window(Draw *d, Vtx *v, float x, float y, float z, float w)
 {
     HD5770Gfx *g = d->g;
     const float *vp = (const float *)&g->ctx[(PA_CL_VPORT_XSCALE_0 - 0x28000)
                                              / 4];
     uint32_t vte = CTX(g, PA_CL_VTE_CNTL);
-    float x, y, z, w;
-    unsigned k;
 
-    memset(t->r, 0, sizeof(t->r[0]) * 4);
-    t->r[0][0].u = index;
-    t->param_mask = 0;
-    t->pos_written = false;
-    if (!hd5770_prog_run(d->vs, &d->vs_env, t) || !d->ok) {
-        return false;
-    }
-    x = t->pos[0].f;
-    y = t->pos[1].f;
-    z = t->pos[2].f;
-    w = t->pos[3].f;
     if (!(vte & (1u << 8))) {
-        if (!(w > 0.0f)) {
-            /* behind the eye: not clipped */
-            d->st->gap_misc[HD5770_GAP_CLIP]++;
-        }
         if (w == 0.0f) {
             w = 1.0f;
         }
@@ -2266,6 +2583,50 @@ static bool vs_run(Draw *d, uint32_t index, Vtx *v, HD5770Thread *t)
     v->y = y;
     v->z = z;
     v->w = w;
+}
+
+/*
+ * Distances of a clip space position to the near and far planes
+ * (PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF puts near at z = 0, else z = -w);
+ * negative = outside.
+ */
+static void clip_dist(const Draw *d, const float *cp, float *dn, float *df)
+{
+    *dn = d->clip_dx ? cp[2] : cp[2] + cp[3];
+    *df = cp[3] - cp[2];
+    if (!d->clip_near) {
+        *dn = 0.0f;
+    }
+    if (!d->clip_far) {
+        *df = 0.0f;
+    }
+}
+
+/* R0 on entry: x vertex index, w instance index */
+static bool vs_run(Draw *d, uint32_t index, uint32_t inst, Vtx *v,
+                   HD5770Thread *t)
+{
+    float dn, df;
+    unsigned k;
+
+    memset(t->r, 0, sizeof(t->r[0]) * 4);
+    t->r[0][0].u = index;
+    t->r[0][3].u = inst;
+    t->param_mask = 0;
+    t->pos_written = false;
+    if (!hd5770_prog_run(d->vs, &d->vs_env, t) || !d->ok) {
+        return false;
+    }
+    for (k = 0; k < 4; k++) {
+        v->cp[k] = t->pos[k].f;
+    }
+    if (!(CTX(d->g, PA_CL_VTE_CNTL) & (1u << 8)) && !(v->cp[3] > 0.0f)) {
+        /* behind the eye */
+        d->st->gap_misc[HD5770_GAP_CLIP]++;
+    }
+    clip_dist(d, v->cp, &dn, &df);
+    v->clip = d->clip_on && (dn < 0.0f || df < 0.0f);
+    vtx_window(d, v, v->cp[0], v->cp[1], v->cp[2], v->cp[3]);
     for (k = 0; k < HD5770_PARAMS; k++) {
         if (t->param_mask & (1u << k)) {
             memcpy(v->param[k], t->param[k], sizeof(v->param[k]));
@@ -2317,8 +2678,42 @@ typedef void TriFn(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
  * (flat inputs; with PROVOKING_VTX_LAST, else the first vertex), then
  * tri().
  */
-static void emit(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
-                 const Vtx *pv, HD5770Thread *t, TriFn *tri)
+/*
+ * POLY_OFFSET_FRONT/BACK: z + SCALE / 16 * max(|dz/dx|, |dz/dy|) +
+ * OFFSET * 2^POLY_OFFSET_NEG_NUM_DB_BITS, clamped by PA_SU_POLY_OFFSET_CLAMP
+ * when that is not 0; the same for every pixel of the triangle.
+ */
+static void poly_offset(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c)
+{
+    HD5770Gfx *g = d->g;
+    unsigned side = d->front ? 0 : 8;
+    float scale, units, clamp, area, dzx, dzy, o;
+    int8_t nb = CTX(g, PA_SU_POLY_OFFSET_DB_FMT_CNTL) & 0xff;
+
+    memcpy(&scale, &g->ctx[(PA_SU_POLY_OFFSET_FRONT_SCALE + side - 0x28000) / 4],
+           4);
+    memcpy(&units, &g->ctx[(PA_SU_POLY_OFFSET_FRONT_SCALE + side + 4 - 0x28000)
+                           / 4], 4);
+    memcpy(&clamp, &g->ctx[(PA_SU_POLY_OFFSET_CLAMP - 0x28000) / 4], 4);
+    area = (b->x - a->x) * (c->y - a->y) - (c->x - a->x) * (b->y - a->y);
+    dzx = dzy = 0.0f;
+    if (area != 0.0f) {
+        dzx = ((b->z - a->z) * (c->y - a->y) - (c->z - a->z) * (b->y - a->y)) /
+              area;
+        dzy = ((c->z - a->z) * (b->x - a->x) - (b->z - a->z) * (c->x - a->x)) /
+              area;
+    }
+    o = scale / 16.0f * fmaxf(fabsf(dzx), fabsf(dzy)) + units * ldexpf(1.0f, nb);
+    if (clamp > 0.0f) {
+        o = fminf(o, clamp);
+    } else if (clamp < 0.0f) {
+        o = fmaxf(o, clamp);
+    }
+    d->zoff = o == o ? o : 0.0f;
+}
+
+static void emit_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
+                     const Vtx *tvp, HD5770Thread *t, TriFn *tri)
 {
     float area = edge(a->x, a->y, b->x, b->y, c->x, c->y);
     bool cw = FACE_CW_IS_AREA_POS ? area > 0 : area < 0;
@@ -2328,12 +2723,85 @@ static void emit(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
         d->st->culled++;
         return;
     }
-    d->tvp = d->prov_last ? pv : a;
+    d->tvp = tvp;
+    d->zoff = 0.0f;
+    if (CTX(d->g, PA_SU_SC_MODE_CNTL) & (d->front ? 1u << 11 : 1u << 12)) {
+        poly_offset(d, a, b, c);
+    }
     tri(d, a, b, c, t);
 }
 
+/* the point at f of the way from a to b, in clip space */
+static void clip_lerp(Draw *d, const Vtx *a, const Vtx *b, float f, Vtx *o)
+{
+    unsigned p, k;
+
+    for (k = 0; k < 4; k++) {
+        o->cp[k] = a->cp[k] + (b->cp[k] - a->cp[k]) * f;
+    }
+    for (p = 0; p < HD5770_PARAMS; p++) {
+        for (k = 0; k < 4; k++) {
+            o->param[p][k].f = a->param[p][k].f +
+                               (b->param[p][k].f - a->param[p][k].f) * f;
+        }
+    }
+    o->clip = false;
+    vtx_window(d, o, o->cp[0], o->cp[1], o->cp[2], o->cp[3]);
+}
+
+/*
+ * A triangle with a vertex beyond the near or far plane: the part inside
+ * (clip space, attributes linear there) as a fan; flat inputs keep the
+ * provoking vertex of the whole triangle.
+ */
+static void emit(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
+                 const Vtx *pv, HD5770Thread *t, TriFn *tri)
+{
+    const Vtx *tvp = d->prov_last ? pv : a;
+    Vtx *buf, *in[9], *out[9], **src = in, **dst = out;
+    unsigned n = 3, m, plane, i, nb = 0;
+
+    if (!a->clip && !b->clip && !c->clip) {
+        emit_tri(d, a, b, c, tvp, t, tri);
+        return;
+    }
+    d->st->clipped++;
+    buf = g_new(Vtx, 12);
+    in[0] = (Vtx *)a;
+    in[1] = (Vtx *)b;
+    in[2] = (Vtx *)c;
+    for (plane = 0; plane < 2 && n >= 3; plane++) {
+        float dist[9], dn, df;
+
+        for (i = 0; i < n; i++) {
+            clip_dist(d, src[i]->cp, &dn, &df);
+            dist[i] = plane ? df : dn;
+        }
+        m = 0;
+        for (i = 0; i < n; i++) {
+            unsigned j = (i + 1) % n;
+
+            if (dist[i] >= 0.0f) {
+                dst[m++] = src[i];
+            }
+            if ((dist[i] >= 0.0f) != (dist[j] >= 0.0f) && nb < 12 && m < 9) {
+                clip_lerp(d, src[i], src[j], dist[i] / (dist[i] - dist[j]),
+                          &buf[nb]);
+                dst[m++] = &buf[nb++];
+            }
+        }
+        n = m;
+        src = dst;
+        dst = src == in ? out : in;
+    }
+    for (i = 1; i + 1 < n && d->ok; i++) {
+        emit_tri(d, src[0], src[i], src[i + 1], tvp, t, tri);
+    }
+    g_free(buf);
+}
+
 /* the primitives of a draw as triangles, in order */
-static void assemble(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
+static void assemble(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
                      HD5770Thread *t, TriFn *tri)
 {
     HD5770GfxStats *st = d->st;
@@ -2343,51 +2811,51 @@ static void assemble(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     case PRIM_RECTLIST:
         /* three corners, v1 adjacent to both others: v3 = v0 + v2 - v1 */
         for (i = 0; i + 3 <= nv && d->ok; i += 3) {
-            Vtx v3 = vb[i + 2];
+            Vtx v3 = *vb[i + 2];
             unsigned p, k;
 
-            v3.x = vb[i].x + vb[i + 2].x - vb[i + 1].x;
-            v3.y = vb[i].y + vb[i + 2].y - vb[i + 1].y;
-            v3.z = vb[i].z + vb[i + 2].z - vb[i + 1].z;
+            v3.x = vb[i]->x + vb[i + 2]->x - vb[i + 1]->x;
+            v3.y = vb[i]->y + vb[i + 2]->y - vb[i + 1]->y;
+            v3.z = vb[i]->z + vb[i + 2]->z - vb[i + 1]->z;
             for (p = 0; p < HD5770_PARAMS; p++) {
                 for (k = 0; k < 4; k++) {
-                    v3.param[p][k].f = vb[i].param[p][k].f +
-                                       vb[i + 2].param[p][k].f -
-                                       vb[i + 1].param[p][k].f;
+                    v3.param[p][k].f = vb[i]->param[p][k].f +
+                                       vb[i + 2]->param[p][k].f -
+                                       vb[i + 1]->param[p][k].f;
                 }
             }
-            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 2], t, tri);
-            emit(d, &vb[i], &vb[i + 2], &v3, &vb[i + 2], t, tri);
+            emit(d, vb[i], vb[i + 1], vb[i + 2], vb[i + 2], t, tri);
+            emit(d, vb[i], vb[i + 2], &v3, vb[i + 2], t, tri);
             st->prims++;
         }
         break;
     case PRIM_QUADLIST:
         for (i = 0; i + 4 <= nv && d->ok; i += 4) {
-            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 3], t, tri);
-            emit(d, &vb[i], &vb[i + 2], &vb[i + 3], &vb[i + 3], t, tri);
+            emit(d, vb[i], vb[i + 1], vb[i + 2], vb[i + 3], t, tri);
+            emit(d, vb[i], vb[i + 2], vb[i + 3], vb[i + 3], t, tri);
             st->prims++;
         }
         break;
     case PRIM_QUADSTRIP:
         /* quad i: vertices 2i, 2i + 1, 2i + 3, 2i + 2 */
         for (i = 0; i + 4 <= nv && d->ok; i += 2) {
-            emit(d, &vb[i], &vb[i + 1], &vb[i + 3], &vb[i + 3], t, tri);
-            emit(d, &vb[i], &vb[i + 3], &vb[i + 2], &vb[i + 3], t, tri);
+            emit(d, vb[i], vb[i + 1], vb[i + 3], vb[i + 3], t, tri);
+            emit(d, vb[i], vb[i + 3], vb[i + 2], vb[i + 3], t, tri);
             st->prims++;
         }
         break;
     case PRIM_TRILIST:
         for (i = 0; i + 3 <= nv && d->ok; i += 3) {
-            emit(d, &vb[i], &vb[i + 1], &vb[i + 2], &vb[i + 2], t, tri);
+            emit(d, vb[i], vb[i + 1], vb[i + 2], vb[i + 2], t, tri);
             st->prims++;
         }
         break;
     case PRIM_TRISTRIP:
         for (i = 2; i < nv && d->ok; i++) {
             if (i & 1) {
-                emit(d, &vb[i - 1], &vb[i - 2], &vb[i], &vb[i], t, tri);
+                emit(d, vb[i - 1], vb[i - 2], vb[i], vb[i], t, tri);
             } else {
-                emit(d, &vb[i - 2], &vb[i - 1], &vb[i], &vb[i], t, tri);
+                emit(d, vb[i - 2], vb[i - 1], vb[i], vb[i], t, tri);
             }
             st->prims++;
         }
@@ -2395,7 +2863,7 @@ static void assemble(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
     case PRIM_TRIFAN:
     case PRIM_POLYGON:
         for (i = 2; i < nv && d->ok; i++) {
-            emit(d, &vb[0], &vb[i - 1], &vb[i], &vb[i], t, tri);
+            emit(d, vb[0], vb[i - 1], vb[i], vb[i], t, tri);
             st->prims++;
         }
         break;
@@ -2435,7 +2903,7 @@ static void gpu_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
     gt.area = area;
     gt.prim = d->st->prims;
     for (q = 0; q < 3; q++) {
-        gt.z[q] = v[q]->z;
+        gt.z[q] = v[q]->z + d->zoff;
     }
     gt.front = d->front;
     g_array_append_val(d->gtri, gt);
@@ -2480,7 +2948,9 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
         }
     }
     memset(gt, 0, sizeof(*gt));
-    if (!tex_setup(d, id, sid, &t) || !gpu_surf(d->g, &t.s, false, &gt->surf)) {
+    if (!tex_setup(d, id, sid, &t) || t.bc || (t.dim != 0 && t.dim != 1) ||
+        !gpu_surf(d->g, &t.s, false, &gt->surf)) {
+        /* compressed, 3D, cube and array textures: on the CPU */
         return false;
     }
     gt->fmt = t.fmt;
@@ -2635,7 +3105,7 @@ static bool gpu_queued(HD5770Gfx *g, Draw *d, int y0, int y1)
  * CPU path draws it again over the same pixels, the two are compared,
  * and VRAM keeps the CPU's result.
  */
-static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
+static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
                      HD5770Thread *t)
 {
     HD5770Gfx *g = d->g;
@@ -2657,7 +3127,7 @@ static bool gpu_draw(Draw *d, Vtx *vb, unsigned nv, unsigned prim,
         g->gst.fallback[GFB_DB]++;
         return false;
     }
-    if (d->rt_bpe > 8) {
+    if (d->rt_bpe > 8 || d->mrt) {
         g->gst.fallback[GFB_RT]++;
         return false;
     }
@@ -2911,7 +3381,7 @@ static void lanes_setup(Draw *d)
     unsigned nconst, nres, i;
     bool grad;
 
-    if (d->resolve || !hd5770_prog_lanes(d->ps, &nconst, &grad)) {
+    if (d->resolve || d->mrt || !hd5770_prog_lanes(d->ps, &nconst, &grad)) {
         return;
     }
     hd5770_prog_resources(d->ps, ids, &nres, ARRAY_SIZE(ids));
@@ -2940,21 +3410,200 @@ static void lanes_setup(Draw *d)
     }
 }
 
+bool hd5770_gfx_state_packet(HD5770Gfx *g, const uint32_t *b, uint32_t n)
+{
+    switch ((b[0] >> 8) & 0xff) {
+    case 0x13:                  /* INDEX_BUFFER_SIZE */
+        if (n >= 2) {
+            g->index_size = b[1];
+        }
+        return true;
+    case 0x26:                  /* INDEX_BASE */
+        if (n >= 3) {
+            g->index_base = (b[1] & ~1u) | ((uint64_t)(b[2] & 0xff) << 32);
+        }
+        return true;
+    case 0x2a:                  /* INDEX_TYPE */
+        if (n >= 2) {
+            g->index_type = b[1];
+        }
+        return true;
+    case 0x2f:                  /* NUM_INSTANCES */
+        if (n >= 2) {
+            g->num_instances = b[1];
+        }
+        return true;
+    }
+    return false;
+}
+
+/*
+ * The indices of a draw packet: *idx = NULL for auto-generated ones
+ * (0..count-1), else count indices as the VGT fetches them (out of the
+ * bounds of the buffer: 0). False for a packet not modelled.
+ */
+static bool draw_indices(HD5770Gfx *g, const uint32_t *b, uint32_t n,
+                         uint32_t *count, uint32_t **idx)
+{
+    unsigned op = (b[0] >> 8) & 0xff;
+    bool i32 = g->index_type & 1;
+    unsigned isz = i32 ? 4 : 2, swap = (g->index_type >> 2) & 3;
+    uint64_t base, max;
+    uint32_t *v, i, k;
+    uint8_t *raw;
+
+    *idx = NULL;
+    switch (op) {
+    case 0x2d:                  /* DRAW_INDEX_AUTO */
+        if (n < 3) {
+            return false;
+        }
+        *count = b[1];
+        return true;
+    case 0x2b:                  /* DRAW_INDEX */
+        if (n < 5) {
+            return false;
+        }
+        base = b[1] | ((uint64_t)(b[2] & 0xff) << 32);
+        *count = b[3];
+        max = b[3];
+        break;
+    case 0x27:                  /* DRAW_INDEX_2 */
+        if (n < 6) {
+            return false;
+        }
+        max = b[1];
+        base = b[2] | ((uint64_t)(b[3] & 0xff) << 32);
+        *count = b[4];
+        break;
+    case 0x29:                  /* DRAW_INDEX_OFFSET */
+        if (n < 4) {
+            return false;
+        }
+        base = g->index_base + ((uint64_t)b[1] << (i32 ? 2 : 1));
+        *count = b[2];
+        max = b[2];
+        break;
+    case 0x35:                  /* DRAW_INDEX_OFFSET_2 */
+        if (n < 5) {
+            return false;
+        }
+        max = b[1];
+        base = g->index_base + ((uint64_t)b[2] << (i32 ? 2 : 1));
+        *count = b[3];
+        break;
+    case 0x2e:                  /* DRAW_INDEX_IMMD: indices in the packet */
+        if (n < 3) {
+            return false;
+        }
+        *count = MIN(b[1], (n - 3) * (i32 ? 1 : 2));
+        v = g_new(uint32_t, MAX(*count, 1));
+        for (i = 0; i < *count; i++) {
+            v[i] = i32 ? b[3 + i] : (b[3 + i / 2] >> (16 * (i & 1))) & 0xffff;
+        }
+        *idx = v;
+        return true;
+    default:
+        return false;
+    }
+    *count = MIN(*count, MAX_VERTS);
+    max = MIN(max, *count);
+    v = g_new0(uint32_t, MAX(*count, 1));
+    raw = g_malloc(max * isz + 1);
+    pend_check(g, base, max * isz);
+    hd5770_mem_read(&g->mem, base, raw, max * isz);
+    for (i = 0; i < max; i++) {
+        uint32_t x = i32 ? ldl_le_p(raw + 4 * i) : lduw_le_p(raw + 2 * i);
+
+        if (swap == 1) {
+            /* bytes swapped in each 16-bit half */
+            x = i32 ? ((x & 0x00ff00ffu) << 8) | ((x >> 8) & 0x00ff00ffu)
+                    : bswap16(x);
+        } else if (swap == 2 && i32) {
+            x = bswap32(x);
+        } else if (swap == 3 && i32) {
+            x = (x << 16) | (x >> 16);
+        }
+        v[i] = x;
+    }
+    for (k = max; k < *count; k++) {
+        v[k] = 0;
+    }
+    g_free(raw);
+    *idx = v;
+    return true;
+}
+
+/* the primitives of vertices vp[0..nv-1]: on the host GPU or the CPU */
+static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
+                       HD5770Thread *t)
+{
+    HD5770Gfx *g = d->g;
+    bool taken;
+    unsigned i;
+
+    memset(t, 0, sizeof(*t));
+    gpu_lock(g, true);
+    taken = gpu_draw(d, vp, nv, prim, t);
+    gpu_lock(g, false);
+    if (!taken) {
+        const HD5770Surf *ws[10] = { d->color ? &d->rt : NULL,
+                                     d->db && d->zfmt ? &d->zs : NULL,
+                                     d->db && d->has_s ? &d->ss : NULL };
+        unsigned nws = 3;
+
+        if (d->mrt) {
+            /* the targets of an MRT draw: target 0 is d->rt now */
+            for (i = 1; i < d->nmrt; i++) {
+                ws[nws++] = mrt_surf(d, i);
+            }
+        }
+        /* the CPU writes the targets: after queued draws that touch them */
+        for (i = 0; i < nws; i++) {
+            uint64_t off;
+
+            if (!ws[i]) {
+                continue;
+            }
+            if (vram_off(g, ws[i]->base, hd5770_surf_size(ws[i]), &off)) {
+                hd5770_gfx_touch(g, off, hd5770_surf_size(ws[i]));
+            } else if (g->ram_pend) {
+                hd5770_gfx_sync(g);
+            }
+        }
+        if (d->resolve) {
+            pend_check(g, d->rs.base, hd5770_surf_size(&d->rs));
+        }
+        d->wy0 = INT_MAX;
+        d->wy1 = -1;
+        assemble(d, vp, nv, prim, t, raster_tri);
+        for (i = 0; i < nws && d->ok && d->g->mem.dirty && d->wy1 >= d->wy0;
+             i++) {
+            uint64_t lo, hi;
+
+            if (ws[i]) {
+                /* the rows drawn */
+                hd5770_surf_rows(ws[i], d->wy0, d->wy1 + 1, &lo, &hi);
+                d->g->mem.dirty(d->g->mem.opaque, lo, hi - lo);
+            }
+        }
+    }
+}
+
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
 {
     HD5770GfxStats *st = g->st;
-    unsigned op = (b[0] >> 8) & 0xff, prim, i, nv, mode;
+    unsigned prim, i, nv, nu, mode;
     unsigned reason = HD5770_SKIP_MAX;
-    uint32_t count, cctl;
+    uint32_t count, cctl, inst, ninst, *idx = NULL, *vid = NULL, *slot = NULL;
     int64_t t0 = get_clock();
     Draw *d;
-    Vtx *vb = NULL;
+    Vtx *vb = NULL, **vp = NULL;
     HD5770Thread *t = NULL;
     int wx, wy;
-    bool taken;
 
     st->draws++;
-    if (op != 0x2d || n < 3) {
+    if (!draw_indices(g, b, n, &count, &idx)) {
         st->skip_reason[HD5770_SKIP_INDEX]++;
         st->skipped++;
         return;
@@ -2963,7 +3612,6 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     d->g = g;
     d->st = st;
     d->ok = true;
-    count = b[1];
     prim = CFG(g, VGT_PRIMITIVE_TYPE) & 0x3f;
     cctl = CTX(g, CB_COLOR_CONTROL);
     mode = (cctl >> 4) & 7;
@@ -3050,10 +3698,19 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     {
         uint32_t sc = CTX(g, PA_SU_SC_MODE_CNTL);
 
+        uint32_t cc = CTX(g, PA_CL_CLIP_CNTL);
+
+        d->clip_near = !((cc >> 26) & 1);
+        d->clip_far = !((cc >> 27) & 1);
+        d->clip_dx = (cc >> 19) & 1;
+        d->clip_on = !((cc >> 16) & 1) && prim != PRIM_RECTLIST &&
+                     !(CTX(g, PA_CL_VTE_CNTL) & (1u << 8)) &&
+                     (d->clip_near || d->clip_far);
         d->cull = prim == PRIM_RECTLIST ? 0 : sc & 3;
         d->face_cw = (sc >> 2) & 1;
         d->prov_last = (sc >> 19) & 1;
-        if (sc & (7u << 11)) {
+        if (sc & (1u << 13)) {
+            /* offset for points and lines */
             st->gap_misc[HD5770_GAP_POLY_OFFSET]++;
         }
         if (CTX(g, SPI_PS_IN_CONTROL_1) & (1u << 8)) {
@@ -3077,6 +3734,8 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     if (d->resolve) {
         d->blend = 0;
         d->alpha_test = false;
+    } else if (mode == CB_NORMAL && !(d->rctl & RC_COLOR_DISABLE)) {
+        mrt_setup(d);
     }
     if (d->x0 >= d->x1 || d->y0 >= d->y1 || (!d->color && !d->db)) {
         reason = HD5770_SKIP_MAX;
@@ -3133,51 +3792,72 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     if (count > MAX_VERTS) {
         st->gap_misc[HD5770_GAP_LOOP]++;
     }
-    vb = g_new(Vtx, MAX(nv, 1) + 1);
-    t = g_new0(HD5770Thread, 1);
-    for (i = 0; i < nv; i++) {
-        if (!vs_run(d, i + CTX(g, VGT_INDX_OFFSET), &vb[i], t)) {
-            reason = HD5770_SKIP_SHADER;
-            goto out;
+    /*
+     * Vertex indices: index + VGT_INDX_OFFSET (fetched indices clamped
+     * to [VGT_MIN_VTX_INDX, VGT_MAX_VTX_INDX]); each distinct vertex is
+     * shaded once per instance. A fetched index equal to
+     * VGT_MULTI_PRIM_IB_RESET_INDX (when enabled) starts a new primitive.
+     */
+    slot = g_new(uint32_t, MAX(nv, 1));
+    vid = g_new(uint32_t, MAX(nv, 1));
+    if (!idx) {
+        for (i = 0; i < nv; i++) {
+            vid[i] = i + CTX(g, VGT_INDX_OFFSET);
+            slot[i] = i;
         }
-    }
-    memset(t, 0, sizeof(*t));
-    gpu_lock(g, true);
-    taken = gpu_draw(d, vb, nv, prim, t);
-    gpu_lock(g, false);
-    if (!taken) {
-        const HD5770Surf *ws[3] = { d->color ? &d->rt : NULL,
-                                    d->db && d->zfmt ? &d->zs : NULL,
-                                    d->db && d->has_s ? &d->ss : NULL };
+        nu = nv;
+    } else {
+        GHashTable *seen = g_hash_table_new(NULL, NULL);
+        bool restart = CTX(g, VGT_MULTI_PRIM_IB_RESET_EN) & 1;
+        uint32_t lo = CTX(g, VGT_MIN_VTX_INDX), hi = CTX(g, VGT_MAX_VTX_INDX);
 
-        /* the CPU writes the targets: after queued draws that touch them */
-        for (i = 0; i < 3; i++) {
-            uint64_t off;
+        nu = 0;
+        for (i = 0; i < nv; i++) {
+            uint32_t x = idx[i], u;
+            gpointer pu;
 
-            if (!ws[i]) {
+            if (restart && x == CTX(g, VGT_MULTI_PRIM_IB_RESET_INDX)) {
+                slot[i] = UINT32_MAX;
                 continue;
             }
-            if (vram_off(g, ws[i]->base, hd5770_surf_size(ws[i]), &off)) {
-                hd5770_gfx_touch(g, off, hd5770_surf_size(ws[i]));
-            } else if (g->ram_pend) {
-                hd5770_gfx_sync(g);
+            x += CTX(g, VGT_INDX_OFFSET);
+            x = MIN(MAX(x, lo), hi);
+            pu = g_hash_table_lookup(seen, GUINT_TO_POINTER(x + 1));
+            if (pu) {
+                u = GPOINTER_TO_UINT(pu) - 1;
+            } else {
+                u = nu++;
+                vid[u] = x;
+                g_hash_table_insert(seen, GUINT_TO_POINTER(x + 1),
+                                    GUINT_TO_POINTER(u + 1));
             }
+            slot[i] = u;
         }
-        if (d->resolve) {
-            pend_check(g, d->rs.base, hd5770_surf_size(&d->rs));
-        }
-        d->wy0 = INT_MAX;
-        d->wy1 = -1;
-        assemble(d, vb, nv, prim, t, raster_tri);
-        for (i = 0; i < 3 && d->ok && d->g->mem.dirty && d->wy1 >= d->wy0;
-             i++) {
-            uint64_t lo, hi;
+        g_hash_table_destroy(seen);
+    }
+    vb = g_new(Vtx, MAX(nu, 1) + 1);
+    vp = g_new(Vtx *, MAX(nv, 1));
+    t = g_new0(HD5770Thread, 1);
+    ninst = MAX(g->num_instances, 1);
+    for (inst = 0; inst < ninst && d->ok; inst++) {
+        unsigned s0 = 0, k = 0;
 
-            if (ws[i]) {
-                /* the rows drawn */
-                hd5770_surf_rows(ws[i], d->wy0, d->wy1 + 1, &lo, &hi);
-                d->g->mem.dirty(d->g->mem.opaque, lo, hi - lo);
+        for (i = 0; i < nu; i++) {
+            if (!vs_run(d, vid[i], inst, &vb[i], t)) {
+                reason = HD5770_SKIP_SHADER;
+                goto out;
             }
+        }
+        /* runs of vertices between restart indices */
+        for (i = 0; i <= nv && d->ok; i++) {
+            if (i < nv && slot[i] != UINT32_MAX) {
+                vp[k++] = &vb[slot[i]];
+                continue;
+            }
+            if (k) {
+                draw_prims(d, vp + s0, k - s0, prim, t);
+            }
+            s0 = k;
         }
     }
     if (d->ok) {
@@ -3191,7 +3871,12 @@ out:
         st->skipped++;
     }
     g_free(vb);
+    g_free(vp);
+    g_free(vid);
+    g_free(slot);
+    g_free(idx);
     g_free(t);
+    g_free(d->mrt);
     g_free(d->nt);
     g_free(d->lanes);
     g_free(d->kv);
@@ -3307,11 +3992,12 @@ void hd5770_gfx_stats(HD5770Gfx *g, GString *out)
         "3D: blended %" PRIu64 " tex fetches %" PRIu64 " vtx fetches %" PRIu64
         " kills %" PRIu64 " ms in draws %" PRIu64 "\n"
         "3D: culled %" PRIu64 " depth/stencil tests %" PRIu64 " failed %"
-        PRIu64 " resolves %" PRIu64 " mipmapped fetches %" PRIu64 "\n",
+        PRIu64 " resolves %" PRIu64 " mipmapped fetches %" PRIu64
+        " clipped %" PRIu64 "\n",
         st->draws, st->drawn, st->skipped, st->prims, st->verts, st->pixels,
         st->blend_on, st->tex_fetch, st->vtx_fetch, st->kills,
         st->ns / 1000000, st->culled, st->db_tests, st->db_fails,
-        st->resolves, st->lod_fetches);
+        st->resolves, st->lod_fetches, st->clipped);
     g_string_append(out, "colour formats drawn:");
     for (i = 0; i < 64; i++) {
         if (st->rt_fmt[i]) {

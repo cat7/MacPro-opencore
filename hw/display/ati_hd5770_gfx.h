@@ -164,7 +164,7 @@ typedef struct HD5770GfxStats {
     uint64_t gap_vtx_fmt[64], gap_mode[16], gap_prim[64], gap_misc[32];
     uint64_t gap_export[8], gap_src_sel;
     uint64_t blend_on, tex_fetch, vtx_fetch, kills;
-    uint64_t culled, db_tests, db_fails, resolves, lod_fetches;
+    uint64_t culled, db_tests, db_fails, resolves, lod_fetches, clipped;
     uint64_t rt_fmt[64];
     uint64_t ns;                /* host time in draws */
     HD5770ShaderInfo sh[HD5770_SHADER_SLOTS];
@@ -234,6 +234,11 @@ typedef struct HD5770Gfx {
     /* serialises the backend between threads; recursive, may be NULL */
     void (*lock)(struct HD5770Gfx *g, bool on);
     void *lock_opaque;
+    /* draw state the CP takes from packets (INDEX_TYPE, INDEX_BASE, ...) */
+    uint32_t index_type;        /* bit 0 32-bit indices, bits 3:2 swap */
+    uint64_t index_base;        /* MC address */
+    uint32_t index_size;        /* INDEX_BUFFER_SIZE, indices */
+    uint32_t num_instances;     /* 0 counts as 1 */
 } HD5770Gfx;
 
 void hd5770_gfx_init(HD5770Gfx *g);
@@ -251,6 +256,8 @@ bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len);
 void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out);
 /* a draw packet, b[0] its header, n dwords */
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n);
+/* a packet that sets draw state; false when op is not one of them */
+bool hd5770_gfx_state_packet(HD5770Gfx *g, const uint32_t *b, uint32_t n);
 void hd5770_gfx_stats(HD5770Gfx *g, GString *out);
 void hd5770_gfx_gaps(HD5770Gfx *g, GString *out);
 void hd5770_gfx_dump_shaders(HD5770Gfx *g, GString *out);

@@ -1009,6 +1009,12 @@ static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
             gap(s, op);
         }
         return PKT_DONE;
+    case OP_INDEX_BUFFER_SIZE:
+    case OP_INDEX_BASE:
+    case OP_INDEX_TYPE:
+    case OP_NUM_INSTANCES:
+        hd5770_gfx_state_packet(&s->gfx3d, b, n);
+        return PKT_DONE;
     case OP_STRMOUT_BUFFER_UPDATE:
         if (n >= 4 && (b[1] & 1)) {
             fx_add(s, FX_WR32, addr40(b[2], b[3], 3), 0, 0);
