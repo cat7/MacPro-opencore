@@ -2230,6 +2230,7 @@ char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
 {
     GString *o;
     unsigned i, j, q, nq = ir->grad || mipmask ? 3 : 1;
+    int last = -1;
     unsigned ng = MAX(ir->ngpr, 1u);
 
     o = g_string_new(NULL);
@@ -2362,19 +2363,41 @@ char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
             "           %s,\n           %s,\n"
             "           killed, C, cm, zd, sd, zw);\n", n1, n2);
     }
+    /*
+     * the neighbour sets only up to the last fetch that reads them (a
+     * gradient, or a sample of a mipmapped unit)
+     */
+    for (i = 0; i < ir->nops && !ir->cf && nq > 1; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+
+        for (j = 0; op->kind == HD5770_IRO_FETCH && j < op->n; j++) {
+            const HD5770IRFetch *f = &ir->fetches[op->first + j];
+            unsigned u;
+
+            for (u = 0; u < ir->nres && ir->res[u] != f->res; u++) {
+                /* search */
+            }
+            if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V ||
+                (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) != 0x03 &&
+                 (f->w[0] & 0x1f) != 0x04 && ((mipmask >> u) & 1))) {
+                last = i;
+            }
+        }
+    }
     for (i = 0; i < ir->nops && !ir->cf; i++) {
         const HD5770IROp *op = &ir->ops[i];
+        unsigned nqi = (int)i <= last ? nq : 1;
 
         switch (op->kind) {
         case HD5770_IRO_ALU:
             for (j = 0; j < op->n; j++) {
-                for (q = 0; q < nq; q++) {
+                for (q = 0; q < nqi; q++) {
                     emit_group(o, ir, &ir->groups[op->first + j], q);
                 }
             }
             break;
         case HD5770_IRO_FETCH:
-            emit_fetch_clause(o, ir, op, nq, mipmask);
+            emit_fetch_clause(o, ir, op, nqi, mipmask);
             break;
         default:
             emit_export(o, ir, op);

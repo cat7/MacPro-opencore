@@ -324,9 +324,21 @@ static void e_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
     g_string_append(o, "                o[0] = 0u;\n                o[1] = 0u;\n"
                        "                o[2] = 0u;\n                o[3] = 0u;\n");
     if (!main && p >= 0) {
-        /* the source as a neighbour run that stops here returns it */
+        unsigned np = 0, i;
+
+        for (i = 0; i < ir->nfetches; i++) {
+            np += pidx[i] >= 0;
+        }
+        /*
+         * the source as a neighbour run that stops here returns it; the
+         * run ends once it has every point
+         */
         g_string_append_printf(o, "                if (!seen[%d]) {\n"
-                               "                    seen[%d] = true;\n", p, p);
+                               "                    seen[%d] = true;\n"
+                               "                    nseen++;\n"
+                               "                    if (nseen >= %uu) {\n"
+                               "                        run = false;\n"
+                               "                    }\n", p, p, np);
         for (k = 0; k < 4; k++) {
             g_string_append_printf(o, "                    rec[%d][%u] = R[%u][%u];\n", p,
                                    k, f->src, k);
@@ -508,7 +520,7 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
         "    int ls_start[%d], ls_end[%d], ls_cnt[%d], ls_idx[%d], ls_inc[%d], ls_sp[%d];\n"
         "    bool ls_dx10[%d];\n"
         "    int rets[%d];\n"
-        "    uint steps = 0u;\n"
+        "    uint steps = 0u, nseen = 0u;\n"
         "    int fq = -1, fend = -1;\n"
         "    while ((run && pc < %u && steps < %uu) || fq >= 0) {\n"
         "%s"

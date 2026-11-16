@@ -62,7 +62,7 @@
 #ifndef ATI_HD5770_IR_H
 #define ATI_HD5770_IR_H
 
-#define HD5770_IR_GPRS          16
+#define HD5770_IR_GPRS          64
 
 enum {
     HD5770_IRS_GPR, HD5770_IRS_PV, HD5770_IRS_CONST, HD5770_IRS_IMM,
