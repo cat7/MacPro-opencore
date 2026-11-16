@@ -79,7 +79,7 @@ enum {
     OP2_MULLO_UINT = 0x91, OP2_MULHI_UINT = 0x92, OP2_FLT_TO_UINT = 0x9a,
     OP2_INT_TO_FLT = 0x9b, OP2_UINT_TO_FLT = 0x9c,
     OP2_FLT_TO_INT_RPI = 0xb0, OP2_FLT_TO_INT_FLOOR = 0xb1, OP2_DOT4 = 0xbe,
-    OP2_DOT4_IEEE = 0xbf, OP2_MAX4 = 0xc1, OP2_MOVA_INT = 0xcc,
+    OP2_DOT4_IEEE = 0xbf, OP2_CUBE = 0xc0, OP2_MAX4 = 0xc1, OP2_MOVA_INT = 0xcc,
     OP2_INTERP_XY = 0xd6, OP2_INTERP_ZW = 0xd7, OP2_INTERP_X = 0xd8,
     OP2_INTERP_Z = 0xd9, OP2_INTERP_LOAD_P0 = 0xe0,
 };
@@ -180,6 +180,7 @@ static bool op2_known(unsigned op)
     case OP2_MULLO_UINT: case OP2_MULHI_UINT: case OP2_FLT_TO_UINT:
     case OP2_INT_TO_FLT: case OP2_UINT_TO_FLT: case OP2_DOT4:
     case OP2_FLT_TO_INT_RPI: case OP2_FLT_TO_INT_FLOOR: case OP2_DOT4_IEEE: case OP2_MAX4: case OP2_MOVA_INT:
+    case OP2_CUBE:
     case OP2_INTERP_XY: case OP2_INTERP_ZW: case OP2_INTERP_X:
     case OP2_INTERP_Z: case OP2_INTERP_LOAD_P0:
         return true;
@@ -403,6 +404,10 @@ static void decode_fetch(HD5770Prog *p, CfInst *cf, HD5770GfxStats *st)
             case 0x11:              /* SAMPLE_L */
             case 0x12:              /* SAMPLE_LB */
             case 0x13:              /* SAMPLE_LZ */
+            case 0x18:              /* SAMPLE_C */
+            case 0x19:              /* SAMPLE_C_L */
+            case 0x1a:              /* SAMPLE_C_LB */
+            case 0x1b:              /* SAMPLE_C_LZ */
                 break;
             default:
                 st->gap_tex[op]++;
@@ -422,7 +427,9 @@ uint32_t hd5770_prog_size(const uint32_t *code, uint32_t max)
         uint32_t w0 = code[i], w1 = code[i + 1];
         uint32_t cend = i + 2;
 
-        if ((w1 >> 29) & 1) {
+        if ((w1 >> 29) & 1 && ((w1 >> 26) & 0xf) == CF_ALU_EXTENDED) {
+            /* the extension words of the next ALU instruction */
+        } else if ((w1 >> 29) & 1) {
             uint32_t a = (w0 & 0x3fffff) * 2;
 
             cend = a + (((w1 >> 18) & 0x7f) + 1) * 2;
@@ -464,6 +471,16 @@ HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
 
         cf->w0 = code[i];
         cf->w1 = code[i + 1];
+        if ((cf->w1 >> 29) & 1 && ((cf->w1 >> 26) & 0xf) == CF_ALU_EXTENDED) {
+            /* kcache sets 2 and 3 of the ALU instruction that follows */
+            cf->op = 0x80 | CF_ALU_EXTENDED;
+            if ((cf->w0 >> 4) & 0xff) {
+                /* indexed constant buffers */
+                st->gap_cf[cf->op]++;
+                gap_mark(p);
+            }
+            continue;
+        }
         if ((cf->w1 >> 29) & 1) {
             first = MIN(first, (cf->w0 & 0x3fffff) * 2);
         } else if (((cf->w1 >> 22) & 0xff) == CF_TEX ||
@@ -474,11 +491,6 @@ HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
             unsigned op = (cf->w1 >> 26) & 0xf;
 
             cf->op = 0x80 | op;
-            if (op == CF_ALU_EXTENDED || op == CF_ALU_CONTINUE ||
-                op == CF_ALU_BREAK) {
-                st->gap_cf[cf->op]++;
-                gap_mark(p);
-            }
             if (((cf->w0 >> 30) & 3) > 2 || ((cf->w1 & 3) > 2)) {
                 st->gap_misc[HD5770_GAP_KCACHE]++;
                 gap_mark(p);
@@ -543,7 +555,8 @@ typedef struct Run {
     bool stack[STACK_DEPTH];
     unsigned sp;
     /* kcache windows of the current ALU clause */
-    unsigned kc_bank[2], kc_addr[2], kc_mode[2];
+    unsigned kc_bank[4], kc_addr[4], kc_mode[4];
+    bool kc_ext, kc_ext_next;   /* the clause uses kcache sets 2 and 3 */
     bool ok;
     /* stop point of a neighbour run */
     bool stop, stopped;
@@ -589,6 +602,17 @@ static HD5770Val read_src(Run *r, const AluInst *in, unsigned s,
         v = r->t->r[idx & (HD5770_GPRS - 1)][chan];
     } else if (sel < 192) {
         unsigned k = sel >= SEL_KCACHE1, i = sel - (k ? SEL_KCACHE1 : SEL_KCACHE0);
+        HD5770Val c[4];
+
+        idx = r->kc_addr[k] * 16 + i;
+        if (in->rel[s]) {
+            idx += in->index_mode == 4 ? r->loop_idx : r->ar[in->index_mode & 3];
+        }
+        r->env->kcache(r->env->opaque, r->kc_bank[k], idx, c);
+        v = c[chan];
+    } else if (r->kc_ext && sel >= 256 && sel < 320) {
+        /* kcache sets 2 and 3 of an ALU_EXTENDED clause */
+        unsigned k = sel >= 288 ? 3 : 2, i = sel - (k == 3 ? 288 : 256);
         HD5770Val c[4];
 
         idx = r->kc_addr[k] * 16 + i;
@@ -1023,6 +1047,74 @@ static HD5770Val post(const AluInst *in, HD5770Val v)
     return v;
 }
 
+/*
+ * CUBE in slots x..w, sources Rn.zzxy and Rn.yxzz: x = T, y = S,
+ * z = 2 * major axis, w = face (+X -X +Y -Y +Z -Z), as in OpenGL's cube
+ * map face selection (sc, tc, ma).
+ */
+static void cube(const AluGroup *g, HD5770Val src[5][3], HD5770Val res[5])
+{
+    float v[3] = { 0.0f, 0.0f, 0.0f }, ax, ay, az, sc, tc, ma, face;
+    bool any = false;
+    unsigned i;
+
+    for (i = 0; i < g->n; i++) {
+        const AluInst *in = &g->inst[i];
+
+        if (in->op != OP2_CUBE) {
+            continue;
+        }
+        any = true;
+        if (in->slot == 2) {
+            v[0] = fmod_src(in, 0, src[i][0]);
+        } else if (in->slot == 3) {
+            v[1] = fmod_src(in, 0, src[i][0]);
+        } else if (in->slot == 0) {
+            v[2] = fmod_src(in, 0, src[i][0]);
+        }
+    }
+    if (!any) {
+        return;
+    }
+    ax = fabsf(v[0]);
+    ay = fabsf(v[1]);
+    az = fabsf(v[2]);
+    if (ax >= ay && ax >= az) {
+        ma = v[0];
+        face = v[0] >= 0.0f ? 0.0f : 1.0f;
+        sc = v[0] >= 0.0f ? -v[2] : v[2];
+        tc = -v[1];
+    } else if (ay >= az) {
+        ma = v[1];
+        face = v[1] >= 0.0f ? 2.0f : 3.0f;
+        sc = v[0];
+        tc = v[1] >= 0.0f ? v[2] : -v[2];
+    } else {
+        ma = v[2];
+        face = v[2] >= 0.0f ? 4.0f : 5.0f;
+        sc = v[2] >= 0.0f ? v[0] : -v[0];
+        tc = -v[1];
+    }
+    for (i = 0; i < g->n; i++) {
+        if (g->inst[i].op == OP2_CUBE) {
+            switch (g->inst[i].slot) {
+            case 0:
+                res[i].f = tc;
+                break;
+            case 1:
+                res[i].f = sc;
+                break;
+            case 2:
+                res[i].f = 2.0f * ma;
+                break;
+            default:
+                res[i].f = face;
+                break;
+            }
+        }
+    }
+}
+
 static void run_group(Run *r, const AluGroup *g)
 {
     HD5770Val res[5], src[5][3];
@@ -1067,7 +1159,7 @@ static void run_group(Run *r, const AluGroup *g)
                 : 0.0f;
             continue;
         }
-        if (op == OP2_MAX4) {
+        if (op == OP2_MAX4 || op == OP2_CUBE) {
             res[i] = src[i][0];
             continue;
         }
@@ -1111,8 +1203,12 @@ static void run_group(Run *r, const AluGroup *g)
             }
         }
     }
+    cube(g, src, res);
     for (i = 0; i < g->n; i++) {
-        res[i] = post(&g->inst[i], res[i]);
+        if (g->inst[i].op != OP2_CUBE || g->inst[i].slot != 3) {
+            /* output modifiers do not touch CUBE's face id */
+            res[i] = post(&g->inst[i], res[i]);
+        }
         wr[i] = g->inst[i].write && g->inst[i].op != OP2_NOP;
     }
     /* results reach PV/PS and the registers together */
@@ -1378,20 +1474,50 @@ static bool run_prog(Run *r)
         unsigned popn = cf->w1 & 7;
 
         pc++;
+        if (cf->op == (0x80 | CF_ALU_EXTENDED)) {
+            r->kc_bank[2] = (cf->w0 >> 22) & 0xf;
+            r->kc_bank[3] = (cf->w0 >> 26) & 0xf;
+            r->kc_mode[2] = (cf->w0 >> 30) & 3;
+            r->kc_mode[3] = cf->w1 & 3;
+            r->kc_addr[2] = (cf->w1 >> 2) & 0xff;
+            r->kc_addr[3] = (cf->w1 >> 10) & 0xff;
+            r->kc_ext_next = true;
+            continue;
+        }
         if (cf->op & 0x80) {
             unsigned op = cf->op & 0xf, g;
 
+            r->kc_ext = r->kc_ext_next;
+            r->kc_ext_next = false;
             r->kc_bank[0] = (cf->w0 >> 22) & 0xf;
             r->kc_bank[1] = (cf->w0 >> 26) & 0xf;
             r->kc_mode[0] = (cf->w0 >> 30) & 3;
             r->kc_mode[1] = cf->w1 & 3;
             r->kc_addr[0] = (cf->w1 >> 2) & 0xff;
             r->kc_addr[1] = (cf->w1 >> 10) & 0xff;
-            if (op == CF_ALU_PUSH_BEFORE) {
+            if (op == CF_ALU_PUSH_BEFORE || op == CF_ALU_BREAK ||
+                op == CF_ALU_CONTINUE) {
                 push(r);
             }
             for (g = 0; g < cf->ngroups; g++) {
                 run_group(r, &p->groups[cf->group0 + g]);
+            }
+            if (op == CF_ALU_BREAK || op == CF_ALU_CONTINUE) {
+                /*
+                 * PUSH, ALU, ELSE, BREAK (CONTINUE), POP: a pixel the
+                 * clause's PRED_SET left inactive leaves the loop (this
+                 * iteration): straight to its LOOP_END
+                 */
+                bool before = r->sp ? r->stack[r->sp - 1] : true;
+                bool hit = before && !r->active;
+
+                pop(r, 1);
+                if (hit && lsp) {
+                    r->sp = loops[lsp - 1].sp + 1;
+                    r->active = op == CF_ALU_CONTINUE;
+                    pc = loops[lsp - 1].end - 1;
+                }
+                continue;
             }
             if (op == CF_ALU_POP_AFTER) {
                 pop(r, 1);
@@ -1636,6 +1762,7 @@ static bool op_lane_ok(const AluInst *in)
     }
     switch (in->op) {
     case OP2_MOVA_INT:
+    case OP2_CUBE:
     case OP2_PRED_SETE: case OP2_PRED_SETGT: case OP2_PRED_SETGE:
     case OP2_PRED_SETNE: case OP2_PRED_SETGT_UINT: case OP2_PRED_SETGE_UINT:
     case OP2_PRED_SETE_INT: case OP2_PRED_SETGT_INT:
@@ -1871,6 +1998,9 @@ static LaneProg *lane_compile(const HD5770Prog *p)
                     f->kind = op == 0x07 ? HD5770_IRF_GRAD_H
                                          : HD5770_IRF_GRAD_V;
                     ir->grad = true;
+                } else if (op >= 0x18) {
+                    /* depth compares: on the CPU */
+                    goto fail;
                 } else {
                     f->kind = HD5770_IRF_TEX;
                     f->res = (w[0] >> 8) & 0xff;
