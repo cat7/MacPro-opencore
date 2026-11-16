@@ -59,6 +59,9 @@
 #define GL_SEG_DRAWS    64      /* draws per segment */
 #define GL_MAX_TILES    (4 * 1024 * 1024)
 #define GL_GROUPS       65535   /* work groups per dispatch call */
+/* a draw waits for its program's build up to its estimated CPU cost, capped */
+#define GL_WAIT_NS      (3000 * (uint64_t)SCALE_MS)
+#define GL_WAIT_MIN_NS  (20 * (uint64_t)SCALE_MS)
 #define GL_POOL         (128u << 20)    /* slots for guest RAM pages */
 
 /* ---- GL, spelled out: opengl32.dll exports 1.1 only ---- */
@@ -258,12 +261,28 @@ enum {
 
 /* ---- what the caller hands to the GL thread ---- */
 
+#define GL_WORKERS      3
+
+typedef struct HD5770Gl HD5770Gl;
+
+/* a compile worker: its thread, window and context */
+typedef struct GlWorker {
+    HD5770Gl *g;
+    QemuThread th;
+    HWND win;
+    HDC dc;
+    HGLRC ctx;
+    char err[320];
+} GlWorker;
+
 typedef struct GlProg {
     int state;                  /* GLP_*, set by the thread that compiles */
-    GLuint prog;
+    GLuint prog;                /* the GL thread's; 0 until it loads bin */
     GLint loc;                  /* tile0 */
     uint64_t hash;
-    char *src;                  /* until compiled */
+    char *src;                  /* until the GL thread has the program */
+    uint8_t *bin;               /* a compile worker's binary, until loaded */
+    uint32_t bin_len, bin_fmt;
 } GlProg;
 
 enum { GLP_QUEUED, GLP_READY, GLP_FAILED };
@@ -328,14 +347,17 @@ typedef struct HD5770Gl {
     HWND win;
     HDC dc;
     HGLRC ctx;
-    /* programs are compiled on a thread of their own, in a shared context */
-    QemuThread cthread;
+    /*
+     * Programs are compiled by workers, each with a context of its own
+     * outside the GL thread's share group (a shared context would hold
+     * the GL thread's draws for as long as a compile takes); a worker
+     * hands over the program binary, which the GL thread loads.
+     */
+    GlWorker w[GL_WORKERS];
+    unsigned nworkers;
     QemuCond ccond;
     GQueue *cq;                 /* GlProg */
     bool cquit, cthread_on;
-    HWND cwin;
-    HDC cdc;
-    HGLRC cctx;
     GLuint buf[B_N];
     GLint align;
     char renderer[160];
@@ -369,7 +391,7 @@ typedef struct HD5770Gl {
     uint64_t barriers, up_bytes, chk_bytes, rb_bytes, wb_bytes, compiles;
     uint64_t st_bytes;
     uint64_t failed;
-    uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns;
+    uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns, compile_wait_ns;
     uint64_t pb_hits, pb_rejected, pb_stored;
     uint64_t ram_draws, pool_resets, slots_max;
 } HD5770Gl;
@@ -465,11 +487,11 @@ static GLuint pb_load(HD5770Gl *g, const char *path, const uint8_t key[32])
         pr = 0;
         goto bad;
     }
-    g->pb_hits++;
+    qatomic_inc(&g->pb_hits);
     g_free(data);
     return pr;
 bad:
-    g->pb_rejected++;
+    qatomic_inc(&g->pb_rejected);
     g_free(data);
     return 0;
 }
@@ -499,15 +521,16 @@ static void pb_store(HD5770Gl *g, GLuint pr, const char *path,
         memcpy(buf, &h, sizeof(h));
         if (g_mkdir_with_parents(g->cdir, 0700) == 0 &&
             g_file_set_contents(path, (gchar *)buf, sizeof(h) + got, NULL)) {
-            g->pb_stored++;
+            qatomic_inc(&g->pb_stored);
         }
     }
     g_free(buf);
 }
 
-static void gl_compile(HD5770Gl *g, GlProg *p)
+/* p's program in the current context, or 0 with the reason in err */
+static GLuint gl_compile(HD5770Gl *g, GlProg *p, char *err, size_t errlen)
 {
-    GLuint sh, pr;
+    GLuint sh, pr = 0;
     GLint ok = 0, n = 0;
     const GLchar *src = p->src;
     int64_t t0 = get_clock();
@@ -517,8 +540,6 @@ static void gl_compile(HD5770Gl *g, GlProg *p)
     if (path) {
         pr = pb_load(g, path, key);
         if (pr) {
-            p->prog = pr;
-            p->loc = p_glGetUniformLocation(pr, "tile0");
             goto out;
         }
     }
@@ -530,17 +551,14 @@ static void gl_compile(HD5770Gl *g, GlProg *p)
         char log[600] = "";
 
         p_glGetShaderInfoLog(sh, sizeof(log), NULL, log);
-        snprintf(g->err, sizeof(g->err), "%s", log);
+        snprintf(err, errlen, "%s", log);
         p_glDeleteShader(sh);
-        p->prog = 0;
-        g->failed++;
+        qatomic_inc(&g->failed);
         goto out;
     }
     pr = p_glCreateProgram();
     p_glAttachShader(pr, sh);
-    if (path) {
-        p_glProgramParameteri(pr, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
-    }
+    p_glProgramParameteri(pr, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
     p_glLinkProgram(pr);
     p_glDeleteShader(sh);
     p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
@@ -548,30 +566,29 @@ static void gl_compile(HD5770Gl *g, GlProg *p)
         char log[600] = "";
 
         p_glGetProgramInfoLog(pr, sizeof(log), &n, log);
-        snprintf(g->err, sizeof(g->err), "%s", log);
+        snprintf(err, errlen, "%s", log);
         p_glDeleteProgram(pr);
-        p->prog = 0;
-        g->failed++;
+        pr = 0;
+        qatomic_inc(&g->failed);
         goto out;
     }
-    p->prog = pr;
-    p->loc = p_glGetUniformLocation(pr, "tile0");
     if (path) {
         pb_store(g, pr, path, key);
     }
 out:
     g_free(path);
-    g->compiles++;
-    g->compile_ns += get_clock() - t0;
+    qatomic_inc(&g->compiles);
+    qatomic_add(&g->compile_ns, get_clock() - t0);
+    return pr;
 }
 
-/* compile, and publish the result to the caller's thread */
+/* on the GL thread: compile, and publish the result to the caller */
 static void gl_build(HD5770Gl *g, GlProg *p)
 {
-    gl_compile(g, p);
-    /* the program is complete before another context uses it */
-    p_glFinish();
-    if (!p->prog) {
+    p->prog = gl_compile(g, p, g->err, sizeof(g->err));
+    if (p->prog) {
+        p->loc = p_glGetUniformLocation(p->prog, "tile0");
+    } else {
         warn_report("ati-hd5770: gl: program %016" PRIx64 " not built: %.200s",
                     p->hash, g->err);
     }
@@ -580,11 +597,74 @@ static void gl_build(HD5770Gl *g, GlProg *p)
     qatomic_store_release(&p->state, p->prog ? GLP_READY : GLP_FAILED);
 }
 
+/* on a worker: compile in its context, keep the binary for the GL thread */
+static void gl_wbuild(GlWorker *w, GlProg *p)
+{
+    HD5770Gl *g = w->g;
+    GLuint pr = gl_compile(g, p, w->err, sizeof(w->err));
+    GLint len = 0;
+    GLsizei got = 0;
+    GLenum fmt = 0;
+
+    if (pr) {
+        p_glGetProgramiv(pr, GL_PROGRAM_BINARY_LENGTH, &len);
+        if (len > 0 && (uint32_t)len <= PB_MAX) {
+            p->bin = g_malloc(len);
+            p_glGetProgramBinary(pr, len, &got, &fmt, p->bin);
+            if (p_glGetError() != GL_NO_ERROR || got <= 0 || got > len) {
+                g_free(p->bin);
+                p->bin = NULL;
+            } else {
+                p->bin_len = got;
+                p->bin_fmt = fmt;
+            }
+        }
+        p_glDeleteProgram(pr);
+    } else {
+        warn_report("ati-hd5770: gl: program %016" PRIx64 " not built: %.200s",
+                    p->hash, w->err);
+    }
+    /* no binary: the GL thread compiles the source itself */
+    qatomic_store_release(&p->state, pr ? GLP_READY : GLP_FAILED);
+}
+
+/* on the GL thread, before p's first dispatch */
+static void gl_load_prog(HD5770Gl *g, GlProg *p)
+{
+    GLint ok = 0;
+
+    if (p->bin) {
+        GLuint pr = p_glCreateProgram();
+
+        p_glProgramBinary(pr, p->bin_fmt, p->bin, p->bin_len);
+        p_glGetProgramiv(pr, GL_LINK_STATUS, &ok);
+        while (p_glGetError() != GL_NO_ERROR) {
+            ok = 0;
+        }
+        if (ok) {
+            p->prog = pr;
+        } else {
+            p_glDeleteProgram(pr);
+        }
+        g_free(p->bin);
+        p->bin = NULL;
+    }
+    if (!p->prog && p->src) {
+        p->prog = gl_compile(g, p, g->err, sizeof(g->err));
+    }
+    if (p->prog) {
+        p->loc = p_glGetUniformLocation(p->prog, "tile0");
+    }
+    g_free(p->src);
+    p->src = NULL;
+}
+
 static void *gl_cthread(void *opaque)
 {
-    HD5770Gl *g = opaque;
+    GlWorker *w = opaque;
+    HD5770Gl *g = w->g;
 
-    wglMakeCurrent(g->cdc, g->cctx);
+    wglMakeCurrent(w->dc, w->ctx);
     qemu_mutex_lock(&g->lock);
     for (;;) {
         GlProg *p;
@@ -597,7 +677,7 @@ static void *gl_cthread(void *opaque)
         }
         p = g_queue_pop_head(g->cq);
         qemu_mutex_unlock(&g->lock);
-        gl_build(g, p);
+        gl_wbuild(w, p);
         qemu_mutex_lock(&g->lock);
     }
     qemu_mutex_unlock(&g->lock);
@@ -660,6 +740,9 @@ static void gl_run_seg(HD5770Gl *g, GlSeg *s)
         }
         if (cur != c->prog) {
             cur = c->prog;
+            if (!cur->prog) {
+                gl_load_prog(g, cur);
+            }
             p_glUseProgram(cur->prog);
         }
         for (k = 0; k < c->ntiles; k += GL_GROUPS) {
@@ -814,17 +897,23 @@ static void gl_run_sync(HD5770Gl *g)
 
 static void gl_close_ctx(HD5770Gl *g)
 {
-    if (g->cctx) {
-        wglDeleteContext(g->cctx);
-        g->cctx = NULL;
-    }
-    if (g->cdc) {
-        ReleaseDC(g->cwin, g->cdc);
-        g->cdc = NULL;
-    }
-    if (g->cwin) {
-        DestroyWindow(g->cwin);
-        g->cwin = NULL;
+    unsigned i;
+
+    for (i = 0; i < GL_WORKERS; i++) {
+        GlWorker *w = &g->w[i];
+
+        if (w->ctx) {
+            wglDeleteContext(w->ctx);
+            w->ctx = NULL;
+        }
+        if (w->dc) {
+            ReleaseDC(w->win, w->dc);
+            w->dc = NULL;
+        }
+        if (w->win) {
+            DestroyWindow(w->win);
+            w->win = NULL;
+        }
     }
     if (g->ctx) {
         wglMakeCurrent(NULL, NULL);
@@ -943,12 +1032,24 @@ static bool gl_open_ctx(HD5770Gl *g)
 
         g->ctx = arb.mk(g->dc, NULL, attr);
         if (g->ctx) {
-            /* the compile thread's, on a window of its own */
-            g->cwin = CreateWindowExA(0, cls, cls, WS_POPUP, 0, 0, 1, 1, NULL,
-                                      NULL, GetModuleHandleA(NULL), NULL);
-            g->cdc = g->cwin ? GetDC(g->cwin) : NULL;
-            if (g->cdc && SetPixelFormat(g->cdc, fmt, &pfd)) {
-                g->cctx = arb.mk(g->cdc, g->ctx, attr);
+            unsigned i;
+
+            /* the compile workers', each on a window of its own, unshared */
+            for (i = 0; i < GL_WORKERS; i++) {
+                GlWorker *w = &g->w[i];
+
+                w->g = g;
+                w->win = CreateWindowExA(0, cls, cls, WS_POPUP, 0, 0, 1, 1,
+                                         NULL, NULL, GetModuleHandleA(NULL),
+                                         NULL);
+                w->dc = w->win ? GetDC(w->win) : NULL;
+                if (w->dc && SetPixelFormat(w->dc, fmt, &pfd)) {
+                    w->ctx = arb.mk(w->dc, NULL, attr);
+                }
+                if (!w->ctx) {
+                    break;
+                }
+                g->nworkers++;
             }
         }
     }
@@ -1013,7 +1114,7 @@ static bool gl_open_ctx(HD5770Gl *g)
     {
         GlProg t = { .src = hd5770_glsl_lib_only() };
 
-        gl_compile(g, &t);
+        t.prog = gl_compile(g, &t, g->err, sizeof(g->err));
         g_free(t.src);
         if (!t.prog) {
             char log[320];
@@ -1032,6 +1133,10 @@ static bool gl_open_ctx(HD5770Gl *g)
         const char *base = g_getenv("LOCALAPPDATA");
 
         p_glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nfmt);
+        if (nfmt <= 0) {
+            /* nothing to hand over: the GL thread compiles */
+            g->nworkers = 0;
+        }
         if (nfmt > 0 && base && *base) {
             g->cdir = g_strdup_printf("%s\\qemu-x86-opencore\\hd5770-gl",
                                       base);
@@ -1307,6 +1412,22 @@ static void gl_need(HD5770Gl *g, uint64_t lo, uint64_t hi)
     }
     if (in) {
         gl_upload(g, run, (p1 + 1) << GL_PAGE_SH);
+    }
+}
+
+/* the CPU wrote these bytes: their pages are compared again when needed */
+static void gl_wrote(void *opaque, uint64_t off, uint64_t len)
+{
+    HD5770Gl *g = opaque;
+    uint64_t p;
+
+    if (!len) {
+        /* guest RAM: every page */
+        g->epoch++;
+        return;
+    }
+    for (p = off >> GL_PAGE_SH; p <= (off + len - 1) >> GL_PAGE_SH; p++) {
+        g->pchk[p] = 0;
     }
 }
 
@@ -1772,6 +1893,27 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         mipmask |= (uint32_t)d->tex[i].mip << i;
     }
     p = gl_prog(g, d->ir, mipmask);
+    if (qatomic_load_acquire(&p->state) == GLP_QUEUED && g->cthread_on) {
+        /*
+         * The CPU would draw it meanwhile: wait for the build up to about
+         * what that costs (a pixel: some 20 ns an instruction, 200 a fetch)
+         */
+        uint64_t px = 0, ns;
+        int64_t t0w = get_clock(), until;
+
+        for (i = 0; i < d->ntri; i++) {
+            px += (uint64_t)(d->tri[i].x1 - d->tri[i].x0 + 1) *
+                  (d->tri[i].y1 - d->tri[i].y0 + 1);
+        }
+        ns = MIN(px * (20 * d->ir->ninsts + 200 * d->ir->nfetches),
+                 GL_WAIT_NS);
+        until = t0w + ns;
+        while (qatomic_load_acquire(&p->state) == GLP_QUEUED &&
+               ns >= GL_WAIT_MIN_NS && get_clock() < until) {
+            g_usleep(500);
+        }
+        g->compile_wait_ns += get_clock() - t0w;
+    }
     switch (qatomic_load_acquire(&p->state)) {
     case GLP_QUEUED:
         g->declined[GLD_COMPILING]++;
@@ -2142,13 +2284,15 @@ static void gl_stats(void *opaque, GString *out)
         PRIu64 " wait ms %" PRIu64 " (gpu %" PRIu64 " read back %" PRIu64
         ") encode ms %" PRIu64 " programs %u compiled %" PRIu64
         " (failed %" PRIu64 ") in ms %" PRIu64 " binaries: loaded %" PRIu64
-        " rejected %" PRIu64 " stored %" PRIu64 "\n",
+        " rejected %" PRIu64 " stored %" PRIu64 "; draws waited for builds ms %"
+        PRIu64 "\n",
         g->syncs, g->segs, g->dispatches,
         g->barriers, g->st_bytes >> 20, g->chk_bytes >> 20, g->up_bytes >> 20,
         g->rb_bytes >> 20, g->wb_bytes >> 10, g->wait_ns / 1000000,
         g->gpu_ns / 1000000, g->rb_ns / 1000000, g->encode_ns / 1000000,
         g_hash_table_size(g->progs), g->compiles, g->failed,
-        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored);
+        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored,
+        g->compile_wait_ns / 1000000);
 }
 
 static void gl_prog_free(gpointer p)
@@ -2156,6 +2300,7 @@ static void gl_prog_free(gpointer p)
     GlProg *gp = p;
 
     g_free(gp->src);
+    g_free(gp->bin);
     g_free(gp);
 }
 
@@ -2169,9 +2314,11 @@ static void gl_close(void *opaque)
     if (g->cthread_on) {
         qemu_mutex_lock(&g->lock);
         g->cquit = true;
-        qemu_cond_signal(&g->ccond);
+        qemu_cond_broadcast(&g->ccond);
         qemu_mutex_unlock(&g->lock);
-        qemu_thread_join(&g->cthread);
+        for (i = 0; i < g->nworkers; i++) {
+            qemu_thread_join(&g->w[i].th);
+        }
     }
     gl_job(g, &j, true);
     qemu_thread_join(&g->thread);
@@ -2220,12 +2367,14 @@ static const HD5770GpuOps gl_ops = {
     .mipmaps = true,
     .resinfo = true,
     .full = true,
+    .wrote = gl_wrote,
 };
 
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)
 {
     static char why[sizeof(((HD5770Gl *)0)->err)];
     HD5770Gl *g = g_new0(HD5770Gl, 1);
+    unsigned i;
 
     g->vram_host = vram;
     g->vram_size = vram_size;
@@ -2252,9 +2401,9 @@ HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)
                                      gl_prog_free);
     qemu_cond_init(&g->ccond);
     g->cq = g_queue_new();
-    if (g->cctx) {
+    for (i = 0; i < g->nworkers; i++) {
         g->cthread_on = true;
-        qemu_thread_create(&g->cthread, "ati-hd5770-glc", gl_cthread, g,
+        qemu_thread_create(&g->w[i].th, "ati-hd5770-glc", gl_cthread, &g->w[i],
                            QEMU_THREAD_JOINABLE);
     }
     g->seg = seg_new();

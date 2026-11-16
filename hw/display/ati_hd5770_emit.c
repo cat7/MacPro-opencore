@@ -309,14 +309,19 @@ static int e_point(const HD5770IR *ir, const HD5770IRFetch *f, uint32_t mipmask,
     return pidx[fi];
 }
 
+static void e_fetch_wb(GString *o, const HD5770IRFetch *f);
+
+/*
+ * Fetch f before its texture sample: the source, the derivatives and the
+ * parameters of the shared site (TEX), or the whole fetch (the others)
+ */
 static void e_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
                     unsigned fi, uint32_t mipmask, bool main, const int *pidx)
 {
     int p = e_point(ir, f, mipmask, pidx, fi);
     unsigned k;
 
-    g_string_append(o, "            {\n                uint o[4];\n"
-                       "                o[0] = 0u;\n                o[1] = 0u;\n"
+    g_string_append(o, "                o[0] = 0u;\n                o[1] = 0u;\n"
                        "                o[2] = 0u;\n                o[3] = 0u;\n");
     if (!main && p >= 0) {
         /* the source as a neighbour run that stops here returns it */
@@ -361,7 +366,6 @@ static void e_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
     } else {
         unsigned u = e_unit(ir, f);
 
-        g_string_append(o, "                uint c[4];\n                float dv[8];\n");
         for (k = 0; k < 4; k++) {
             unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
 
@@ -390,9 +394,21 @@ static void e_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
             }
             g_string_append(o, "                }\n");
         }
-        g_string_append_printf(o, "                HD_TEX(%uu, 0x%08xu, 0x%08xu, 0x%08xu, c, dv, o);\n",
+        /* the fetch itself at the one site the program has (e_body) */
+        g_string_append_printf(o, "                fu = %uu;\n                fw0 = 0x%08xu;\n"
+                               "                fw1 = 0x%08xu;\n                fw2 = 0x%08xu;\n"
+                               "                dotex = true;\n",
                                u, f->w[0], f->w[1], f->w[2]);
+        return;
     }
+    e_fetch_wb(o, f);
+}
+
+/* the destination of a fetch from its result o */
+static void e_fetch_wb(GString *o, const HD5770IRFetch *f)
+{
+    unsigned k;
+
     for (k = 0; k < 4; k++) {
         unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
 
@@ -403,7 +419,6 @@ static void e_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
                                    sel == 5 ? "1.0f" : "0.0f");
         }
     }
-    g_string_append(o, "            }\n");
 }
 
 static void e_export(GString *o, const HD5770IRExport *e)
@@ -438,6 +453,39 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                    const int *pidx)
 {
     unsigned i, j, ng = MAX(ir->ngpr, 1u);
+    GString *fh = g_string_new(NULL);
+
+    /*
+     * The fetches of a clause run one per turn of the loop, through one
+     * texture sample: the shader compiler gets the sample code once, not
+     * once per fetch
+     */
+    g_string_append(fh, "        if (fq >= 0) {\n"
+                        "            uint o[4];\n            uint c[4];\n"
+                        "            float dv[8];\n"
+                        "            uint fu = 0u, fw0 = 0u, fw1 = 0u, fw2 = 0u;\n"
+                        "            bool dotex = false;\n"
+                        "            switch (fq) {\n");
+    for (i = 0; i < ir->nfetches; i++) {
+        g_string_append_printf(fh, "            case %u: {\n", i);
+        e_fetch(fh, ir, &ir->fetches[i], i, mipmask, main, pidx);
+        g_string_append(fh, "                break;\n            }\n");
+    }
+    g_string_append(fh, "            default:\n                break;\n            }\n"
+                        "            if (dotex) {\n"
+                        "                HD_TEX(fu, fw0, fw1, fw2, c, dv, o);\n"
+                        "                switch (fq) {\n");
+    for (i = 0; i < ir->nfetches; i++) {
+        if (ir->fetches[i].kind == HD5770_IRF_TEX) {
+            g_string_append_printf(fh, "                case %u: {\n", i);
+            e_fetch_wb(fh, &ir->fetches[i]);
+            g_string_append(fh, "                    break;\n                }\n");
+        }
+    }
+    g_string_append(fh, "                default:\n                    break;\n"
+                        "                }\n            }\n"
+                        "            fq = fq < fend ? fq + 1 : -1;\n"
+                        "            continue;\n        }\n");
 
     g_string_append_printf(o,
         "    uint R[%u][4];\n"
@@ -461,13 +509,16 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
         "    bool ls_dx10[%d];\n"
         "    int rets[%d];\n"
         "    uint steps = 0u;\n"
-        "    while (run && pc < %u && steps < %uu) {\n"
+        "    int fq = -1, fend = -1;\n"
+        "    while ((run && pc < %u && steps < %uu) || fq >= 0) {\n"
+        "%s"
         "        int cur = pc;\n"
         "        steps++;\n"
         "        pc++;\n"
         "        switch (cur) {\n",
         E_STACK, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS,
-        E_CALLS, ir->nops, E_STEPS);
+        E_CALLS, ir->nops, E_STEPS, fh->str);
+    g_string_free(fh, true);
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
         unsigned t = op->cf & 0xf;
@@ -503,12 +554,11 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
             }
             break;
         case HD5770_IRO_FETCH:
-            g_string_append(o, "        if (act_) {\n");
-            for (j = 0; j < op->n; j++) {
-                e_fetch(o, ir, &ir->fetches[op->first + j], op->first + j,
-                        mipmask, main, pidx);
+            if (op->n) {
+                g_string_append_printf(o, "        if (act_) {\n            fq = %u;\n"
+                                       "            fend = %u;\n        }\n",
+                                       op->first, op->first + op->n - 1);
             }
-            g_string_append(o, "        }\n");
             break;
         case HD5770_IRO_EXPORT:
             if (main && op->n) {

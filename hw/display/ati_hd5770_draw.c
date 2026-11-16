@@ -429,6 +429,21 @@ void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
     gpu_lock(g, false);
 }
 
+/* the CPU wrote memory at mc: a backend with a copy of it checks it again */
+static void cpu_wrote(HD5770Gfx *g, uint64_t mc, uint64_t len)
+{
+    uint64_t off;
+
+    if (!g->gpu || !g->gpu->ops->wrote || !len) {
+        return;
+    }
+    if (vram_off(g, mc, len, &off)) {
+        g->gpu->ops->wrote(g->gpu->b, off, len);
+    } else {
+        g->gpu->ops->wrote(g->gpu->b, 0, 0);
+    }
+}
+
 /* the CPU reads memory at mc: queued draws first, if they may write it */
 static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
 {
@@ -3486,7 +3501,13 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         area += (uint64_t)(q->tri[i].x1 - q->tri[i].x0 + 1) *
                 (q->tri[i].y1 - q->tri[i].y0 + 1);
     }
+    /*
+     * A small draw stays on the CPU; not while a backend that draws into a
+     * copy of memory has draws queued: the CPU would wait for them and
+     * the copy be read back first
+     */
     if (g->gpu_mode == HD5770_GPU_ON &&
+        !(g->gpu->ops->wrote && (g->npend || g->ram_pend)) &&
         (d->db ? area * ps_cost(d, ir) < HD5770_DB_MIN_PIXELS
                : area * ps_cost(d, ir) < g->gpu->ops->min_pixels &&
                  !gpu_queued(g, d, y0, y1))) {
@@ -3934,15 +3955,20 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
         assemble(d, vp, nv, prim, t, raster_tri);
         g->gst.fb_ns[MIN(d->gfb, GFB_NONE)] += get_clock() - t0;
         g->gst.fb_px[MIN(d->gfb, GFB_NONE)] += d->st->pixels - px0;
-        for (i = 0; i < nws && d->ok && d->g->mem.dirty && d->wy1 >= d->wy0;
-             i++) {
+        for (i = 0; i < nws && d->ok && d->wy1 >= d->wy0; i++) {
             uint64_t lo, hi;
 
             if (ws[i]) {
                 /* the rows drawn */
                 hd5770_surf_rows(ws[i], d->wy0, d->wy1 + 1, &lo, &hi);
-                d->g->mem.dirty(d->g->mem.opaque, lo, hi - lo);
+                if (d->g->mem.dirty) {
+                    d->g->mem.dirty(d->g->mem.opaque, lo, hi - lo);
+                }
+                cpu_wrote(g, lo, hi - lo);
             }
+        }
+        if (d->resolve && d->ok) {
+            cpu_wrote(g, d->rs.base, hd5770_surf_size(&d->rs));
         }
     }
 }

@@ -255,6 +255,11 @@ typedef struct HD5770GpuOps {
      * targets (the fields marked HD5770GpuOps.full)
      */
     bool full;
+    /*
+     * added 2026-11-17: the CPU wrote VRAM [off, off + len), or guest RAM
+     * when len is 0; NULL for a backend that reads memory in place
+     */
+    void (*wrote)(void *b, uint64_t off, uint64_t len);
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {

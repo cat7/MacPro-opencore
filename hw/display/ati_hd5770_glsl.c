@@ -2037,6 +2037,114 @@ static void emit_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
     g_string_append(o, "    }\n");
 }
 
+/*
+ * A fetch clause of the straight-line form: its fetches for each register
+ * set, one per turn of a loop the compiler cannot unroll, through one
+ * texture sample -- the sample code once per clause, not once per fetch
+ * and set
+ */
+static void emit_fetch_clause(GString *o, const HD5770IR *ir,
+                              const HD5770IROp *op, unsigned nq,
+                              uint32_t mipmask)
+{
+    unsigned j, q, k, n;
+
+    g_string_append_printf(o, "    {\n        float dvs[%u];\n", op->n * 8);
+    g_string_append_printf(o, "        for (uint n_ = 0u; n_ < %uu + (tile0 >> 31u); n_++) {\n"
+                           "            uint o[4] = uint[4](0u, 0u, 0u, 0u);\n"
+                           "            uint c[4] = uint[4](0u, 0u, 0u, 0u);\n"
+                           "            float dv[8] = float[8](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);\n"
+                           "            uint fu = 0u, f0 = 0u, f1 = 0u, f2 = 0u;\n"
+                           "            bool ft = false;\n"
+                           "            switch (n_) {\n", op->n * nq);
+    for (j = 0; j < op->n; j++) {
+        const HD5770IRFetch *f = &ir->fetches[op->first + j];
+        unsigned unit = 0;
+        bool tex = f->kind == HD5770_IRF_TEX, mip = false;
+
+        if (tex) {
+            for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+                /* search */
+            }
+            mip = (f->w[0] & 0x1f) != 0x03 && (f->w[0] & 0x1f) != 0x04 &&
+                  ((mipmask >> unit) & 1);
+        }
+        for (q = 0; q < nq; q++) {
+            const char *x = set_sfx[q];
+
+            n = j * nq + q;
+            g_string_append_printf(o, "            case %uu: {\n", n);
+            if (mip && !q) {
+                /* across the quad, before any set's result lands */
+                for (k = 0; k < 8; k++) {
+                    unsigned sel = (f->w[2] >> (20 + 3 * (k & 3))) & 7;
+
+                    if (sel < 4) {
+                        g_string_append_printf(o, "                dvs[%u] = hd_fsub(F(r_%u[%u][%u]), "
+                                               "F(r[%u][%u]));\n", j * 8 + k,
+                                               k < 4 ? 1 : 2, f->src, sel, f->src, sel);
+                    } else {
+                        g_string_append_printf(o, "                dvs[%u] = 0.0;\n", j * 8 + k);
+                    }
+                }
+            }
+            if (!tex) {
+                emit_fetch(o, ir, f, q, mipmask, op->first + j);
+                g_string_append(o, "                break;\n            }\n");
+                continue;
+            }
+            for (k = 0; k < 4; k++) {
+                unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+                if (sel < 4) {
+                    g_string_append_printf(o, "                c[%u] = r%s[%u][%u];\n", k, x,
+                                           f->src, sel);
+                } else {
+                    g_string_append_printf(o, "                c[%u] = U(%s);\n", k,
+                                           sel == 5 ? "1.0" : "0.0");
+                }
+            }
+            for (k = 0; mip && k < 8; k++) {
+                g_string_append_printf(o, "                dv[%u] = dvs[%u];\n", k, j * 8 + k);
+            }
+            g_string_append_printf(o, "                fu = %uu;\n                f0 = 0x%08xu;\n"
+                                   "                f1 = 0x%08xu;\n                f2 = 0x%08xu;\n"
+                                   "                ft = true;\n                break;\n"
+                                   "            }\n", unit, f->w[0], f->w[1], f->w[2]);
+        }
+    }
+    g_string_append(o, "            default:\n                break;\n            }\n"
+                       "            if (ft) {\n"
+                       "                hd_tfetch_d(tx + fu, f0, f1, f2, c, dv, o);\n"
+                       "                switch (n_) {\n");
+    for (j = 0; j < op->n; j++) {
+        const HD5770IRFetch *f = &ir->fetches[op->first + j];
+
+        if (f->kind != HD5770_IRF_TEX) {
+            continue;
+        }
+        for (q = 0; q < nq; q++) {
+            const char *x = set_sfx[q];
+
+            g_string_append_printf(o, "                case %uu:\n", j * nq + q);
+            for (k = 0; k < 4; k++) {
+                unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
+
+                if (sel < 4) {
+                    g_string_append_printf(o, "                    r%s[%u][%u] = o[%u];\n", x,
+                                           f->dst, k, sel);
+                } else if (sel == 4 || sel == 5) {
+                    g_string_append_printf(o, "                    r%s[%u][%u] = U(%s);\n", x,
+                                           f->dst, k, sel == 5 ? "1.0" : "0.0");
+                }
+            }
+            g_string_append(o, "                    break;\n");
+        }
+    }
+    g_string_append(o, "                default:\n                    break;\n"
+                       "                }\n            }\n        }\n    }\n");
+}
+
 /* the version line and the arithmetic choice */
 static void emit_head(GString *o)
 {
@@ -2266,12 +2374,7 @@ char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
             }
             break;
         case HD5770_IRO_FETCH:
-            for (j = 0; j < op->n; j++) {
-                for (q = 0; q < nq; q++) {
-                    emit_fetch(o, ir, &ir->fetches[op->first + j], q, mipmask,
-                               op->first + j);
-                }
-            }
+            emit_fetch_clause(o, ir, op, nq, mipmask);
             break;
         default:
             emit_export(o, ir, op);
