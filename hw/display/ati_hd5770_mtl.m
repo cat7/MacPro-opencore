@@ -45,7 +45,7 @@ typedef struct GSurf {
     uint32_t pipes, banks, bankw, bankh, pib;
     uint32_t mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh;
     uint32_t fast;
-    uint32_t space, pt_off, pg0;
+    uint32_t space, pt_off, pg0, split_sh, split_stride;
     uint32_t eoff[64];
 } GSurf;
 
@@ -59,6 +59,8 @@ typedef struct GTex {
     float min_lod, max_lod, lod_bias;
     uint32_t lw[16], lh[16];
     uint32_t base_lv, levels, depth, pad;
+    uint32_t bc, slices;
+    uint32_t sb[16];
 } GTex;
 
 typedef struct GVb {
@@ -85,6 +87,12 @@ typedef struct GDraw {
     GSurf zs, ss;
     uint32_t db, zfmt, has_s, dctl, rctl, srm0, srm1, sclear;
     float zclear, zmin, zmax;
+    uint32_t nmrt, mrt_off, zexp, sexp, bconst, cb;
+    uint32_t lconst[32];
+    uint32_t resolve, rs_same, rs_fmt, rs_num, rs_comps;
+    uint32_t rs_src[4];
+    GSurf rs;
+    uint32_t tri_off, prm_off, prm_st, pad2;
 } GDraw;
 
 typedef struct GTri {
@@ -97,9 +105,9 @@ typedef struct GTri {
 
 #define MTL_TRI_SLOT    128     /* staging bytes per GTri */
 
-QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 152);
-QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 416);
+QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 89);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 172);
+QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 562);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
 /* a committed command buffer */
@@ -508,6 +516,10 @@ static void mtl_surf(HD5770Mtl *m, GSurf *g, const HD5770GpuSurf *s)
     g->pib_sh = f->pib_sh;
     g->hi_sh = f->hi_sh;
     g->fast = f->fast;
+    if (f->split) {
+        g->split_sh = f->split_sh;
+        g->split_stride = f->split_stride;
+    }
     if (f->mode >= HD5770_ARRAY_1D_TILED_THIN1) {
         memcpy(g->eoff, f->eoff, sizeof(g->eoff));
     }
@@ -555,6 +567,15 @@ static uint64_t mtl_hi(const HD5770GpuSurf *s)
     return s->space ? MTL_RAM_RANGE + 1 : s->voff + hd5770_surf_size(&s->s);
 }
 
+/* the slices of level l of a texture */
+static uint64_t mtl_tex_lvbytes(const HD5770GpuTex *t, unsigned l)
+{
+    uint32_t ns = t->dim == 2 ? MAX(t->slices >> l, 1u) : MAX(t->slices, 1u);
+
+    return MAX(t->slice_bytes[l] * ns,
+               hd5770_surf_size(l ? &t->lv[l].s : &t->surf.s));
+}
+
 /* the VRAM bytes a texture reads: level 0, and the mip chain after it */
 static uint64_t mtl_tex_lo(const HD5770GpuTex *t)
 {
@@ -569,19 +590,20 @@ static uint64_t mtl_tex_lo(const HD5770GpuTex *t)
 
 static uint64_t mtl_tex_hi(const HD5770GpuTex *t)
 {
-    uint64_t hi = mtl_hi(&t->surf);
+    uint64_t hi = t->surf.space ? mtl_hi(&t->surf)
+                                : t->surf.voff + mtl_tex_lvbytes(t, 0);
     unsigned l;
 
     for (l = 1; t->mip && l <= t->last_lv; l++) {
-        hi = MAX(hi, mtl_hi(&t->lv[l]));
+        hi = MAX(hi, t->lv[l].voff + mtl_tex_lvbytes(t, l));
     }
     return hi;
 }
 
-/* the surfaces a request writes: target, depth plane, stencil plane */
+/* the surfaces a request writes: targets, depth plane, stencil plane */
 static unsigned mtl_writes(const HD5770GpuDraw *d, const HD5770GpuSurf **ws)
 {
-    unsigned n = 0;
+    unsigned n = 0, i;
 
     ws[n++] = &d->rt;
     if (d->db && d->zfmt) {
@@ -589,6 +611,9 @@ static unsigned mtl_writes(const HD5770GpuDraw *d, const HD5770GpuSurf **ws)
     }
     if (d->db && d->has_s) {
         ws[n++] = &d->ss;
+    }
+    for (i = 1; i < d->nmrt; i++) {
+        ws[n++] = &d->mrt[i].surf;
     }
     return n;
 }
@@ -615,10 +640,10 @@ static void mtl_rows(const HD5770GpuSurf *s, int32_t y0, int32_t y1,
 static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
                        const HD5770GpuTri *t, bool first)
 {
-    const HD5770GpuSurf *ws[3];
+    const HD5770GpuSurf *ws[11];
     unsigned nw = mtl_writes(d, ws), i, j, k;
-    bool bar = m->nwr + nw > MTL_ACC || m->nrd + d->ntex > MTL_ACC;
-    uint64_t lo[3], hi[3];
+    bool bar = m->nwr + nw > MTL_ACC || m->nrd + d->ntex + 1 > MTL_ACC;
+    uint64_t lo[11], hi[11];
     /*
      * The pixels the triangle can cover: centres within its vertices'
      * extent, widened by far more than the edge functions' rounding.
@@ -651,6 +676,9 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
             bar = mtl_overlap(a->lo, a->hi, mtl_tex_lo(&d->tex[k]),
                               mtl_tex_hi(&d->tex[k]));
         }
+        if (first && !bar && d->resolve) {
+            bar = mtl_overlap(a->lo, a->hi, mtl_lo(&d->rs), mtl_hi(&d->rs));
+        }
     }
     for (i = 0; !bar && i < m->nrd; i++) {
         for (j = 0; !bar && j < nw; j++) {
@@ -669,6 +697,11 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
             m->rd[m->nrd].hi = mtl_tex_hi(&d->tex[k]);
             m->nrd++;
         }
+        if (d->resolve) {
+            m->rd[m->nrd].lo = mtl_lo(&d->rs);
+            m->rd[m->nrd].hi = mtl_hi(&d->rs);
+            m->nrd++;
+        }
     }
     for (j = 0; j < nw; j++) {
         m->wr[m->nwr] = (MtlAcc) {
@@ -679,6 +712,126 @@ static void mtl_hazard(HD5770Mtl *m, const HD5770GpuDraw *d,
         };
         m->nwr++;
     }
+}
+
+/*
+ * A draw of more than this many triangles runs by tiles of the screen:
+ * the thread of a pixel draws the triangles over its tile in order, so
+ * no barrier is needed inside the draw.
+ */
+#define MTL_BIN_MIN     2
+
+static void mtl_binned(HD5770Mtl *m, const HD5770GpuDraw *d, GDraw *u,
+                       size_t o_draw, size_t o_tex, size_t o_kv,
+                       int *miny, int *maxy)
+{
+    size_t prm_tri = (size_t)d->ninputs * 12 * sizeof(float);
+    size_t ps = ROUND_UP(MAX(prm_tri, 16), 16);
+    uint8_t *st = m->st.contents;
+    size_t o_tri = mtl_take(m, MTL_TRI_SLOT * d->ntri);
+    size_t o_prm = mtl_take(m, ps * d->ntri), o_bin;
+    int bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1, tx, ty, ntx, nty;
+    uint32_t *cnt, *at, *bin, total = 0;
+    HD5770GpuTri box;
+    unsigned i;
+
+    u->tri_off = o_tri;
+    u->prm_off = o_prm;
+    u->prm_st = ps;
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+        GTri *gt = (GTri *)(st + o_tri + MTL_TRI_SLOT * i);
+
+        memcpy(gt->x, t->x, sizeof(gt->x));
+        memcpy(gt->y, t->y, sizeof(gt->y));
+        memcpy(gt->w, t->w, sizeof(gt->w));
+        gt->area = t->area;
+        gt->x0 = t->x0;
+        gt->y0 = t->y0;
+        gt->x1 = t->x1;
+        gt->y1 = t->y1;
+        memcpy(gt->z, t->z, sizeof(gt->z));
+        gt->front = t->front;
+        memcpy(st + o_prm + ps * i, d->prm + (size_t)i * d->ninputs * 12,
+               prm_tri);
+        if (t->x1 >= t->x0 && t->y1 >= t->y0) {
+            bx0 = MIN(bx0, t->x0);
+            by0 = MIN(by0, t->y0);
+            bx1 = MAX(bx1, t->x1);
+            by1 = MAX(by1, t->y1);
+        }
+    }
+    m->tris += d->ntri;
+    if (bx1 < bx0) {
+        return;
+    }
+    /* the whole draw as one box for the hazards between dispatches */
+    memset(&box, 0, sizeof(box));
+    box.x[0] = box.x[2] = bx0 + d->pix_center;
+    box.x[1] = bx1 + d->pix_center;
+    box.y[0] = box.y[1] = by0 + d->pix_center;
+    box.y[2] = by1 + d->pix_center;
+    box.x0 = bx0;
+    box.y0 = by0;
+    box.x1 = bx1;
+    box.y1 = by1;
+    box.prim = UINT32_MAX;
+    mtl_hazard(m, d, &box, true);
+    /* the triangles of each 8 x 8 tile of the box, in order */
+    bx0 &= ~7;
+    by0 &= ~7;
+    ntx = (bx1 - bx0) / 8 + 1;
+    nty = (by1 - by0) / 8 + 1;
+    cnt = g_new0(uint32_t, (size_t)ntx * nty);
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+
+        if (t->x1 < t->x0 || t->y1 < t->y0) {
+            continue;
+        }
+        for (ty = (t->y0 - by0) / 8; ty <= (t->y1 - by0) / 8; ty++) {
+            for (tx = (t->x0 - bx0) / 8; tx <= (t->x1 - bx0) / 8; tx++) {
+                cnt[ty * ntx + tx]++;
+                total++;
+            }
+        }
+    }
+    o_bin = mtl_take(m, (size_t)total * 4 + 4);
+    bin = (uint32_t *)(st + o_bin);
+    at = g_new(uint32_t, (size_t)ntx * nty);
+    total = 0;
+    for (ty = 0; ty < nty; ty++) {
+        for (tx = 0; tx < ntx; tx++) {
+            uint32_t c = cnt[ty * ntx + tx];
+
+            at[ty * ntx + tx] = total;
+            if (c) {
+                uint32_t te[8] = {
+                    o_draw, o_bin + total * 4, c, o_tex, o_kv,
+                    bx0 + tx * 8, by0 + ty * 8, 8 | 0x200,
+                };
+
+                g_array_append_vals(m->tiles, te, 8);
+            }
+            total += c;
+        }
+    }
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+
+        if (t->x1 < t->x0 || t->y1 < t->y0) {
+            continue;
+        }
+        for (ty = (t->y0 - by0) / 8; ty <= (t->y1 - by0) / 8; ty++) {
+            for (tx = (t->x0 - bx0) / 8; tx <= (t->x1 - bx0) / 8; tx++) {
+                bin[at[ty * ntx + tx]++] = i;
+            }
+        }
+    }
+    g_free(cnt);
+    g_free(at);
+    *miny = MIN(*miny, by0);
+    *maxy = MAX(*maxy, by1);
 }
 
 static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
@@ -709,30 +862,59 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     default:
         break;
     }
-    if ((!d->rt.space &&
-         d->rt.voff + hd5770_surf_size(&d->rt.s) > m->vram_size) ||
-        (d->rt.space && !m->ram) || !d->rt.s.fast) {
-        m->declined[MTL_NO_SURF]++;
-        return false;
+    for (i = 0; i < MAX(d->nmrt, 1u); i++) {
+        const HD5770GpuSurf *rs = d->nmrt ? &d->mrt[i].surf : &d->rt;
+
+        if ((!rs->space &&
+             rs->voff + hd5770_surf_size(&rs->s) > m->vram_size) ||
+            (rs->space && !m->ram) || !(rs->s.fast || rs->s.split)) {
+            m->declined[MTL_NO_SURF]++;
+            return false;
+        }
+    }
+    for (i = 0; i < d->ntex; i++) {
+        const HD5770GpuTex *t = &d->tex[i];
+
+        for (k = 0; k <= (t->mip ? t->last_lv : 0); k++) {
+            if (t->slice_bytes[k] > UINT32_MAX ||
+                (!t->surf.space && (k ? t->lv[k].voff : t->surf.voff) +
+                 mtl_tex_lvbytes(t, k) > m->vram_size)) {
+                m->declined[MTL_NO_SURF]++;
+                return false;
+            }
+        }
     }
     if (d->db &&
-        ((d->zfmt && (d->zs.space || !d->zs.s.fast ||
+        ((d->zfmt && (d->zs.space || !(d->zs.s.fast || d->zs.s.split) ||
                       d->zs.voff + hd5770_surf_size(&d->zs.s) > m->vram_size)) ||
-         (d->has_s && (d->ss.space || !d->ss.s.fast ||
+         (d->has_s && (d->ss.space || !(d->ss.s.fast || d->ss.s.split) ||
                        d->ss.voff + hd5770_surf_size(&d->ss.s) > m->vram_size)))) {
         m->declined[MTL_NO_SURF]++;
         return false;
     }
     need = sizeof(GDraw) + sizeof(GTex) * HD5770_GPU_TEX + 4096 +
-           d->ntri * (sizeof(GTri) + prm_tri + 2 * MTL_ALIGN) +
+           d->ntri * (MTL_TRI_SLOT + prm_tri + 16 + 2 * MTL_ALIGN) +
            (d->ir->nconsts + 1) * 4 + 8 * MTL_ALIGN;
-    for (i = 0; i < d->ntri; i++) {
-        const HD5770GpuTri *t = &d->tri[i];
+    {
+        int bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
 
-        if (t->x1 >= t->x0 && t->y1 >= t->y0) {
-            /* tiles of at least 8 pixels each way, or a row of 64 */
-            need += 32 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
-                    ((size_t)(t->y1 - t->y0) / 1 + 2);
+        for (i = 0; i < d->ntri; i++) {
+            const HD5770GpuTri *t = &d->tri[i];
+
+            if (t->x1 >= t->x0 && t->y1 >= t->y0) {
+                /* tiles of at least 8 pixels each way, or a row of 64 */
+                need += 32 * ((size_t)(t->x1 - t->x0) / 8 + 2) *
+                        ((size_t)(t->y1 - t->y0) / 1 + 2);
+                bx0 = MIN(bx0, t->x0);
+                by0 = MIN(by0, t->y0);
+                bx1 = MAX(bx1, t->x1);
+                by1 = MAX(by1, t->y1);
+            }
+        }
+        if (bx1 >= bx0) {
+            /* the screen tiles of a binned draw */
+            need += 32 * ((size_t)(bx1 - bx0) / 8 + 2) *
+                    ((size_t)(by1 - by0) / 8 + 2) + MTL_ALIGN;
         }
     }
     /* the batch's tiles go to staging when it is dispatched */
@@ -741,6 +923,16 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         need += d->vb[i].len + MTL_ALIGN;
     }
     need += (d->rt.npages + 1) * 4 + MTL_ALIGN;
+    need += (d->rs.npages + 1) * 4 + MTL_ALIGN;
+    if (d->resolve && ((d->rs.space && !m->ram) || !(d->rs.s.fast || d->rs.s.split) ||
+                       (!d->rs.space && d->rs.voff +
+                        hd5770_surf_size(&d->rs.s) > m->vram_size))) {
+        m->declined[MTL_NO_SURF]++;
+        return false;
+    }
+    for (i = 0; i < d->nmrt; i++) {
+        need += sizeof(GDraw) + (d->mrt[i].surf.npages + 1) * 4 + 2 * MTL_ALIGN;
+    }
     for (i = 0; i < d->ntex; i++) {
         if (d->tex[i].surf.space && !m->ram) {
             m->declined[MTL_NO_SURF]++;
@@ -800,6 +992,19 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     u->cfile_off = o_cf;
     u->ntex = d->ntex;
     u->nvb = d->nvb;
+    u->zexp = d->zexport;
+    u->sexp = d->sexport;
+    if (d->resolve) {
+        mtl_surf(m, &u->rs, &d->rs);
+        u->resolve = 1;
+        u->rs_same = d->rs_same;
+        u->rs_fmt = d->rs_fmt;
+        u->rs_num = d->rs_num;
+        u->rs_comps = d->rs_comps;
+        memcpy(u->rs_src, d->rs_src, sizeof(u->rs_src));
+    }
+    u->bconst = d->bool_const;
+    memcpy(u->lconst, d->loop_const, sizeof(u->lconst));
     if (d->db) {
         if (d->zfmt) {
             mtl_surf(m, &u->zs, &d->zs);
@@ -825,10 +1030,37 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         u->vb[i].len = d->vb[i].len;
         memcpy(u->vb[i].res, d->vb[i].res, sizeof(u->vb[i].res));
     }
+    if (d->nmrt) {
+        /* each target: a copy of the draw with its own target fields */
+        size_t o_mrt = mtl_take(m, sizeof(GDraw) * d->nmrt);
+
+        u->nmrt = d->nmrt;
+        u->mrt_off = o_mrt;
+        for (i = 0; i < d->nmrt; i++) {
+            const HD5770GpuRt *r = &d->mrt[i];
+            GDraw *c = (GDraw *)(st + o_mrt) + i;
+
+            memcpy(c, u, sizeof(*c));
+            c->nmrt = 0;
+            mtl_surf(m, &c->rt, &r->surf);
+            c->rt_fmt = r->fmt;
+            c->rt_num = r->num;
+            c->rt_comps = r->comps;
+            c->rt_unorm8 = r->unorm8;
+            c->rt_float = r->is_float;
+            c->rt_blend = r->blend_ok;
+            c->wmask = r->wmask;
+            c->blend = r->blend;
+            memcpy(c->rt_bits, r->bits, sizeof(c->rt_bits));
+            memcpy(c->rt_src, r->src, sizeof(c->rt_src));
+            c->cb = r->cb;
+        }
+    }
     for (i = 0; i < d->ntex; i++) {
         const HD5770GpuTex *t = &d->tex[i];
         GTex *g = (GTex *)(st + o_tex) + i;
 
+        memset(g, 0, sizeof(*g));
         mtl_surf(m, &g->s, &t->surf);
         g->fmt = t->fmt;
         g->num = t->num;
@@ -850,6 +1082,11 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         }
         g->lw[0] = t->w;
         g->lh[0] = t->h;
+        g->bc = t->bc;
+        g->slices = MAX(t->slices, 1u);
+        for (k = 0; k < 16; k++) {
+            g->sb[k] = k < HD5770_GPU_LEVELS ? (uint32_t)t->slice_bytes[k] : 0;
+        }
         if (t->mip) {
             size_t lo = mtl_take(m, (t->last_lv + 1) * sizeof(GSurf));
             GSurf *ls = (GSurf *)(st + lo);
@@ -882,7 +1119,12 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             mtl_flush(m);
             m->bpso = p->pso;
         }
-        for (i = 0; i < d->ntri; i++) {
+        if (d->ntri > MTL_BIN_MIN) {
+            mtl_binned(m, d, u, o_draw, o_tex, o_kv, &miny, &maxy);
+            /* a dispatch of its own */
+            mtl_flush(m);
+        }
+        for (i = 0; i < d->ntri && d->ntri <= MTL_BIN_MIN; i++) {
             const HD5770GpuTri *t = &d->tri[i], *pt[2] = { t, NULL };
             size_t ps = ROUND_UP(MAX(prm_tri, 16), 16);
             unsigned tw, th, n = 1, q;
@@ -947,23 +1189,20 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
             i += n - 1;
         }
     }
-    if (maxy >= miny && d->rt.space) {
-        for (i = 0; i < d->rt.npages; i++) {
-            mtl_range(m->ram_ranges, d->rt.pages[i], d->rt.pages[i] + 4096);
-        }
-    } else if (maxy >= miny) {
-        uint64_t lo, hi;
-
-        mtl_rows(&d->rt, miny, maxy, &lo, &hi);
-        mtl_range(m->ranges, lo, MIN(hi, m->vram_size));
-    }
-    if (maxy >= miny && d->db) {
-        const HD5770GpuSurf *ws[3];
+    if (maxy >= miny) {
+        const HD5770GpuSurf *ws[11];
         unsigned nw = mtl_writes(d, ws);
 
-        for (i = 1; i < nw; i++) {
+        for (i = 0; i < nw; i++) {
             uint64_t lo, hi;
 
+            if (ws[i]->space) {
+                for (k = 0; k < ws[i]->npages; k++) {
+                    mtl_range(m->ram_ranges, ws[i]->pages[k],
+                              ws[i]->pages[k] + 4096);
+                }
+                continue;
+            }
             mtl_rows(ws[i], miny, maxy, &lo, &hi);
             mtl_range(m->ranges, lo, MIN(hi, m->vram_size));
         }
@@ -1064,6 +1303,7 @@ static const HD5770GpuOps mtl_ops = {
     .depth = true,
     .mipmaps = true,
     .resinfo = true,
+    .full = true,
     .draw = mtl_draw,
     .sync = mtl_sync,
     .stats = mtl_stats,

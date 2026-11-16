@@ -190,7 +190,7 @@ typedef struct GSurf {
     uint32_t pipes, banks, bankw, bankh, pib;
     uint32_t mt_w_sh, mt_h_sh, pipes_sh, bankw_sh, bankh_sh, pib_sh, hi_sh;
     uint32_t fast;
-    uint32_t space, pt, pg0;
+    uint32_t space, pt, pg0, split_sh, split_stride;
     uint32_t eoff[64];
 } GSurf;
 
@@ -203,6 +203,8 @@ typedef struct GTex {
     float min_lod, max_lod, lod_bias;
     uint32_t lw[16], lh[16];
     uint32_t base_lv, levels, depth, pad;
+    uint32_t bc, slices;
+    uint32_t sb[16];
 } GTex;
 
 typedef struct GVb {
@@ -227,6 +229,10 @@ typedef struct GDraw {
     GVb vb[8];
     uint32_t zs, ss, db, zfmt, has_s, dctl, rctl, srm0, srm1, sclear;
     float zclear, zmin, zmax;
+    uint32_t nmrt, mrt, zexp, sexp, bconst, cb;
+    uint32_t lconst[32];
+    uint32_t resolve, rs_same, rs, rs_fmt, rs_num, rs_comps;
+    uint32_t rs_src[4];
 } GDraw;
 
 typedef struct GTri {
@@ -237,9 +243,9 @@ typedef struct GTri {
     uint32_t front;
 } GTri;
 
-QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 87);
-QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 66);
-QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 158);
+QEMU_BUILD_BUG_ON(sizeof(GSurf) != 4 * 89);
+QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 84);
+QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 206);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
 /* storage buffers; B_UP: upload bytes (not bound); B_STAGE, B_RB: buffers */
@@ -1338,18 +1344,28 @@ static void gl_span(HD5770Gl *g, const HD5770GpuSurf *s, uint64_t *lo,
     }
 }
 
+/* the bytes level l of a texture takes, all its slices */
+static uint64_t gl_tex_lvbytes(const HD5770GpuTex *t, unsigned l)
+{
+    uint32_t ns = t->dim == 2 ? MAX(t->slices >> l, 1u) : MAX(t->slices, 1u);
+
+    return MAX(t->slice_bytes[l] * ns,
+               hd5770_surf_size(l ? &t->lv[l].s : &t->surf.s));
+}
+
 /* the bytes a texture reads: level 0 and its mip chain */
 static void gl_tex_span(HD5770Gl *g, const HD5770GpuTex *t, uint64_t *lo,
                         uint64_t *hi)
 {
-    uint64_t l0, h0;
     unsigned l;
 
     gl_span(g, &t->surf, lo, hi);
+    if (!t->surf.space) {
+        *hi = t->surf.voff + gl_tex_lvbytes(t, 0);
+    }
     for (l = 1; t->mip && l <= t->last_lv; l++) {
-        gl_span(g, &t->lv[l], &l0, &h0);
-        *lo = MIN(*lo, l0);
-        *hi = MAX(*hi, h0);
+        *lo = MIN(*lo, t->lv[l].voff);
+        *hi = MAX(*hi, t->lv[l].voff + gl_tex_lvbytes(t, l));
     }
 }
 
@@ -1360,10 +1376,10 @@ static uint64_t gl_key(const HD5770GpuSurf *s)
                     : s->voff;
 }
 
-/* the surfaces a request writes: the target, the depth and stencil planes */
+/* the surfaces a request writes: the targets, the depth and stencil planes */
 static unsigned gl_writes(const HD5770GpuDraw *d, const HD5770GpuSurf **ws)
 {
-    unsigned n = 0;
+    unsigned n = 0, i;
 
     ws[n++] = &d->rt;
     if (d->db && d->zfmt) {
@@ -1371,6 +1387,9 @@ static unsigned gl_writes(const HD5770GpuDraw *d, const HD5770GpuSurf **ws)
     }
     if (d->db && d->has_s) {
         ws[n++] = &d->ss;
+    }
+    for (i = 1; i < d->nmrt; i++) {
+        ws[n++] = &d->mrt[i].surf;
     }
     return n;
 }
@@ -1396,10 +1415,10 @@ static void gl_wrows(HD5770Gl *g, const HD5770GpuSurf *s, int32_t y0,
 static void gl_hazard(HD5770Gl *g, const HD5770GpuDraw *d,
                       const HD5770GpuTri *t, bool first)
 {
-    const HD5770GpuSurf *ws[3];
+    const HD5770GpuSurf *ws[11];
     unsigned nw = gl_writes(d, ws), i, j, k;
-    bool bar = g->nwr + nw > GL_ACC || g->nrd + d->ntex > GL_ACC;
-    uint64_t lo[3], hi[3], key[3], tlo, thi;
+    bool bar = g->nwr + nw > GL_ACC || g->nrd + d->ntex + 1 > GL_ACC;
+    uint64_t lo[11], hi[11], key[11], tlo, thi;
     float pc = d->pix_center, mg = 1.0f / 16;
     int32_t x0 = ceilf(MIN(t->x[0], MIN(t->x[1], t->x[2])) - pc - mg);
     int32_t x1 = floorf(MAX(t->x[0], MAX(t->x[1], t->x[2])) - pc + mg);
@@ -1429,6 +1448,10 @@ static void gl_hazard(HD5770Gl *g, const HD5770GpuDraw *d,
             gl_tex_span(g, &d->tex[k], &tlo, &thi);
             bar = gl_overlap(a->lo, a->hi, tlo, thi);
         }
+        if (first && !bar && d->resolve) {
+            gl_span(g, &d->rs, &tlo, &thi);
+            bar = gl_overlap(a->lo, a->hi, tlo, thi);
+        }
     }
     for (i = 0; !bar && i < g->nrd; i++) {
         for (j = 0; !bar && j < nw; j++) {
@@ -1444,6 +1467,10 @@ static void gl_hazard(HD5770Gl *g, const HD5770GpuDraw *d,
     if (first || bar) {
         for (k = 0; k < d->ntex; k++) {
             gl_tex_span(g, &d->tex[k], &g->rd[g->nrd].lo, &g->rd[g->nrd].hi);
+            g->nrd++;
+        }
+        if (d->resolve) {
+            gl_span(g, &d->rs, &g->rd[g->nrd].lo, &g->rd[g->nrd].hi);
             g->nrd++;
         }
     }
@@ -1486,6 +1513,10 @@ static uint32_t gl_surf(HD5770Gl *g, const HD5770GpuSurf *s, uint32_t pt)
     gs.pib_sh = f->pib_sh;
     gs.hi_sh = f->hi_sh;
     gs.fast = f->fast;
+    if (f->split) {
+        gs.split_sh = f->split_sh;
+        gs.split_stride = f->split_stride;
+    }
     if (s->space) {
         gs.voff = g->vram_size;
         gs.space = 1;
@@ -1597,6 +1628,126 @@ static uint32_t gl_words(HD5770Gl *g, const void *p, size_t n)
     return at;
 }
 
+/*
+ * A draw of more than this many triangles runs by tiles of the screen:
+ * the invocation of a pixel draws the triangles over its tile in order,
+ * so no barrier is needed inside the draw.
+ */
+#define GL_BIN_MIN      2
+
+static void gl_binned(HD5770Gl *g, const HD5770GpuDraw *d, uint32_t di,
+                      uint32_t tex0, uint32_t kvo)
+{
+    size_t prm_tri = (size_t)d->ninputs * 12 * sizeof(float);
+    GArray *tiles = g->seg->a[B_TILES], *w = g->seg->a[B_WORDS];
+    int bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1, tx, ty, ntx, nty;
+    uint32_t *cnt, *at, *ti, *pr, total = 0, ob;
+    HD5770GpuTri box;
+    unsigned i;
+
+    ti = g_new(uint32_t, d->ntri);
+    pr = g_new(uint32_t, d->ntri);
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+        GTri gt;
+
+        memcpy(gt.x, t->x, sizeof(gt.x));
+        memcpy(gt.y, t->y, sizeof(gt.y));
+        memcpy(gt.w, t->w, sizeof(gt.w));
+        gt.area = t->area;
+        gt.x0 = t->x0;
+        gt.y0 = t->y0;
+        gt.x1 = t->x1;
+        gt.y1 = t->y1;
+        memcpy(gt.z, t->z, sizeof(gt.z));
+        gt.front = t->front;
+        g_array_append_val(g->seg->a[B_TRIS], gt);
+        ti[i] = g->seg->a[B_TRIS]->len - 1;
+        pr[i] = gl_words(g, d->prm + (size_t)i * d->ninputs * 12, prm_tri);
+        if (t->x1 >= t->x0 && t->y1 >= t->y0) {
+            bx0 = MIN(bx0, t->x0);
+            by0 = MIN(by0, t->y0);
+            bx1 = MAX(bx1, t->x1);
+            by1 = MAX(by1, t->y1);
+        }
+    }
+    g->tris += d->ntri;
+    if (bx1 < bx0) {
+        g_free(ti);
+        g_free(pr);
+        return;
+    }
+    /* the whole draw as one box for the hazards between dispatches */
+    memset(&box, 0, sizeof(box));
+    box.x[0] = box.x[2] = bx0 + d->pix_center;
+    box.x[1] = bx1 + d->pix_center;
+    box.y[0] = box.y[1] = by0 + d->pix_center;
+    box.y[2] = by1 + d->pix_center;
+    box.x0 = bx0;
+    box.y0 = by0;
+    box.x1 = bx1;
+    box.y1 = by1;
+    box.prim = UINT32_MAX;
+    gl_hazard(g, d, &box, true);
+    bx0 &= ~7;
+    by0 &= ~7;
+    ntx = (bx1 - bx0) / 8 + 1;
+    nty = (by1 - by0) / 8 + 1;
+    cnt = g_new0(uint32_t, (size_t)ntx * nty);
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+
+        if (t->x1 < t->x0 || t->y1 < t->y0) {
+            continue;
+        }
+        for (ty = (t->y0 - by0) / 8; ty <= (t->y1 - by0) / 8; ty++) {
+            for (tx = (t->x0 - bx0) / 8; tx <= (t->x1 - bx0) / 8; tx++) {
+                cnt[ty * ntx + tx]++;
+                total++;
+            }
+        }
+    }
+    ob = w->len;
+    g_array_set_size(w, ob + 2 * (size_t)total + 1);
+    at = g_new(uint32_t, (size_t)ntx * nty);
+    total = 0;
+    for (ty = 0; ty < nty; ty++) {
+        for (tx = 0; tx < ntx; tx++) {
+            uint32_t c = cnt[ty * ntx + tx];
+
+            at[ty * ntx + tx] = total;
+            if (c) {
+                uint32_t te[8] = {
+                    di, ob + 2 * total, c, tex0, kvo, bx0 + tx * 8,
+                    by0 + ty * 8, 8 | 0x200,
+                };
+
+                g_array_append_vals(tiles, te, 8);
+            }
+            total += c;
+        }
+    }
+    for (i = 0; i < d->ntri; i++) {
+        const HD5770GpuTri *t = &d->tri[i];
+
+        if (t->x1 < t->x0 || t->y1 < t->y0) {
+            continue;
+        }
+        for (ty = (t->y0 - by0) / 8; ty <= (t->y1 - by0) / 8; ty++) {
+            for (tx = (t->x0 - bx0) / 8; tx <= (t->x1 - bx0) / 8; tx++) {
+                uint32_t k = at[ty * ntx + tx]++;
+
+                g_array_index(w, uint32_t, ob + 2 * k) = ti[i];
+                g_array_index(w, uint32_t, ob + 2 * k + 1) = pr[i];
+            }
+        }
+    }
+    g_free(cnt);
+    g_free(at);
+    g_free(ti);
+    g_free(pr);
+}
+
 static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
 {
     HD5770Gl *g = opaque;
@@ -1631,22 +1782,42 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     }
     if ((d->rt.space ? !g->ram_host :
          d->rt.voff + hd5770_surf_size(&d->rt.s) > g->vram_size) ||
-        !d->rt.s.fast) {
+        !(d->rt.s.fast || d->rt.s.split)) {
         g->declined[GLD_SURF]++;
         return false;
     }
-    for (i = 0; i < d->ntex; i++) {
-        const HD5770GpuSurf *ts = &d->tex[i].surf;
+    if (d->resolve && (d->rs.space || !(d->rs.s.fast || d->rs.s.split) ||
+                       d->rs.voff + hd5770_surf_size(&d->rs.s) > g->vram_size)) {
+        g->declined[GLD_SURF]++;
+        return false;
+    }
+    for (i = 1; i < d->nmrt; i++) {
+        const HD5770GpuSurf *ms = &d->mrt[i].surf;
 
-        if (ts->space ? !g->ram_host :
-            ts->voff + hd5770_surf_size(&ts->s) > g->vram_size) {
+        if (ms->space || !(ms->s.fast || ms->s.split) ||
+            ms->voff + hd5770_surf_size(&ms->s) > g->vram_size) {
             g->declined[GLD_SURF]++;
             return false;
         }
-        for (k = 1; d->tex[i].mip && k <= d->tex[i].last_lv; k++) {
-            ts = &d->tex[i].lv[k];
-            if (ts->space ||
-                ts->voff + hd5770_surf_size(&ts->s) > g->vram_size) {
+    }
+    for (i = 0; i < d->ntex; i++) {
+        const HD5770GpuTex *t = &d->tex[i];
+        const HD5770GpuSurf *ts = &t->surf;
+
+        if (ts->space ? !g->ram_host :
+            ts->voff + gl_tex_lvbytes(t, 0) > g->vram_size) {
+            g->declined[GLD_SURF]++;
+            return false;
+        }
+        for (k = 1; t->mip && k <= t->last_lv; k++) {
+            ts = &t->lv[k];
+            if (ts->space || ts->voff + gl_tex_lvbytes(t, k) > g->vram_size) {
+                g->declined[GLD_SURF]++;
+                return false;
+            }
+        }
+        for (k = 0; k <= (t->mip ? t->last_lv : 0); k++) {
+            if (t->slice_bytes[k] > UINT32_MAX) {
                 g->declined[GLD_SURF]++;
                 return false;
             }
@@ -1656,7 +1827,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         const HD5770GpuSurf *ps = i ? &d->ss : &d->zs;
 
         if ((i ? d->has_s : d->zfmt != 0) &&
-            (ps->space || !ps->s.fast ||
+            (ps->space || !(ps->s.fast || ps->s.split) ||
              ps->voff + hd5770_surf_size(&ps->s) > g->vram_size)) {
             g->declined[GLD_SURF]++;
             return false;
@@ -1704,6 +1875,9 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     }
 
     /* the bytes it reads, in the copy before its dispatch */
+    if (d->resolve) {
+        gl_need(g, d->rs.voff, d->rs.voff + hd5770_surf_size(&d->rs.s));
+    }
     for (i = 0; i < d->ntex; i++) {
         const HD5770GpuSurf *ts = &d->tex[i].surf;
 
@@ -1711,11 +1885,11 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             tpt[i] = gl_ram_surf(g, ts, 0, UINT32_MAX, false);
             ram = true;
         } else {
-            gl_need(g, ts->voff, ts->voff + hd5770_surf_size(&ts->s));
+            gl_need(g, ts->voff, ts->voff + gl_tex_lvbytes(&d->tex[i], 0));
         }
         for (k = 1; d->tex[i].mip && k <= d->tex[i].last_lv; k++) {
             ts = &d->tex[i].lv[k];
-            gl_need(g, ts->voff, ts->voff + hd5770_surf_size(&ts->s));
+            gl_need(g, ts->voff, ts->voff + gl_tex_lvbytes(&d->tex[i], k));
         }
     }
     if (d->rt.space) {
@@ -1738,6 +1912,12 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             gl_need(g, lo, hi);
             gl_range(g, lo, hi);
         }
+    }
+    for (i = 1; i < d->nmrt && maxy >= miny; i++) {
+        gl_wrows(g, &d->mrt[i].surf, miny, maxy, &lo, &hi);
+        hi = MIN(hi, g->vram_size);
+        gl_need(g, lo, hi);
+        gl_range(g, lo, hi);
     }
 
     memset(&u, 0, sizeof(u));
@@ -1772,6 +1952,19 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     u.cfile = g->seg->cfile;
     u.ntex = d->ntex;
     u.nvb = d->nvb;
+    u.zexp = d->zexport;
+    u.sexp = d->sexport;
+    if (d->resolve) {
+        u.resolve = 1;
+        u.rs = gl_surf(g, &d->rs, 0);
+        u.rs_same = d->rs_same;
+        u.rs_fmt = d->rs_fmt;
+        u.rs_num = d->rs_num;
+        u.rs_comps = d->rs_comps;
+        memcpy(u.rs_src, d->rs_src, sizeof(u.rs_src));
+    }
+    u.bconst = d->bool_const;
+    memcpy(u.lconst, d->loop_const, sizeof(u.lconst));
     if (d->db) {
         u.db = 1;
         u.zfmt = d->zfmt;
@@ -1820,6 +2013,11 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         gt.depth = t->depth;
         gt.lw[0] = t->w;
         gt.lh[0] = t->h;
+        gt.bc = t->bc;
+        gt.slices = MAX(t->slices, 1u);
+        for (k = 0; k < HD5770_GPU_LEVELS; k++) {
+            gt.sb[k] = (uint32_t)t->slice_bytes[k];
+        }
         if (t->mip) {
             /* levels 1..last_lv in consecutive surfaces from lev */
             for (k = 1; k <= t->last_lv; k++) {
@@ -1841,15 +2039,44 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         g_array_append_val(g->seg->a[B_TEXS], gt);
     }
     kvo = gl_words(g, d->kv, (size_t)d->ir->nconsts * 4);
+    di = g->seg->a[B_DRAWS]->len;
+    if (d->nmrt) {
+        u.nmrt = d->nmrt;
+        u.mrt = di + 1;
+    }
     g_array_append_val(g->seg->a[B_DRAWS], u);
-    di = g->seg->a[B_DRAWS]->len - 1;
+    for (i = 0; i < d->nmrt; i++) {
+        /* each target: a copy of the draw with its own target fields */
+        const HD5770GpuRt *r = &d->mrt[i];
+        GDraw c = u;
+
+        c.nmrt = 0;
+        c.rt = i ? gl_surf(g, &r->surf, 0) : u.rt;
+        c.rt_fmt = r->fmt;
+        c.rt_num = r->num;
+        c.rt_comps = r->comps;
+        c.rt_unorm8 = r->unorm8;
+        c.rt_float = r->is_float;
+        c.rt_blend = r->blend_ok;
+        c.wmask = r->wmask;
+        c.blend = r->blend;
+        memcpy(c.rt_bits, r->bits, sizeof(c.rt_bits));
+        memcpy(c.rt_src, r->src, sizeof(c.rt_src));
+        c.cb = r->cb;
+        g_array_append_val(g->seg->a[B_DRAWS], c);
+    }
 
     if (g->bprog != p) {
         gl_flush(g);
         g->bprog = p;
     }
     tiles = g->seg->a[B_TILES];
-    for (i = 0; i < d->ntri; i++) {
+    if (d->ntri > GL_BIN_MIN) {
+        gl_binned(g, d, di, tex0, kvo);
+        /* a dispatch of its own */
+        gl_flush(g);
+    }
+    for (i = 0; i < d->ntri && d->ntri <= GL_BIN_MIN; i++) {
         const HD5770GpuTri *t = &d->tri[i];
         GTri gt;
         unsigned tw, th;
@@ -1992,6 +2219,7 @@ static const HD5770GpuOps gl_ops = {
     .depth = true,
     .mipmaps = true,
     .resinfo = true,
+    .full = true,
 };
 
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)
