@@ -106,6 +106,11 @@ static LRESULT CALLBACK sdl2_drag_wndproc(HWND hwnd, UINT msg,
             sdl2_drag_grab.x = pt.x - rect.left;
             sdl2_drag_grab.y = pt.y - rect.top;
             sdl2_drag_hwnd = hwnd;
+            /* DefWindowProc, skipped here, would activate the window */
+            if (GetForegroundWindow() != hwnd) {
+                SetForegroundWindow(hwnd);
+            }
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetCapture(hwnd);
             return 0;
         }
