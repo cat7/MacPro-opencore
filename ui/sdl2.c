@@ -33,6 +33,7 @@
 #include "system/runstate-action.h"
 #include "system/system.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu-main.h"
 
 #ifdef CONFIG_X11
@@ -57,6 +58,30 @@ static bool guest_cursor;
 static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
+
+/*
+ * Some display devices take the cursor's top left corner as its position
+ * and know no hot spot (an ATI hardware cursor under Mac OS X). With an
+ * absolute pointer the host cursor would then sit its top left corner on
+ * the guest's pointer. Once the pointer rests, the hot spot is the guest
+ * pointer (the host pointer) less the image's corner, once the guest has
+ * followed; it is kept per image.
+ */
+#define HOT_CACHE 16
+#define HOT_REST_MS 100
+static int sprite_w, sprite_h, sprite_hot_x, sprite_hot_y;
+static int cur_hot_x, cur_hot_y;
+static uint32_t sprite_sum;
+static int host_abs_x, host_abs_y;
+static int64_t host_move_ms, guest_move_ms;
+static bool hot_checked = true;
+static struct {
+    uint32_t sum;
+    int x, y;
+} hot_cache[HOT_CACHE];
+static unsigned hot_cache_next;
+
+static void sdl_learn_hot_spot(struct sdl2_console *scon);
 
 #define SDL2_REFRESH_INTERVAL_BUSY 10
 #define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
@@ -416,6 +441,12 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
     }
 
     if (qemu_input_is_absolute(scon->dcl.con)) {
+        if (x != host_abs_x || y != host_abs_y) {
+            host_abs_x = x;
+            host_abs_y = y;
+            host_move_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            hot_checked = false;
+        }
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X,
                              x, 0, surface_width(scon->surface));
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,
@@ -754,6 +785,8 @@ void sdl2_poll_events(struct sdl2_console *scon)
     bool allow_close = true;
     int idle = 1;
 
+    sdl_learn_hot_spot(scon);
+
     if (scon->last_vm_running != runstate_is_running()) {
         scon->last_vm_running = runstate_is_running();
         sdl_update_caption(scon);
@@ -839,15 +872,70 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
         sdl_hide_cursor(scon);
     }
     guest_cursor = on;
+    if (x != guest_x || y != guest_y) {
+        guest_move_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    }
     guest_x = x, guest_y = y;
+}
+
+static void sdl_make_sprite(int hot_x, int hot_y)
+{
+    SDL_Cursor *old = guest_sprite;
+
+    guest_sprite = SDL_CreateColorCursor(guest_sprite_surface, hot_x, hot_y);
+    if (!guest_sprite) {
+        fprintf(stderr, "Failed to make color cursor\n");
+        guest_sprite = old;
+        return;
+    }
+    cur_hot_x = hot_x;
+    cur_hot_y = hot_y;
+    if (SDL_GetCursor() == old) {
+        SDL_SetCursor(guest_sprite);
+    }
+    if (old) {
+        SDL_FreeCursor(old);
+    }
+}
+
+/* Learn the hot spot once the pointer has rested and the guest followed */
+static void sdl_learn_hot_spot(struct sdl2_console *scon)
+{
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    int hx, hy, i;
+
+    if (hot_checked || !guest_cursor || !guest_sprite_surface ||
+        !qemu_input_is_absolute(scon->dcl.con) ||
+        now - host_move_ms < HOT_REST_MS || guest_move_ms < host_move_ms ||
+        now - guest_move_ms < HOT_REST_MS / 2) {
+        return;
+    }
+    hot_checked = true;
+    hx = host_abs_x - (guest_x - sprite_hot_x);
+    hy = host_abs_y - (guest_y - sprite_hot_y);
+    if (hx < 0 || hy < 0 || hx >= sprite_w || hy >= sprite_h ||
+        (hx == cur_hot_x && hy == cur_hot_y)) {
+        return;
+    }
+    for (i = 0; i < HOT_CACHE && hot_cache[i].sum != sprite_sum; i++) {
+    }
+    if (i == HOT_CACHE) {
+        i = hot_cache_next++ % HOT_CACHE;
+        hot_cache[i].sum = sprite_sum;
+    }
+    hot_cache[i].x = hx;
+    hot_cache[i].y = hy;
+    sdl_make_sprite(hx, hy);
 }
 
 static void sdl_mouse_define(DisplayChangeListener *dcl,
                              QEMUCursor *c)
 {
+    uint32_t sum = c->width * 0x10001u + c->height;
+    int i, hx = c->hot_x, hy = c->hot_y;
 
-    if (guest_sprite) {
-        SDL_FreeCursor(guest_sprite);
+    for (i = 0; i < c->width * c->height; i++) {
+        sum = sum * 31 + c->data[i];
     }
 
     if (guest_sprite_surface) {
@@ -862,10 +950,25 @@ static void sdl_mouse_define(DisplayChangeListener *dcl,
         fprintf(stderr, "Failed to make rgb surface from %p\n", c);
         return;
     }
-    guest_sprite = SDL_CreateColorCursor(guest_sprite_surface,
-                                         c->hot_x, c->hot_y);
+    sprite_w = c->width;
+    sprite_h = c->height;
+    sprite_hot_x = c->hot_x;
+    sprite_hot_y = c->hot_y;
+    sprite_sum = sum;
+    for (i = 0; i < HOT_CACHE; i++) {
+        if (sum && hot_cache[i].sum == sum) {
+            hx = hot_cache[i].x;
+            hy = hot_cache[i].y;
+            break;
+        }
+    }
+    hot_checked = false;
+    if (guest_sprite) {
+        SDL_FreeCursor(guest_sprite);
+        guest_sprite = NULL;
+    }
+    sdl_make_sprite(hx, hy);
     if (!guest_sprite) {
-        fprintf(stderr, "Failed to make color cursor from %p\n", c);
         return;
     }
     if (guest_cursor &&
