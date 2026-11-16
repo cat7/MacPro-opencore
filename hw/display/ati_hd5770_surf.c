@@ -223,6 +223,7 @@ void hd5770_surf_prep(HD5770Surf *s)
     uint32_t mt_w, mt_h, i, pbits, bbits;
 
     s->fast = false;
+    s->split = false;
     s->row_bytes = s->pitch * s->bpe;
     if (s->mode == HD5770_ARRAY_LINEAR_GENERAL ||
         s->mode == HD5770_ARRAY_LINEAR_ALIGNED) {
@@ -242,7 +243,8 @@ void hd5770_surf_prep(HD5770Surf *s)
         return;
     }
     if (s->mode != HD5770_ARRAY_2D_TILED_THIN1 ||
-        s->tile_bytes > s->tile_split || !s->pipes || !s->banks ||
+        !s->tile_split || (s->tile_split & (s->tile_split - 1)) ||
+        !s->pipes || !s->banks ||
         !s->bankw || !s->bankh || !s->mtilea ||
         (s->pipes & (s->pipes - 1)) || (s->banks & (s->banks - 1)) ||
         (s->bankw & (s->bankw - 1)) || (s->bankh & (s->bankh - 1)) ||
@@ -254,6 +256,12 @@ void hd5770_surf_prep(HD5770Surf *s)
     mt_h = 8 * s->bankh * s->banks / s->mtilea;
     if (mt_h < 8) {
         return;
+    }
+    if (s->tile_bytes > s->tile_split) {
+        /* hd5770_surf_offset() addresses it; split_* describe the layout */
+        s->split = true;
+        s->split_sh = ctz32(s->tile_split);
+        s->tile_bytes = s->tile_split;
     }
     pbits = ctz32(s->pipes);
     bbits = ctz32(s->banks);
@@ -268,6 +276,11 @@ void hd5770_surf_prep(HD5770Surf *s)
     s->mt_bytes = (uint64_t)s->tile_bytes * (mt_w / 8) * (mt_h / 8) /
                   (s->pipes * s->banks);
     s->mt_per_row = s->pitch / mt_w;
+    if (s->split) {
+        s->split_stride = (uint64_t)s->mt_per_row * (s->height / mt_h) *
+                          s->mt_bytes;
+        return;
+    }
     for (i = 0; i < 64; i++) {
         uint32_t e = s->eoff[i];
 

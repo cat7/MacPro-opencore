@@ -414,6 +414,10 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         s->regs[off >> 2] = val;
         s->force_redraw = true;
         return;
+    case 0xa400 ... 0xa43c:    /* TD_{PS,VS,GS}_SAMPLER0_BORDER_* */
+        s->regs[off >> 2] = val;
+        hd5770_gfx_border(&s->gfx3d, s->regs, off, val);
+        return;
     case EG_HDP_SURFACE0 ...
          EG_HDP_SURFACE0 + EG_HDP_SURFACES * EG_HDP_SURFACE_STRIDE - 4:
         s->regs[off >> 2] = val;

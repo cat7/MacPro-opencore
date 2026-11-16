@@ -118,6 +118,12 @@ typedef struct HD5770Lanes {
     HD5770Val color[4][HD5770_LANES];   /* colour export 0 */
     bool color0;                        /* colour 0 exported */
     bool killed[HD5770_LANES];
+    /* colour exports 1..7 (mcolor[0] unused), color_mask: exported */
+    HD5770Val mcolor[HD5770_MRTS][4][HD5770_LANES];
+    uint32_t color_mask;
+    /* the depth/stencil export */
+    HD5770Val depth[HD5770_LANES], stencil[HD5770_LANES];
+    bool depth_written;
     /* state */
     HD5770Val r[HD5770_LANE_GPRS][4][HD5770_LANES];
     HD5770Val pv[5][HD5770_LANES];
@@ -129,7 +135,7 @@ typedef struct HD5770Lanes {
  * pixels to the right and below each lane in nh and nv
  */
 bool hd5770_prog_lanes(const HD5770Prog *p, unsigned *nconst, bool *grad);
-/* the IR of a program that runs on lanes, else NULL */
+/* the IR of a pixel shader (straight-line, or the CF form), else NULL */
 const HD5770IR *hd5770_prog_ir(const HD5770Prog *p);
 /* resources [0..*n) the program's fetch instructions read */
 void hd5770_prog_resources(const HD5770Prog *p, uint8_t *ids, unsigned *n,

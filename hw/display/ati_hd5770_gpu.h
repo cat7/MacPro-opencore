@@ -103,7 +103,32 @@ typedef struct HD5770GpuTex {
      * that set HD5770GpuOps.resinfo.
      */
     uint32_t base_lv, levels, depth;
+    /*
+     * Added 2026-11-17 (HD5770GpuOps.full): bc 1..5 for BC1..BC5 (the
+     * surface's elements are 4x4 blocks, as texel() in
+     * ati_hd5770_draw.c decodes them); slices of a 3D (dim 2), cube
+     * (dim 3, six faces) or array (dim 4, 5) texture follow each other in
+     * a level, slice_bytes[l] apart (a 3D texture's depth halves with the
+     * levels); surf and lv[] cover all slices. tex_slice() picks the
+     * slice.
+     */
+    uint32_t bc, slices;
+    uint64_t slice_bytes[HD5770_GPU_LEVELS];
 } HD5770GpuTex;
+
+/*
+ * Added 2026-11-17 (HD5770GpuOps.full): a colour buffer of a draw with
+ * more render targets: export cb goes to it, with its own format, write
+ * mask and CB_BLENDn_CONTROL, as put_pixel() writes it.
+ */
+typedef struct HD5770GpuRt {
+    HD5770GpuSurf surf;
+    uint32_t cb;
+    uint32_t fmt, num, comps;
+    uint32_t bits[4], src[4];
+    bool unorm8, is_float, blend_ok;
+    uint32_t wmask, blend;
+} HD5770GpuRt;
 
 /* a vertex buffer resource the pixel shader fetches from */
 typedef struct HD5770GpuVb {
@@ -178,6 +203,32 @@ typedef struct HD5770GpuDraw {
     bool has_s;
     uint32_t dctl, rctl, srm[2], sclear;
     float zclear, zmin, zmax;
+
+    /*
+     * Added 2026-11-17, only for backends that set HD5770GpuOps.full.
+     * nmrt > 0: the draw writes the colour buffers mrt[0..nmrt-1] (the
+     * rt fields above are mrt[0]'s), each from its own export; as
+     * shade() in ati_hd5770_draw.c, the alpha test reads export 0.
+     * zexport/sexport: the fragment depth (the stencil reference) comes
+     * from the program's depth export when it made one. bool_const and
+     * loop_const: the pixel shader's SQ_BOOL_CONST and SQ_LOOP_CONST for
+     * a program in the IR's CF form.
+     */
+    unsigned nmrt;
+    HD5770GpuRt mrt[8];
+    bool zexport, sexport;
+    uint32_t bool_const;
+    uint32_t loop_const[32];
+    /*
+     * resolve (full): no program runs (ir has no ops); each covered
+     * pixel of rt gets the pixel of rs as resolve_pixel() copies it: its
+     * bytes when rs_same, else its rs_comps components of format rs_fmt
+     * (rs_num 7 float, 4 integer, else UNORM; component i is channel
+     * rs_src[i]) through the output stage.
+     */
+    bool resolve, rs_same;
+    HD5770GpuSurf rs;
+    uint32_t rs_fmt, rs_num, rs_comps, rs_src[4];
 } HD5770GpuDraw;
 
 typedef struct HD5770GpuOps {
@@ -198,6 +249,12 @@ typedef struct HD5770GpuOps {
     bool resinfo;
     /* added 2026-11-15: FENCES above */
     uint64_t (*fence)(void *b);
+    /*
+     * added 2026-11-17: takes BC, 3D, cube and array textures, SAMPLE_C,
+     * CUBE, programs in the CF form, depth exports and more render
+     * targets (the fields marked HD5770GpuOps.full)
+     */
+    bool full;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -226,6 +283,13 @@ char *hd5770_msl_program(const HD5770IR *ir);
 /* the same for draws whose texture units in mipmask are mipmapped */
 char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask);
 extern const char hd5770_msl_lib[];
+
+/*
+ * The functions hd_nb() and hd_run() of a program in the CF form, as
+ * text common to MSL and GLSL (ati_hd5770_emit.c, which lists the
+ * macros the backend defines first)
+ */
+void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask);
 
 /* the OpenGL backend (Windows); NULL and *err set if there is none */
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,

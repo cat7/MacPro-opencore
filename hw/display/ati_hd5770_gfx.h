@@ -64,6 +64,15 @@ typedef struct HD5770Surf {
     uint32_t mt_per_row, tile_bytes, row_bytes;
     uint64_t mt_bytes;
     uint32_t eoff[64];          /* offset of element (x & 7, y & 7) */
+    /*
+     * 2D tiles larger than the tile split (fast false): split_sh is
+     * log2 of the split, the fields above are those of split-sized
+     * tiles, eoff the element offsets in the whole tile, and each part
+     * of a tile lies split_stride bytes after the previous one
+     */
+    bool split;
+    uint8_t split_sh;
+    uint64_t split_stride;
 } HD5770Surf;
 
 #define HD5770_GB_ADDR_CONFIG_JUNIPER   0x02010002
@@ -207,6 +216,8 @@ typedef struct HD5770GpuStats {
     uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
     uint64_t syncs, touch_syncs;
+    /* the CPU's time and pixels for the draws it took, by reason */
+    uint64_t fb_ns[8], fb_px[8];
 } HD5770GpuStats;
 
 typedef struct HD5770Gfx {
@@ -239,7 +250,21 @@ typedef struct HD5770Gfx {
     uint64_t index_base;        /* MC address */
     uint32_t index_size;        /* INDEX_BUFFER_SIZE, indices */
     uint32_t num_instances;     /* 0 counts as 1 */
+    /* DRAW_INDIRECT / DRAW_INDEX_INDIRECT: SET_BASE, and the draw's data */
+    uint64_t ind_base;
+    bool ind_draw;
+    uint32_t ind_ninst, ind_vtx, ind_inst;
+    /*
+     * Border colours of samplers with BORDER_COLOR_TYPE register, per
+     * stage (PS, VS, GS) and sampler, as TD_*_SAMPLER0_BORDER_INDEX
+     * selects them
+     */
+    uint32_t border[3][32][4];
 } HD5770Gfx;
+
+/* a write to a TD_*_SAMPLER0_BORDER_* register (0xa400..0xa43c) */
+void hd5770_gfx_border(HD5770Gfx *g, const uint32_t *regs, uint32_t off,
+                       uint32_t val);
 
 void hd5770_gfx_init(HD5770Gfx *g);
 void hd5770_gfx_fini(HD5770Gfx *g);

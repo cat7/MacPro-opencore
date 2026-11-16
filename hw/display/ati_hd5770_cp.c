@@ -1013,6 +1013,7 @@ static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
     case OP_INDEX_BASE:
     case OP_INDEX_TYPE:
     case OP_NUM_INSTANCES:
+    case OP_SET_BASE:
         hd5770_gfx_state_packet(&s->gfx3d, b, n);
         return PKT_DONE;
     case OP_STRMOUT_BUFFER_UPDATE:
