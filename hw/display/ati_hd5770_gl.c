@@ -60,8 +60,6 @@
 #define GL_MAX_TILES    (4 * 1024 * 1024)
 #define GL_GROUPS       65535   /* work groups per dispatch call */
 /* a draw waits for its program's build up to its estimated CPU cost, capped */
-#define GL_WAIT_NS      (3000 * (uint64_t)SCALE_MS)
-#define GL_WAIT_MIN_NS  (20 * (uint64_t)SCALE_MS)
 #define GL_POOL         (128u << 20)    /* slots for guest RAM pages */
 
 /* ---- GL, spelled out: opengl32.dll exports 1.1 only ---- */
@@ -391,7 +389,7 @@ typedef struct HD5770Gl {
     uint64_t barriers, up_bytes, chk_bytes, rb_bytes, wb_bytes, compiles;
     uint64_t st_bytes;
     uint64_t failed;
-    uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns, compile_wait_ns;
+    uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns;
     uint64_t pb_hits, pb_rejected, pb_stored;
     uint64_t ram_draws, pool_resets, slots_max;
 } HD5770Gl;
@@ -1893,30 +1891,10 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         mipmask |= (uint32_t)d->tex[i].mip << i;
     }
     p = gl_prog(g, d->ir, mipmask);
-    if (qatomic_load_acquire(&p->state) == GLP_QUEUED && g->cthread_on) {
-        /*
-         * The CPU would draw it meanwhile: wait for the build up to about
-         * what that costs (a pixel: some 20 ns an instruction, 200 a fetch)
-         */
-        uint64_t px = 0, ns;
-        int64_t t0w = get_clock(), until;
-
-        for (i = 0; i < d->ntri; i++) {
-            px += (uint64_t)(d->tri[i].x1 - d->tri[i].x0 + 1) *
-                  (d->tri[i].y1 - d->tri[i].y0 + 1);
-        }
-        ns = MIN(px * (20 * d->ir->ninsts + 200 * d->ir->nfetches),
-                 GL_WAIT_NS);
-        until = t0w + ns;
-        while (qatomic_load_acquire(&p->state) == GLP_QUEUED &&
-               ns >= GL_WAIT_MIN_NS && get_clock() < until) {
-            g_usleep(500);
-        }
-        g->compile_wait_ns += get_clock() - t0w;
-    }
     switch (qatomic_load_acquire(&p->state)) {
     case GLP_QUEUED:
         g->declined[GLD_COMPILING]++;
+        g->pub.building = true;
         return false;
     case GLP_FAILED:
         g->declined[GLD_PROG]++;
@@ -2284,15 +2262,13 @@ static void gl_stats(void *opaque, GString *out)
         PRIu64 " wait ms %" PRIu64 " (gpu %" PRIu64 " read back %" PRIu64
         ") encode ms %" PRIu64 " programs %u compiled %" PRIu64
         " (failed %" PRIu64 ") in ms %" PRIu64 " binaries: loaded %" PRIu64
-        " rejected %" PRIu64 " stored %" PRIu64 "; draws waited for builds ms %"
-        PRIu64 "\n",
+        " rejected %" PRIu64 " stored %" PRIu64 "\n",
         g->syncs, g->segs, g->dispatches,
         g->barriers, g->st_bytes >> 20, g->chk_bytes >> 20, g->up_bytes >> 20,
         g->rb_bytes >> 20, g->wb_bytes >> 10, g->wait_ns / 1000000,
         g->gpu_ns / 1000000, g->rb_ns / 1000000, g->encode_ns / 1000000,
         g_hash_table_size(g->progs), g->compiles, g->failed,
-        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored,
-        g->compile_wait_ns / 1000000);
+        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored);
 }
 
 static void gl_prog_free(gpointer p)

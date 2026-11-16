@@ -216,6 +216,7 @@ typedef struct HD5770GpuStats {
     uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
     uint64_t syncs, touch_syncs;
+    uint64_t build_skips;       /* left out while their program builds */
     /* the CPU's time and pixels for the draws it took, by reason */
     uint64_t fb_ns[8], fb_px[8];
 } HD5770GpuStats;

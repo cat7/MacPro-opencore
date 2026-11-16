@@ -855,6 +855,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     switch (qatomic_load_acquire(&p->state)) {
     case MTL_P_BUILDING:
         m->declined[MTL_BUILDING]++;
+        m->pub.building = true;
         return false;
     case MTL_P_FAILED:
         m->declined[MTL_NO_PROG]++;

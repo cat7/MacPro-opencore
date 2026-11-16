@@ -273,6 +273,11 @@ typedef struct HD5770Gpu {
     /* added 2026-11-15: FENCES above; NULL while the device uses none */
     void (*retired)(void *opaque, uint64_t ticket);
     void (*thread)(void *opaque, bool enter);
+    /*
+     * added 2026-11-17: set by draw() when it declines because the
+     * program is still being built; the draw is then left out
+     */
+    bool building;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

@@ -3585,11 +3585,21 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
             pre[i] = g_memdup2(g->vram + rng[i][0], rng[i][1] - rng[i][0]);
         }
     }
+    g->gpu->building = false;
     if (q->ntri && !g->gpu->ops->draw(g->gpu->b, q)) {
-        GPU_FB(d, GFB_BACKEND);
         for (i = 0; i < nr; i++) {
             g_free(pre[i]);
         }
+        if (g->gpu->building && g->gpu_mode == HD5770_GPU_ON) {
+            /*
+             * left out rather than drawn by the CPU, which can take
+             * seconds: the frame is incomplete until the program is built
+             */
+            g->gst.build_skips++;
+            ok = true;
+            goto out;
+        }
+        GPU_FB(d, GFB_BACKEND);
         goto out;
     }
     ok = true;
@@ -4495,14 +4505,14 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
         ") fallback: program %"
         PRIu64 " small %" PRIu64 " target %" PRIu64 " texture %" PRIu64
         " vertex buffer %" PRIu64 " backend %" PRIu64 " depth/resolve %"
-        PRIu64 "\n"
+        PRIu64 " left out while building %" PRIu64 "\n"
         "gpu: syncs %" PRIu64 " (on access %" PRIu64 ") verified %" PRIu64
         " differing draws %" PRIu64 " bytes %" PRIu64 " (>1: %" PRIu64
         ") max %" PRIu64 "\n",
         g->gpu_mode == HD5770_GPU_VERIFY ? "verify" : "on", t->offered,
         t->taken, t->taken_db, t->fallback[GFB_PROG], t->fallback[GFB_SMALL],
         t->fallback[GFB_RT], t->fallback[GFB_TEX], t->fallback[GFB_VB],
-        t->fallback[GFB_BACKEND], t->fallback[GFB_DB], t->syncs, t->touch_syncs, t->verified,
+        t->fallback[GFB_BACKEND], t->fallback[GFB_DB], t->build_skips, t->syncs, t->touch_syncs, t->verified,
         t->vdiff_draws, t->vdiff_bytes, t->vdiff_big, t->vmax);
     g_string_append_printf(out,
         "gpu: on the CPU ms/kpixels: program %" PRIu64 "/%" PRIu64
