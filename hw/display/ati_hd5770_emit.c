@@ -27,6 +27,7 @@
  *   HD_BCONST, HD_LCONST(i)      SQ_BOOL_CONST, SQ_LOOP_CONST i
  *   HD_POSGPR                    compact register of the position, or -1
  *   HD_TEX(u, w0, w1, w2, c, dv, o)  hd_tfetch_d() of texture unit u
+ *   HD_ZERO                      an int 0 the compiler cannot see through
  *   HD_VTX(w0, w1, w2, index, o)     hd_vfetch()
  *   HD_INTERP(p, ch, flat, b0, b1, b2, pw)  hd_interp()
  *   HD_OUTB(n), HD_OUTU(n), HD_OUTC(n), HD_OUTA(n, a, b), HD_OUTBA(n, a)
@@ -460,43 +461,97 @@ static void e_export(GString *o, const HD5770IRExport *e)
     g_string_append_printf(o, "            cm |= %uu;\n", 1u << e->target);
 }
 
-/* the state machine of one function */
-static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
-                   const int *pidx)
+/*
+ * Fetches first..last - 1 by the index in fq (a variable of that name):
+ * the source, the parameters and one texture sample site, the result
+ */
+static void e_dispatch(GString *o, const HD5770IR *ir, unsigned first,
+                       unsigned last, uint32_t mipmask, bool main,
+                       const int *pidx, const char *fq)
 {
-    unsigned i, j, ng = MAX(ir->ngpr, 1u);
-    GString *fh = g_string_new(NULL);
+    unsigned i;
 
-    /*
-     * The fetches of a clause run one per turn of the loop, through one
-     * texture sample: the shader compiler gets the sample code once, not
-     * once per fetch
-     */
-    g_string_append(fh, "        if (fq >= 0) {\n"
-                        "            uint o[4];\n            uint c[4];\n"
-                        "            float dv[8];\n"
-                        "            uint fu = 0u, fw0 = 0u, fw1 = 0u, fw2 = 0u;\n"
-                        "            bool dotex = false;\n"
-                        "            switch (fq) {\n");
-    for (i = 0; i < ir->nfetches; i++) {
-        g_string_append_printf(fh, "            case %u: {\n", i);
-        e_fetch(fh, ir, &ir->fetches[i], i, mipmask, main, pidx);
-        g_string_append(fh, "                break;\n            }\n");
+    g_string_append_printf(o, "            uint o[4];\n            uint c[4];\n"
+                           "            float dv[8];\n"
+                           "            uint fu = 0u, fw0 = 0u, fw1 = 0u, fw2 = 0u;\n"
+                           "            bool dotex = false;\n"
+                           "            switch (%s) {\n", fq);
+    for (i = first; i < last; i++) {
+        g_string_append_printf(o, "            case %u: {\n", i);
+        e_fetch(o, ir, &ir->fetches[i], i, mipmask, main, pidx);
+        g_string_append(o, "                break;\n            }\n");
     }
-    g_string_append(fh, "            default:\n                break;\n            }\n"
-                        "            if (dotex) {\n"
-                        "                HD_TEX(fu, fw0, fw1, fw2, c, dv, o);\n"
-                        "                switch (fq) {\n");
-    for (i = 0; i < ir->nfetches; i++) {
+    g_string_append_printf(o, "            default:\n                break;\n            }\n"
+                           "            if (dotex) {\n"
+                           "                HD_TEX(fu, fw0, fw1, fw2, c, dv, o);\n"
+                           "                switch (%s) {\n", fq);
+    for (i = first; i < last; i++) {
         if (ir->fetches[i].kind == HD5770_IRF_TEX) {
-            g_string_append_printf(fh, "                case %u: {\n", i);
-            e_fetch_wb(fh, &ir->fetches[i]);
-            g_string_append(fh, "                    break;\n                }\n");
+            g_string_append_printf(o, "                case %u: {\n", i);
+            e_fetch_wb(o, &ir->fetches[i]);
+            g_string_append(o, "                    break;\n                }\n");
         }
     }
-    g_string_append(fh, "                default:\n                    break;\n"
-                        "                }\n            }\n"
-                        "            fq = fq < fend ? fq + 1 : -1;\n"
+    g_string_append(o, "                default:\n                    break;\n"
+                       "                }\n            }\n");
+}
+
+/*
+ * Whether the program runs straight through: no loops, calls or backward
+ * jumps; a forward jump skips the ops before its target
+ */
+static bool e_linear(const HD5770IR *ir)
+{
+    unsigned i;
+
+    for (i = 0; i < ir->nops; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+        unsigned t = op->cf & 0xf;
+
+        switch (op->kind) {
+        case HD5770_IRO_ALU:
+            if (t == E_ALU_BREAK || t == E_ALU_CONTINUE) {
+                return false;
+            }
+            continue;
+        case HD5770_IRO_FETCH:
+        case HD5770_IRO_EXPORT:
+            continue;
+        default:
+            break;
+        }
+        switch (op->cf) {
+        case E_PUSH:
+        case E_JUMP:
+        case E_ELSE:
+            if (op->addr <= i) {
+                return false;
+            }
+            break;
+        case E_POP:
+        case E_KILL:
+        case E_END_PROGRAM:
+        case E_NOP:
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+/* the state machine of one function */
+static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
+                   const int *pidx, bool straight)
+{
+    unsigned i, j, ng = MAX(ir->ngpr, 1u);
+    GString *fh = g_string_new(NULL), *ob = g_string_new(NULL);
+    bool lin = straight && e_linear(ir);
+
+    g_string_append(fh, "        if (fq >= 0) {\n");
+
+    e_dispatch(fh, ir, 0, ir->nfetches, mipmask, main, pidx, "fq");
+    g_string_append(fh, "            fq = fq < fend ? fq + 1 : -1;\n"
                         "            continue;\n        }\n");
 
     g_string_append_printf(o,
@@ -521,36 +576,39 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
         "    bool ls_dx10[%d];\n"
         "    int rets[%d];\n"
         "    uint steps = 0u, nseen = 0u;\n"
-        "    int fq = -1, fend = -1;\n"
-        "    while ((run && pc < %u && steps < %uu) || fq >= 0) {\n"
-        "%s"
-        "        int cur = pc;\n"
-        "        steps++;\n"
-        "        pc++;\n"
-        "        switch (cur) {\n",
+        "    int fq = -1, fend = -1, skp = 0;\n",
         E_STACK, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS, E_LOOPS,
-        E_CALLS, ir->nops, E_STEPS, fh->str);
+        E_CALLS);
+    if (!lin) {
+        g_string_append_printf(o,
+            "    while ((run && pc < %u && steps < %uu) || fq >= 0) {\n"
+            "%s"
+            "        int cur = pc;\n"
+            "        steps++;\n"
+            "        pc++;\n"
+            "        switch (cur) {\n", ir->nops, E_STEPS, fh->str);
+    }
     g_string_free(fh, true);
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
         unsigned t = op->cf & 0xf;
 
-        g_string_append_printf(o, "        case %u: {\n", i);
+        g_string_set_size(ob, 0);
         switch (op->kind) {
         case HD5770_IRO_ALU:
             if (t == E_ALU_PUSH_BEFORE || t == E_ALU_BREAK ||
                 t == E_ALU_CONTINUE) {
-                e_push(o);
+                e_push(ob);
             }
             for (j = 0; j < op->n; j++) {
-                e_group(o, ir, &ir->groups[op->first + j], main);
+                e_group(ob, ir, &ir->groups[op->first + j], main);
             }
             if (t == E_ALU_BREAK || t == E_ALU_CONTINUE) {
                 /* PUSH, ALU, ELSE, BREAK (CONTINUE), POP */
-                g_string_append(o, "        {\n"
+                g_string_append(ob, "        {\n"
                                    "            bool hit = (sp > 0 ? stk[sp - 1] : true) && !act_;\n");
-                e_pop(o, "1");
-                g_string_append_printf(o,
+                e_pop(ob, "1");
+                g_string_append_printf(ob,
                     "            if (hit && lsp > 0) {\n"
                     "                sp = ls_sp[lsp - 1] + 1;\n"
                     "                act_ = %s;\n"
@@ -558,55 +616,63 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                     "            }\n        }\n",
                     t == E_ALU_CONTINUE ? "true" : "false");
             } else if (t == E_ALU_POP_AFTER) {
-                e_pop(o, "1");
+                e_pop(ob, "1");
             } else if (t == E_ALU_POP2_AFTER) {
-                e_pop(o, "2");
+                e_pop(ob, "2");
             } else if (t == E_ALU_ELSE_AFTER) {
-                g_string_append(o, "        act_ = (sp > 0 ? stk[sp - 1] : true) && !act_;\n");
+                g_string_append(ob, "        act_ = (sp > 0 ? stk[sp - 1] : true) && !act_;\n");
             }
             break;
         case HD5770_IRO_FETCH:
-            if (op->n) {
-                g_string_append_printf(o, "        if (act_) {\n            fq = %u;\n"
+            if (op->n && lin) {
+                /* one sample site for the clause, in a loop kept a loop */
+                g_string_append_printf(ob, "        if (act_) {\n"
+                                       "        for (int fl = %u; fl < %u + HD_ZERO; fl++) {\n",
+                                       op->first, op->first + op->n);
+                e_dispatch(ob, ir, op->first, op->first + op->n, mipmask, main,
+                           pidx, "fl");
+                g_string_append(ob, "        }\n        }\n");
+            } else if (op->n) {
+                g_string_append_printf(ob, "        if (act_) {\n            fq = %u;\n"
                                        "            fend = %u;\n        }\n",
                                        op->first, op->first + op->n - 1);
             }
             break;
         case HD5770_IRO_EXPORT:
             if (main && op->n) {
-                g_string_append(o, "        if (act_) {\n");
+                g_string_append(ob, "        if (act_) {\n");
                 for (j = 0; j < op->n; j++) {
-                    e_export(o, &ir->exports[op->first + j]);
+                    e_export(ob, &ir->exports[op->first + j]);
                 }
-                g_string_append(o, "        }\n");
+                g_string_append(ob, "        }\n");
             }
             break;
         default:
             switch (op->cf) {
             case E_PUSH:
-                e_push(o);
-                g_string_append(o, "        if (!");
-                e_cond(o, op);
-                g_string_append(o, ") {\n");
-                e_pop(o, op->popn ? (op->popn == 1 ? "1" : op->popn == 2 ? "2" :
+                e_push(ob);
+                g_string_append(ob, "        if (!");
+                e_cond(ob, op);
+                g_string_append(ob, ") {\n");
+                e_pop(ob, op->popn ? (op->popn == 1 ? "1" : op->popn == 2 ? "2" :
                                      op->popn == 3 ? "3" : op->popn == 4 ? "4" :
                                      op->popn == 5 ? "5" : op->popn == 6 ? "6" : "7")
                                   : "1");
-                g_string_append_printf(o, "            pc = %u;\n        }\n", op->addr);
+                g_string_append_printf(ob, "            pc = %u;\n        }\n", op->addr);
                 break;
             case E_JUMP: {
                 char n[4];
 
                 snprintf(n, sizeof(n), "%u", op->popn);
-                g_string_append(o, "        if (!");
-                e_cond(o, op);
-                g_string_append(o, ") {\n");
-                e_pop(o, n);
-                g_string_append_printf(o, "            pc = %u;\n        }\n", op->addr);
+                g_string_append(ob, "        if (!");
+                e_cond(ob, op);
+                g_string_append(ob, ") {\n");
+                e_pop(ob, n);
+                g_string_append_printf(ob, "            pc = %u;\n        }\n", op->addr);
                 break;
             }
             case E_ELSE:
-                g_string_append_printf(o,
+                g_string_append_printf(ob,
                     "        act_ = (sp > 0 ? stk[sp - 1] : true) && !act_;\n"
                     "        if (!act_) {\n            pc = %u;\n        }\n", op->addr);
                 break;
@@ -614,25 +680,25 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                 char n[4];
 
                 snprintf(n, sizeof(n), "%u", op->popn);
-                e_pop(o, n);
+                e_pop(ob, n);
                 break;
             }
             case E_CALL:
-                g_string_append_printf(o, "        if (rsp < %d && ", E_CALLS);
-                e_cond(o, op);
-                g_string_append_printf(o, ") {\n            rets[rsp] = pc;\n"
+                g_string_append_printf(ob, "        if (rsp < %d && ", E_CALLS);
+                e_cond(ob, op);
+                g_string_append_printf(ob, ") {\n            rets[rsp] = pc;\n"
                                        "            rsp++;\n            pc = %u;\n"
                                        "        }\n", op->addr);
                 break;
             case E_RETURN:
-                g_string_append(o, "        if (rsp == 0) {\n            run = false;\n"
+                g_string_append(ob, "        if (rsp == 0) {\n            run = false;\n"
                                    "        } else {\n            rsp--;\n"
                                    "            pc = rets[rsp];\n        }\n");
                 break;
             case E_LOOP_START:
             case E_LOOP_START_DX10:
             case E_LOOP_START_NO_AL:
-                g_string_append_printf(o,
+                g_string_append_printf(ob,
                     "        if (lsp >= %d) {\n            run = false;\n        } else {\n"
                     "            uint lc = HD_LCONST(%uu);\n"
                     "            ls_start[lsp] = pc;\n"
@@ -644,11 +710,11 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                     "            ls_sp[lsp] = sp;\n",
                     E_LOOPS, op->cst, op->addr,
                     op->cf == E_LOOP_START_DX10 ? "true" : "false");
-                e_push(o);
-                g_string_append_printf(o,
+                e_push(ob);
+                g_string_append_printf(ob,
                     "            if (!ls_dx10[lsp] && ls_cnt[lsp] == 0) {\n");
-                e_pop(o, "1");
-                g_string_append_printf(o,
+                e_pop(ob, "1");
+                g_string_append_printf(ob,
                     "                pc = %u;\n            } else {\n"
                     "%s"
                     "                lsp++;\n            }\n        }\n", op->addr,
@@ -656,7 +722,7 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                     ? "                lidx = ls_idx[lsp];\n" : "");
                 break;
             case E_LOOP_END:
-                g_string_append(o,
+                g_string_append(ob,
                     "        if (lsp == 0) {\n            run = false;\n        } else {\n"
                     "            int l_ = lsp - 1;\n"
                     "            bool again = false;\n"
@@ -671,28 +737,28 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                     "                pc = ls_start[l_];\n"
                     "            } else {\n"
                     "                sp = ls_sp[l_] + 1;\n");
-                e_pop(o, "1");
-                g_string_append(o, "                lsp--;\n            }\n        }\n");
+                e_pop(ob, "1");
+                g_string_append(ob, "                lsp--;\n            }\n        }\n");
                 break;
             case E_LOOP_BREAK:
-                g_string_append(o, "        if (lsp > 0 && ");
-                e_cond(o, op);
-                g_string_append(o, ") {\n            act_ = false;\n        }\n");
+                g_string_append(ob, "        if (lsp > 0 && ");
+                e_cond(ob, op);
+                g_string_append(ob, ") {\n            act_ = false;\n        }\n");
                 break;
             case E_LOOP_CONTINUE:
-                g_string_append(o, "        if (lsp > 0 && ");
-                e_cond(o, op);
-                g_string_append(o, ") {\n            pc = ls_end[lsp - 1] - 1;\n        }\n");
+                g_string_append(ob, "        if (lsp > 0 && ");
+                e_cond(ob, op);
+                g_string_append(ob, ") {\n            pc = ls_end[lsp - 1] - 1;\n        }\n");
                 break;
             case E_KILL:
                 if (main) {
-                    g_string_append(o, "        if (");
-                    e_cond(o, op);
-                    g_string_append(o, ") {\n            killed = true;\n        }\n");
+                    g_string_append(ob, "        if (");
+                    e_cond(ob, op);
+                    g_string_append(ob, ") {\n            killed = true;\n        }\n");
                 }
                 break;
             case E_END_PROGRAM:
-                g_string_append(o, "        run = false;\n");
+                g_string_append(ob, "        run = false;\n");
                 break;
             default:
                 break;
@@ -700,15 +766,28 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
             break;
         }
         if (op->eop) {
-            g_string_append(o, "        run = false;\n");
+            g_string_append(ob, "        run = false;\n");
         }
-        g_string_append(o, "        break;\n        }\n");
+        if (lin) {
+            /* a jump taken skips the ops before its target */
+            char *b = g_strjoinv("skp = ", g_strsplit(ob->str, "pc = ", -1));
+
+            g_string_append_printf(o, "    if (run && skp <= %u) {\n%s    }\n", i, b);
+            g_free(b);
+        } else {
+            g_string_append_printf(o, "        case %u: {\n%s        break;\n        }\n",
+                                   i, ob->str);
+        }
     }
-    g_string_append(o, "        default:\n            run = false;\n            break;\n"
-                       "        }\n    }\n");
+    if (!lin) {
+        g_string_append(o, "        default:\n            run = false;\n            break;\n"
+                           "        }\n    }\n");
+    }
+    g_string_free(ob, true);
 }
 
-void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask)
+void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
+                    bool straight)
 {
     int *pidx = g_new(int, ir->nfetches + 1);
     unsigned i, np = 0;
@@ -732,7 +811,7 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask)
             "        seen[i] = false;\n"
             "        rec[i][0] = 0u;\n        rec[i][1] = 0u;\n        rec[i][2] = 0u;\n"
             "        rec[i][3] = 0u;\n    }\n", np, np, np);
-        e_body(o, ir, mipmask, false, pidx);
+        e_body(o, ir, mipmask, false, pidx, straight);
         g_string_append(o, "}\n\n");
     }
     g_string_append(o,
@@ -758,7 +837,7 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask)
             "    hd_nb(HD_CTX_ARGS, N2B0, N2B1, N2B2, N2PW, N2PX, N2PY, rec2, seen2);\n",
             np, np, np, np);
     }
-    e_body(o, ir, mipmask, true, pidx);
+    e_body(o, ir, mipmask, true, pidx, straight);
     g_string_append(o, "}\n\n");
     g_free(pidx);
 }

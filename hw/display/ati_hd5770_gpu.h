@@ -294,7 +294,12 @@ extern const char hd5770_msl_lib[];
  * text common to MSL and GLSL (ati_hd5770_emit.c, which lists the
  * macros the backend defines first)
  */
-void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask);
+/*
+ * straight: a program without loops or calls becomes straight code (NVIDIA's
+ * GL linker takes much longer over it; Metal runs it faster)
+ */
+void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
+                    bool straight);
 
 /* the OpenGL backend (Windows); NULL and *err set if there is none */
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,

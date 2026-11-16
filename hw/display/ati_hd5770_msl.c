@@ -1811,6 +1811,7 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
             "#define HD_LCONST(i) u.lconst[i]\n"
             "#define HD_POSGPR u.pos_gpr\n"
             "#define HD_TEX(n, w0, w1, w2, c, dv, o) hd_tfetch_d(vram, ram, st, tex[n], w0, w1, w2, c, dv, o)\n"
+            "#define HD_ZERO 0\n"
             "#define HD_VTX(w0, w1, w2, i, o) hd_vfetch(u, st, w0, w1, w2, i, o)\n"
             "#define HD_INTERP(p, ch, fl, b0, b1, b2, pw) hd_interp(u, t, prm, p, ch, fl, b0, b1, b2, pw)\n"
             "#define HD_OUTA(n, a, b) thread uint (&n)[a][b]\n"
@@ -1818,7 +1819,7 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
             "#define HD_OUTB(n) thread bool &n\n"
             "#define HD_OUTU(n) thread uint &n\n"
             "#define HD_OUTC(n) thread uint (&n)[8][4]\n");
-        hd5770_emit_cf(o, ir, mipmask);
+        hd5770_emit_cf(o, ir, mipmask, true);
     }
     g_string_append(o,
         "/* the pixel (x, y) of triangle t: false if t does not cover it */\n"
