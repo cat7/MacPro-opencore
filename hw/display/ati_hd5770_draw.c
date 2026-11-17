@@ -1449,6 +1449,7 @@ static void tfetch_stage(Draw *d, const uint32_t *w, const HD5770Val c0[4],
     v[3].f = 0.0f;
     t = tex_get(d, id, sid);
     if (!t) {
+        d->st->gap_misc[HD5770_GAP_TEX_FETCH]++;
         d->ok = false;
         return;
     }
@@ -4998,6 +4999,11 @@ static const char *const misc_names[HD5770_GAP_MISC_MAX] = {
     "predicated ALU", "program layout (clause range, ALU slots)",
     "multisampling", "vertices with w <= 0", "mipmaps (base level drawn)",
     "front face input", "polygon offset",
+    "program stopped: fetch from a resource without a texture",
+    "program stopped: stack overflow", "program stopped: pop of empty stack",
+    "program stopped: ELSE with a pop count", "program stopped: loop nesting",
+    "program stopped: step limit", "program stopped: CF instruction",
+    "program stopped: derivative",
 };
 
 static void gap_list(GString *out, const char *name, const uint64_t *v,

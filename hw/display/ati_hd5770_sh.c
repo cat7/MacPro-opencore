@@ -577,6 +577,15 @@ typedef struct Run {
     uint32_t pc;
 } Run;
 
+/* the program cannot go on: gap g of the CPU path */
+static void run_fail(Run *r, unsigned g)
+{
+    if (r->ok && r->env->st) {
+        r->env->st->gap_misc[g]++;
+    }
+    r->ok = false;
+}
+
 static float fclamp01(float v)
 {
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : (v != v ? 0.0f : v));
@@ -1288,7 +1297,7 @@ static void run_fetch(Run *r, const CfInst *cf)
             } else if (!r->env->neighbour ||
                        !r->env->neighbour(r->env->opaque, op == 0x07,
                                           op == 0x08, r->pc, i, sg, nb)) {
-                r->ok = false;
+                run_fail(r, HD5770_GAP_RUN_GRAD);
                 return;
             }
             for (k = 0; k < 4; k++) {
@@ -1431,7 +1440,7 @@ static void push(Run *r)
     if (r->sp < STACK_DEPTH) {
         r->stack[r->sp++] = r->active;
     } else {
-        r->ok = false;
+        run_fail(r, HD5770_GAP_RUN_STACK);
     }
 }
 
@@ -1439,7 +1448,7 @@ static void pop(Run *r, unsigned n)
 {
     while (n--) {
         if (!r->sp) {
-            r->ok = false;
+            run_fail(r, HD5770_GAP_RUN_POP);
             return;
         }
         r->active = r->stack[--r->sp];
@@ -1571,7 +1580,7 @@ static bool run_prog(Run *r)
             bool before = r->sp ? r->stack[r->sp - 1] : true;
 
             if (popn) {
-                r->ok = false;
+                run_fail(r, HD5770_GAP_RUN_ELSE_POP);
             }
             r->active = before && !r->active;
             if (!r->active) {
@@ -1611,7 +1620,7 @@ static bool run_prog(Run *r)
             uint32_t lc = r->env->loop_const ? r->env->loop_const[cst] : 0;
 
             if (lsp >= LOOP_DEPTH) {
-                r->ok = false;
+                run_fail(r, HD5770_GAP_RUN_LOOP);
                 break;
             }
             loops[lsp].start = pc;
@@ -1635,7 +1644,7 @@ static bool run_prog(Run *r)
         }
         case CF_LOOP_END:
             if (!lsp) {
-                r->ok = false;
+                run_fail(r, HD5770_GAP_RUN_LOOP);
                 break;
             }
             {
@@ -1670,7 +1679,7 @@ static bool run_prog(Run *r)
         case CF_END_PROGRAM:
             return r->ok;
         default:
-            r->ok = false;
+            run_fail(r, HD5770_GAP_RUN_CF);
             break;
         }
         if (eop) {
@@ -1681,7 +1690,7 @@ static bool run_prog(Run *r)
         }
     }
     if (steps >= STEP_LIMIT) {
-        r->ok = false;
+        run_fail(r, HD5770_GAP_RUN_STEPS);
     }
     return r->ok;
 }
