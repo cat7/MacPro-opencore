@@ -300,6 +300,13 @@ struct ATIHD5770State {
     char *gpu_prop;             /* "gpu": off, on, verify, native */
     QemuRecMutex gpu_mutex;     /* the host GPU backend */
     struct RAMBlock *gpu_ram;   /* guest RAM the backend draws into */
+    /*
+     * gpu=native, the write log the backend reads (HD5770Gpu.written):
+     * a byte per VRAM page, set by the refresh for the dirty bits it
+     * clears; gpu_wseq is odd while it does
+     */
+    uint8_t *gpu_wlog;
+    uint32_t gpu_wseq;
     HD5770CPStats cp;
     HD5770Census census_cb0, census_ps, census_vs, census_prim;
     uint64_t census_ctx_writes[1024];

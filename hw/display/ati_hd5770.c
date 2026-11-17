@@ -707,6 +707,24 @@ static void ati_hd5770_draw(const uint8_t *vram, const uint8_t (*pal)[3],
     }
 }
 
+/* gpu=native: the dirty pages the refresh cleared, for the backend */
+static void ati_hd5770_wlog(ATIHD5770State *s, DirtyBitmapSnapshot *snap)
+{
+    uint64_t off, p, len;
+
+    for (off = 0; off < s->vram_size; off += len) {
+        len = MIN(64 * 4096, s->vram_size - off);
+        if (!memory_region_snapshot_get_dirty(&s->vram, snap, off, len)) {
+            continue;
+        }
+        for (p = off; p < off + len; p += 4096) {
+            if (memory_region_snapshot_get_dirty(&s->vram, snap, p, 4096)) {
+                qatomic_set(&s->gpu_wlog[p >> 12], 1);
+            }
+        }
+    }
+}
+
 /*
  * The refresh up to the conversion: dirty snapshot, mode, palette and
  * surface. False when CRTC 0 shows nothing (the last frame stays).
@@ -717,8 +735,15 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
     DisplaySurface *ds;
     DirtyBitmapSnapshot *snap;
 
+    if (s->gpu_wlog) {
+        qatomic_inc(&s->gpu_wseq);
+    }
     snap = memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
                                                    DIRTY_MEMORY_VGA);
+    if (s->gpu_wlog) {
+        ati_hd5770_wlog(s, snap);
+        qatomic_inc(&s->gpu_wseq);
+    }
     if (!ati_hd5770_dce4_scanout(s, mode)) {
         g_free(snap);
         return false;

@@ -369,6 +369,15 @@ typedef struct HD5770Gpu {
      * cleared before each call; 0 counts as HD5770_WHY_BK_OTHER
      */
     unsigned why;
+    /*
+     * added 2026-11-17: the device's log of VRAM writes, for a backend
+     * that keeps copies. Bit i of the result is set when page
+     * (off >> 12) + i (i < 64, off a multiple of 64 pages) may have been
+     * written, by the guest, the device or a done() range, since the
+     * call before for it; a write is reported at least once. NULL: no
+     * log, every page may have been written.
+     */
+    uint64_t (*written)(void *opaque, uint64_t off);
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */
@@ -414,14 +423,25 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
  * but not bit for bit what the CPU path produces. A pixel program is a
  * fragment function hd_nfs, with the pass-through vertex function
  * hd_nvs, for the draws of key k: ninputs inputs (those in flat by the
- * provoking vertex), the position in GPR pos_gpr (-1 none), byte i of
- * the target from channel rt_src[i]. NULL: not expressible.
+ * provoking vertex), the position in GPR pos_gpr (-1 none). The target
+ * is a host texture of rt_bytes (1 or 4) 8-bit channels: with out 0,
+ * channel i is component rt_src[i] of rt_comps (1 or 4) as UNORM; with
+ * out 1 the channels are the bytes of component rt_src[0] as an integer.
+ * clip: the clip rectangle rule applies. vb[0..nvb-1]: the buffers of
+ * its vertex fetches, as HD5770GpuDraw.vb, with the format, number type
+ * and sign of the resource. NULL: not expressible.
  */
 typedef struct HD5770NatKey {
     uint8_t ninputs;
     int8_t pos_gpr;
     uint8_t rt_src[4];
     uint32_t flat;
+    uint8_t out, rt_comps, rt_bytes;
+    bool clip;
+    uint8_t nvb;
+    struct {
+        uint8_t id, fmt, num, sgn;
+    } vb[HD5770_GPU_VB];
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);

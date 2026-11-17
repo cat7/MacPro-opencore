@@ -31,6 +31,7 @@
 #include "system/runstate.h"
 #include "qemu/error-report.h"
 #include "system/ramblock.h"
+#include "system/physmem.h"
 #include "hw/pci/pci_device.h"
 #include "hw/core/cpu.h"
 #include "ati_hd5770_int.h"
@@ -1729,6 +1730,43 @@ static void gpu_done_ram_cb(void *opaque, uint64_t lo, uint64_t hi)
     memory_region_set_dirty(s->gpu_ram->mr, lo, hi - lo);
 }
 
+/*
+ * HD5770Gpu.written: the pages the refresh took from the dirty bitmap
+ * (gpu_wlog) and the ones still in it. A refresh between the two reads
+ * can hide a page from both: then every page counts as written.
+ */
+static uint64_t gpu_written_cb(void *opaque, uint64_t off)
+{
+    ATIHD5770State *s = opaque;
+    ram_addr_t ram = memory_region_get_ram_addr(&s->vram);
+    uint64_t p0 = off >> 12, n, bits = 0, i;
+    uint32_t seq;
+
+    if (off >= s->vram_size) {
+        return 0;
+    }
+    n = MIN(64, (s->vram_size >> 12) - p0);
+    smp_mb();
+    seq = qatomic_read(&s->gpu_wseq);
+    for (i = 0; i < n; i++) {
+        if (qatomic_read(&s->gpu_wlog[p0 + i]) &&
+            qatomic_xchg(&s->gpu_wlog[p0 + i], 0)) {
+            bits |= 1ull << i;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        if (physical_memory_get_dirty_flag(ram + off + (i << 12),
+                                           DIRTY_MEMORY_VGA)) {
+            bits |= 1ull << i;
+        }
+    }
+    smp_mb();
+    if ((seq & 1) || qatomic_read(&s->gpu_wseq) != seq) {
+        bits = ~0ull;
+    }
+    return bits;
+}
+
 /* host page p of guest RAM: its RAM block given to the backend, once */
 static bool gpu_ram_for(HD5770Gfx *g, uint8_t *p)
 {
@@ -1781,6 +1819,10 @@ static void gpu_open(ATIHD5770State *s)
     gp->done = gpu_done_cb;
     gp->done_ram = gpu_done_ram_cb;
     gp->opaque = s;
+    if (!strcmp(mode, "native")) {
+        s->gpu_wlog = g_malloc0((s->vram_size >> 12) + 1);
+        gp->written = gpu_written_cb;
+    }
     s->gfx3d.ram_for = gpu_ram_for;
     s->gfx3d.gpu = gp;
     s->gfx3d.vram = memory_region_get_ram_ptr(&s->vram);
@@ -1852,6 +1894,8 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
         hd5770_gfx_sync(&s->gfx3d);
         s->gfx3d.gpu->ops->close(s->gfx3d.gpu->b);
         s->gfx3d.gpu = NULL;
+        g_free(s->gpu_wlog);
+        s->gpu_wlog = NULL;
     }
     if (s->fx_bh) {
         qemu_bh_delete(s->fx_bh);
