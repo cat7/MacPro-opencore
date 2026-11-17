@@ -74,16 +74,21 @@ enum {
     ND_BLEND_ORDER, ND_PROG_FORM, ND_PROG_EXPORTS,
     ND_PROG_INPUTS, ND_PROG_VTX, ND_PROG_EMIT, ND_PROG_BUILD,
     ND_TEX_KIND, ND_TEX_FMT, ND_TEX_SURF, ND_TEX_TARGET, ND_W, ND_ROOM,
+    ND_MRT, ND_RESOLVE, ND_ZEXPORT, ND_RT_WIDE, ND_FETCH_OP, ND_TEX_BC,
+    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY,
     ND_N
 };
 
 static const char *const nd_names[ND_N] = {
     "taken", "nothing to draw", "target format",
-    "target surface", "MRT/resolve/exports", "depth surface",
+    "target surface", "stencil export", "depth surface",
     "blend not on 8_8_8_8 alpha last", "program form", "program exports",
     "program inputs", "vertex fetch format", "program not expressible",
     "program build failed", "texture kind", "texture format",
     "texture surface", "texture is the target", "1/w", "room",
+    "more render targets", "resolve", "depth export",
+    "target over 8 bytes", "fetch operation", "BC texture", "3D texture",
+    "cube texture", "array texture",
 };
 
 /* the uniforms of hd5770_msl_native_fs() */
@@ -1632,15 +1637,27 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     GString *pkey;
 
     m->seq++;
-    if (d->nmrt || d->resolve || d->zexport || d->sexport) {
+    if (d->resolve) {
+        return nat_decline(m, ND_RESOLVE, HD5770_WHY_BK_NATIVE_STATE);
+    }
+    if (d->nmrt) {
+        return nat_decline(m, ND_MRT, HD5770_WHY_BK_NATIVE_STATE);
+    }
+    if (d->sexport) {
         return nat_decline(m, ND_STATE_DB, HD5770_WHY_BK_NATIVE_STATE);
+    }
+    if (d->zexport) {
+        return nat_decline(m, ND_ZEXPORT, HD5770_WHY_BK_NATIVE_STATE);
     }
     /* no colour is written: the target is not needed */
     color = !(d->db && !d->wmask);
     if (!ir || ir->cf || ir->vs) {
         return nat_decline(m, ND_PROG_FORM, HD5770_WHY_BK_PROG);
     }
-    if (ir->zexport || ir->cmask != 1) {
+    if (ir->zexport) {
+        return nat_decline(m, ND_ZEXPORT, HD5770_WHY_BK_PROG);
+    }
+    if (ir->cmask != 1) {
         return nat_decline(m, ND_PROG_EXPORTS, HD5770_WHY_BK_PROG);
     }
     if (d->ninputs > 32 || ir->nres != d->ntex) {
@@ -1651,6 +1668,9 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         const HD5770IRFetch *f = &ir->fetches[i];
         unsigned bid = (f->w[0] >> 8) & 0xff, fmt;
 
+        if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) >= 0x18) {
+            return nat_decline(m, ND_FETCH_OP, HD5770_WHY_BK_PROG);
+        }
         if (f->kind != HD5770_IRF_VTX) {
             continue;
         }
@@ -1677,6 +1697,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     blend = (d->blend & (1u << 30)) && d->rt_blend ? d->blend : 0;
     if (!color) {
         rhf = NF_RGBA8;
+    } else if (d->rt.s.bpe > 8) {
+        return nat_decline(m, ND_RT_WIDE, HD5770_WHY_BK_SURF);
     } else if (d->rt_num == 4 && d->rt_comps == 1 &&
         (d->rt_fmt == HD5770_FMT_8 || d->rt_fmt == HD5770_FMT_32)) {
         /* an integer: the bits of its channel */
@@ -1748,6 +1770,14 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     for (i = 0; i < d->ntex; i++) {
         const HD5770GpuTex *t = &d->tex[i];
 
+        if (t->bc) {
+            return nat_decline(m, ND_TEX_BC, HD5770_WHY_BK_SURF);
+        }
+        if (t->dim >= 2) {
+            return nat_decline(m, t->dim == 2 ? ND_TEX_3D :
+                                  t->dim == 3 ? ND_TEX_CUBE : ND_TEX_ARRAY,
+                               HD5770_WHY_BK_SURF);
+        }
         if (t->dim != 1 || t->bc || t->slices > 1 ||
             (t->mip && (nlv + t->last_lv > HD5770_NAT_LEVELS ||
                         d->ntex > 14))) {
@@ -2438,6 +2468,7 @@ static const HD5770GpuOps nat_ops = {
     .depth = true,
     .mipmaps = true,
     .resinfo = true,
+    .full = true,
 };
 
 HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
