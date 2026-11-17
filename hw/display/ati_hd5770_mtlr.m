@@ -9,8 +9,8 @@
  *
  * SURFACES. Targets and textures are host textures holding the bytes of
  * the guest surface (RGBA8, R8 or R16 by the element size: byte i of an
- * element in channel i, a 16-bit element in one; RGBA16Float for
- * 16_16_16_16_FLOAT), in bands of rows: a
+ * element in channel i, a 16-bit element in one; RG8 for 8_8,
+ * RGBA16Float for 16_16_16_16_FLOAT), in bands of rows: a
  * band is held once a draw needs it (a texture's rows, the rows a draw
  * covers of its target), with a shadow of its bytes. At a band's first
  * use after each sync, and after wrote() or a write-back over its
@@ -31,12 +31,12 @@
  * The host tests the fragment's depth unrounded against a plane that
  * holds unrounded depths where it drew.
  *
- * Accepted: one colour target (8_8_8_8 or 8 UNORM, 16_16_16_16_FLOAT, 8
- * or 32 integer) in
+ * Accepted: one colour target (8_8_8_8, 8_8 or 8 UNORM,
+ * 16_16_16_16_FLOAT, 8 or 32 integer) in
  * VRAM or guest RAM, or none; depth and stencil planes in VRAM with
  * tests, writes, two-sided stencil and the clears; programs in the
  * straight form with texture fetches, RESINFO and vertex fetches of 8
- * and 32 bit elements; 2D 8_8_8_8, 8 and 16 UNORM and
+ * and 32 bit elements; 2D 8_8_8_8, 8_8, 8 and 16 UNORM and
  * 16_16_16_16_FLOAT textures, mipmapped
  * ones with each level an entry; clip rectangles. Builds are
  * synchronous.
@@ -96,16 +96,17 @@ typedef struct NatU {
 
 /* host formats: the element's bytes */
 enum {
-    NF_RGBA8, NF_R8, NF_R16, NF_D16, NF_D24, NF_D32, NF_S8, NF_RGBA16F, NF_N
+    NF_RGBA8, NF_R8, NF_R16, NF_D16, NF_D24, NF_D32, NF_S8, NF_RGBA16F, NF_RG8,
+    NF_N
 };
 
 static const MTLPixelFormat nf_fmt[NF_N] = {
     MTLPixelFormatRGBA8Unorm, MTLPixelFormatR8Unorm, MTLPixelFormatR16Unorm,
     MTLPixelFormatDepth16Unorm, MTLPixelFormatDepth32Float,
     MTLPixelFormatDepth32Float, MTLPixelFormatStencil8,
-    MTLPixelFormatRGBA16Float,
+    MTLPixelFormatRGBA16Float, MTLPixelFormatRG8Unorm,
 };
-static const uint8_t nf_bpe[NF_N] = { 4, 1, 2, 2, 4, 4, 1, 8 };
+static const uint8_t nf_bpe[NF_N] = { 4, 1, 2, 2, 4, 4, 1, 8, 2 };
 
 #define NAT_BAND        32      /* rows compared and uploaded together */
 #define NAT_RECTS       4
@@ -1194,6 +1195,10 @@ static unsigned nat_tex_fmt(const HD5770GpuTex *t)
         t->comps == 4) {
         return NF_RGBA16F;
     }
+    if (t->num == HD5770_NUM_NORM && !t->sgn && t->comps == 2 &&
+        t->fmt == HD5770_FMT_8_8) {
+        return NF_RG8;
+    }
     if (t->num != HD5770_NUM_NORM || t->sgn || t->comps != 1) {
         return NF_N;
     }
@@ -1284,6 +1289,16 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         }
         mask = (d->wmask >> d->rt_src[0]) & 1 ? 0xf : 0;
         rhf = NF_R8;
+    } else if (d->rt_num == 0 && !d->rt_float && d->rt_comps == 2 &&
+               d->rt_fmt == HD5770_FMT_8_8 && d->rt_src[0] < 4 &&
+               d->rt_src[1] < 4) {
+        /* channel i is component rt_src[i] */
+        if (blend) {
+            return nat_decline(m, ND_BLEND_ORDER, HD5770_WHY_BK_NATIVE_STATE);
+        }
+        mask = ((d->wmask >> d->rt_src[0]) & 1) |
+               ((d->wmask >> d->rt_src[1]) & 1) << 1;
+        rhf = NF_RG8;
     } else {
         for (i = 0; i < 4; i++) {
             perm |= d->rt_src[i] < 4 ? 1u << d->rt_src[i] : 0x10;
