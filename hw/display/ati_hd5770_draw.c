@@ -3163,6 +3163,8 @@ static const char *const why_names[HD5770_WHY_N] = {
     [HD5770_WHY_BK_ROOM] = "backend: room",
     [HD5770_WHY_BK_DEAD] = "backend: lost",
     [HD5770_WHY_BK_OTHER] = "backend: other",
+    [HD5770_WHY_BK_BUILD_SLOW] = "backend: build time",
+    [HD5770_WHY_BK_NATIVE_STATE] = "backend: state",
 };
 
 const char *hd5770_why_name(unsigned why)
@@ -4047,6 +4049,10 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     q->cliprule = d->cliprule;
     memcpy(q->cr, d->cr, sizeof(q->cr));
     q->pix_center = d->pix_center;
+    q->sc[0] = d->x0;
+    q->sc[1] = d->y0;
+    q->sc[2] = d->x1;
+    q->sc[3] = d->y1;
     q->persp = d->persp;
     q->pos_gpr = d->pos_ena ? (int)d->pos_gpr : -1;
     for (i = 0; i < ir->nres; i++) {

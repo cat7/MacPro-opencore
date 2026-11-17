@@ -266,6 +266,8 @@ enum {
     HD5770_WHY_BK_ROOM,
     HD5770_WHY_BK_DEAD,
     HD5770_WHY_BK_OTHER,
+    HD5770_WHY_BK_BUILD_SLOW,   /* its program was not built in time */
+    HD5770_WHY_BK_NATIVE_STATE, /* state the native pipeline lacks */
     HD5770_WHY_N
 };
 

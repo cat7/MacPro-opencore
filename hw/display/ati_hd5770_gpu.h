@@ -229,6 +229,8 @@ typedef struct HD5770GpuDraw {
     bool resolve, rs_same;
     HD5770GpuSurf rs;
     uint32_t rs_fmt, rs_num, rs_comps, rs_src[4];
+    /* added 2026-11-17: the scissor, x0, y0, x1, y1 (x1, y1 exclusive) */
+    int32_t sc[4];
 } HD5770GpuDraw;
 
 /*
