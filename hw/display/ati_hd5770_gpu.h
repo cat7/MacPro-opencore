@@ -429,8 +429,13 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
  * out 1 the channels are the bytes of component rt_src[0] as an integer.
  * clip: the clip rectangle rule applies. vb[0..nvb-1]: the buffers of
  * its vertex fetches, as HD5770GpuDraw.vb, with the format, number type
- * and sign of the resource. NULL: not expressible.
+ * and sign of the resource. mip[i]: texture unit i is mipmapped, with
+ * that many levels after the first, each a texture of its own; the
+ * levels of all units count from texture index 16 on, in unit order.
+ * zout: the function writes the depth, the rasteriser's clamped to the
+ * depth range. NULL: not expressible.
  */
+#define HD5770_NAT_LEVELS       32      /* levels after the first, all units */
 typedef struct HD5770NatKey {
     uint8_t ninputs;
     int8_t pos_gpr;
@@ -442,6 +447,8 @@ typedef struct HD5770NatKey {
     struct {
         uint8_t id, fmt, num, sgn;
     } vb[HD5770_GPU_VB];
+    uint8_t mip[HD5770_GPU_TEX];
+    bool zout;
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);

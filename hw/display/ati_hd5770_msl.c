@@ -2778,11 +2778,32 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
         }
         g_string_append(o, "        }\n");
     } else if (f->kind != HD5770_IRF_TEX ||
-               !(op == 0x03 || (op >= 0x10 && op <= 0x13))) {
+               !(op == 0x03 || op == 0x04 || (op >= 0x10 && op <= 0x13))) {
         return false;
-    } else {
+    } else if (op == 0x04) {
+        /* GET_TEXTURE_RESINFO, as tfetch_stage() */
+        unsigned sel = (f->w[2] >> 20) & 7;
+
         for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
             /* search */
+        }
+        if (sel < 4) {
+            g_string_append_printf(o, "        uint lv = min(R0[%u][%u] + u.tres[%u].x, 31u);\n",
+                                   f->src, sel, unit);
+        } else {
+            g_string_append_printf(o, "        uint lv = min(%s + u.tres[%u].x, 31u);\n",
+                                   sel == 5 ? "U(1.0f)" : "0u", unit);
+        }
+        g_string_append_printf(o,
+            "        o[0] = max(uint(u.tsize[%u].x) >> lv, 1u);\n"
+            "        o[1] = max(uint(u.tsize[%u].y) >> lv, 1u);\n"
+            "        o[2] = u.tres[%u].z;\n"
+            "        o[3] = u.tres[%u].y;\n", unit, unit, unit, unit);
+    } else {
+        unsigned slot = 0;
+
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            slot += key->mip[unit];
         }
         g_string_append(o, "        uint c[4] = {");
         for (k = 0; k < 4; k++) {
@@ -2803,6 +2824,70 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
                 "        if (xy.x >= 0 && xy.y >= 0 && xy.x < (int)ts.x && xy.y < (int)ts.y) {\n"
                 "            v = hd_nsel(t%u.read(uint2(xy)), u.tsel[%u]);\n"
                 "        }\n", ox / 2, oy / 2, unit, unit);
+        } else if (key->mip[unit] && ((f->w[1] >> 28) & 3) == 3) {
+            /* the level of detail and the levels, as tfetch_stage() */
+            unsigned l;
+
+            g_string_append(o, "        float2 cn = float2(F(c[0]), F(c[1]));\n"
+                               "        float lod = 0.0f;\n");
+            if (op == 0x11) {
+                g_string_append(o, "        lod = F(c[3]);\n");
+            } else if (op != 0x13) {
+                g_string_append(o,
+                    "        float2 da = dfdx(cn) * ts.xy, db = dfdy(cn) * ts.xy;\n"
+                    "        lod = 0.5f * hd_nlog2(max(dot(da, da), dot(db, db)));\n");
+                if (op == 0x12) {
+                    g_string_append(o, "        lod += F(c[3]);\n");
+                }
+                if ((f->w[1] >> 21) & 0x7f) {
+                    g_string_append_printf(o, "        lod += %d.0f / 16.0f;\n",
+                                           (int32_t)(f->w[1] << 4) >> 25);
+                }
+            }
+            g_string_append_printf(o,
+                "        lod = min(max(lod + u.tlod[%u].x, u.tlod[%u].y), u.tlod[%u].z);\n"
+                "        uint lv = 0, last = u.tmip[%u].y;\n"
+                "        bool lin = u.tmip[%u].z != 0u, two = false;\n"
+                "        float fr = 0.0f;\n"
+                "        if (lod > 0.0f) {\n"
+                "            lin = u.tmip[%u].w != 0u;\n"
+                "            if (u.tmip[%u].x == 1u) {\n"
+                "                lv = min(uint(floor(lod + 0.5f)), last);\n"
+                "            } else {\n"
+                "                float l0 = floor(lod);\n"
+                "                fr = lod - l0;\n"
+                "                lv = min(uint(l0), last);\n"
+                "                two = lv < last;\n"
+                "            }\n"
+                "        }\n"
+                "        float4 v1 = float4(0.0f);\n"
+                "        float2 of = float2(%d.0f, %d.0f) * 0.5f;\n",
+                unit, unit, unit, unit, unit, unit, unit, ox, oy);
+            for (k = 0; k < 2; k++) {
+                const char *lvs = k ? "lv + 1u" : "lv", *dst = k ? "v1" : "v";
+
+                g_string_append_printf(o, "        %sswitch (%s) {\n",
+                                       k ? "if (two) " : "", lvs);
+                for (l = 0; l <= key->mip[unit]; l++) {
+                    char tn[24], ls[40], cs[24];
+
+                    snprintf(cs, sizeof(cs), "case %u:", l);
+                    if (l) {
+                        snprintf(tn, sizeof(tn), "t%u_%u", unit, l);
+                        snprintf(ls, sizeof(ls), "u.lsize[%u]", slot + l - 1);
+                    } else {
+                        snprintf(tn, sizeof(tn), "t%u", unit);
+                        snprintf(ls, sizeof(ls), "ts");
+                    }
+                    g_string_append_printf(o,
+                        "        %s %s = hd_nlv(%s, %s, cn, of, u.twrap[%u], lin,"
+                        " u.tborder[%u], u.tsel[%u]); break;\n",
+                        l == key->mip[unit] ? "default:" : cs, dst, tn, ls, unit, unit,
+                        unit);
+                }
+                g_string_append(o, "        }\n");
+            }
+            g_string_append(o, "        if (two) {\n            v = v + (v1 - v) * fr;\n        }\n");
         } else {
             g_string_append_printf(o,
                 "        float2 tc = float2(F(c[0])%s, F(c[1])%s);\n"
@@ -2836,11 +2921,19 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
 {
     GString *o;
-    unsigned i, j, ng = MAX(ir->ngpr, 1u);
+    unsigned i, j, ng = MAX(ir->ngpr, 1u), nlv = 0;
     uint32_t iflat = 0, ivar = 0;
+    bool mips = false;
 
     if (ir->cf || ir->vs || ir->zexport || ir->cmask != 1 || k->ninputs > 32 ||
         k->nvb > HD5770_GPU_VB) {
+        return NULL;
+    }
+    for (i = 0; i < ir->nres && i < HD5770_GPU_TEX; i++) {
+        nlv += k->mip[i];
+        mips |= k->mip[i] != 0;
+    }
+    if (nlv > HD5770_NAT_LEVELS || (mips && ir->nres > 14)) {
         return NULL;
     }
     for (i = 0; i < ir->ninsts; i++) {
@@ -2868,6 +2961,12 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    float pc;\n"
         "    uint persp;\n"
         "    uint cliprule;\n"
+        "    uint pad0, pad1, pad2;\n"
+        "    float4 tlod[16];\n"
+        "    uint4 tmip[16];\n"
+        "    uint4 tres[16];\n"
+        "    float4 lsize[32];\n"
+        "    float4 zr;\n"
         "};\n"
         "struct NV {\n    float4 pos [[position]];\n");
     for (i = 0; i < k->ninputs; i++) {
@@ -2894,7 +2993,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    float cw = u.persp ? 1.0f / v[3] : 1.0f;\n"
         "    NV r;\n"
         "    r.pos = float4(((v[0] - u.pc + 0.5f) * u.vp.x - 1.0f) * cw,\n"
-        "                   (1.0f - (v[1] - u.pc + 0.5f) * u.vp.y) * cw, 0.0f, cw);\n",
+        "                   (1.0f - (v[1] - u.pc + 0.5f) * u.vp.y) * cw, v[2] * cw, cw);\n",
         4 + 4 * k->ninputs);
     for (i = 0; i < k->ninputs; i++) {
         bool fl = ((k->flat | iflat) >> i) & 1;
@@ -2953,15 +3052,53 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    default: return true;\n"
         "    }\n"
         "}\n"
-        "fragment float4 hd_nfs(NF in [[stage_in]], constant NU &u [[buffer(0)]],\n"
-        "                       constant uint *kv [[buffer(1)]]");
+        "/* lod_log2() in ati_hd5770_draw.c */\n"
+        "static __attribute__((always_inline)) float hd_nlog2(float x)\n"
+        "{\n"
+        "    if (!(x > 0.0f)) {\n"
+        "        return -128.0f;\n"
+        "    }\n"
+        "    uint b = as_type<uint>(x);\n"
+        "    return float(int((b >> 23) & 0xffu) - 127) + float(b & 0x7fffffu) * (1.0f / 8388608.0f);\n"
+        "}\n");
+    if (mips) {
+        g_string_append(o,
+            "constexpr sampler hd_sn(coord::normalized, address::clamp_to_edge, filter::nearest);\n"
+            "constexpr sampler hd_sl(coord::normalized, address::clamp_to_edge, filter::linear);\n"
+            "/* a level: its size and its texture's in ls, cn normalised */\n"
+            "static __attribute__((always_inline)) float4 hd_nlv(texture2d<float> t, float4 ls, float2 cn,\n"
+            "    float2 of, uint4 wrap, bool lin, float4 border, uint4 sel)\n"
+            "{\n"
+            "    float2 tc = cn * ls.xy + of;\n"
+            "    bool bo = false;\n"
+            "    tc.x = hd_nwrap(tc.x, ls.x, wrap.x, bo);\n"
+            "    tc.y = hd_nwrap(tc.y, ls.y, wrap.y, bo);\n"
+            "    float4 v;\n"
+            "    if (lin) {\n"
+            "        v = t.sample(hd_sl, tc / ls.zw, level(0.0f));\n"
+            "    } else {\n"
+            "        v = t.sample(hd_sn, tc / ls.zw, level(0.0f));\n"
+            "    }\n"
+            "    return bo ? border : hd_nsel(v, sel);\n"
+            "}\n");
+    }
+    if (k->zout) {
+        g_string_append(o, "struct NO {\n    float4 c [[color(0)]];\n    float z [[depth(any)]];\n};\n");
+    }
+    g_string_append_printf(o,
+        "fragment %s hd_nfs(NF in [[stage_in]], constant NU &u [[buffer(0)]],\n"
+        "                       constant uint *kv [[buffer(1)]]", k->zout ? "NO" : "float4");
     for (i = 0; i < k->nvb; i++) {
         g_string_append_printf(o, ",\n    const device uchar *vb%u [[buffer(%u)]]",
                                i, 2 + i);
     }
-    for (i = 0; i < ir->nres; i++) {
+    for (i = 0, nlv = 0; i < ir->nres; i++) {
         g_string_append_printf(o, ",\n    texture2d<float> t%u [[texture(%u)]], "
                                "sampler s%u [[sampler(%u)]]", i, i, i, i);
+        for (j = 1; j <= k->mip[i]; j++) {
+            g_string_append_printf(o, ",\n    texture2d<float> t%u_%u [[texture(%u)]]",
+                                   i, j, 16 + nlv++);
+        }
     }
     g_string_append_printf(o,
         ")\n{\n"
@@ -3029,20 +3166,28 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         /* an integer target: the bytes of the channel */
         g_string_append_printf(o,
             "    uint v = C[0][%u];\n"
-            "    return float4(float(v & 0xffu), float((v >> 8) & 0xffu),\n"
-            "                  float((v >> 16) & 0xffu), float(v >> 24)) / 255.0f;\n"
-            "}\n", k->rt_src[0] & 3);
+            "    float4 r = float4(float(v & 0xffu), float((v >> 8) & 0xffu),\n"
+            "                      float((v >> 16) & 0xffu), float(v >> 24)) / 255.0f;\n",
+            k->rt_src[0] & 3);
     } else if (k->rt_comps == 1) {
         g_string_append_printf(o,
             "    float4 r = float4(F(C[0][%u]), 0.0f, 0.0f, 0.0f);\n"
-            "    return select(r, float4(0.0f), isnan(r));\n"
-            "}\n", k->rt_src[0] & 3);
+            "    r = select(r, float4(0.0f), isnan(r));\n", k->rt_src[0] & 3);
     } else {
         /* byte i of the target is channel rt_src[i] */
         g_string_append_printf(o,
             "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
-            "    return select(r, float4(0.0f), isnan(r));\n"
-            "}\n", k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+            "    r = select(r, float4(0.0f), isnan(r));\n",
+            k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+    }
+    if (k->zout) {
+        g_string_append(o,
+            "    NO no;\n"
+            "    no.c = r;\n"
+            "    no.z = min(max(in.pos.z, u.zr.x), u.zr.y);\n"
+            "    return no;\n}\n");
+    } else {
+        g_string_append(o, "    return r;\n}\n");
     }
     return g_string_free(o, false);
 }
