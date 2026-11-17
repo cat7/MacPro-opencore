@@ -1765,8 +1765,11 @@ static void gpu_open(ATIHD5770State *s)
         return;
     }
 #if defined(CONFIG_DARWIN)
-    gp = hd5770_mtl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
-                         &err);
+    gp = !strcmp(mode, "native")
+         ? hd5770_mtlr_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
+                            &err)
+         : hd5770_mtl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
+                           &err);
 #elif defined(CONFIG_WIN32)
     gp = hd5770_gl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
                         &err);

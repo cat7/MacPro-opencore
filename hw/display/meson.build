@@ -108,7 +108,8 @@ system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5
 # the HD 5770's 3D engine on the host GPU: Metal on macOS, OpenGL (WGL) on
 # Windows
 if host_os == 'darwin'
-  system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_msl.c', 'ati_hd5770_mtl.m'),
+  system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_msl.c', 'ati_hd5770_mtl.m',
+                                                         'ati_hd5770_mtlr.m'),
                 dependency('appleframeworks', modules: ['Metal', 'Foundation'])])
 elif host_os == 'windows'
   system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_glsl.c', 'ati_hd5770_gl.c'),

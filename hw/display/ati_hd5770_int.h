@@ -297,7 +297,7 @@ struct ATIHD5770State {
     VMChangeStateEntry *eng_vmse;
     uint64_t eng_runs, eng_waits, eng_draw_ns;
     uint64_t redraws;           /* scanout conversions */
-    char *gpu_prop;             /* "gpu": off, on, verify */
+    char *gpu_prop;             /* "gpu": off, on, verify, native */
     QemuRecMutex gpu_mutex;     /* the host GPU backend */
     struct RAMBlock *gpu_ram;   /* guest RAM the backend draws into */
     HD5770CPStats cp;

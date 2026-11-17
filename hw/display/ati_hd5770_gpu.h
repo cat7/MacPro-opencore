@@ -425,6 +425,8 @@ typedef struct HD5770NatKey {
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);
+HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
+                            const char **err);
 
 /* the OpenGL backend (Windows); NULL and *err set if there is none */
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,
