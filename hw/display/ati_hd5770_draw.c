@@ -5001,7 +5001,7 @@ static const char *const misc_names[HD5770_GAP_MISC_MAX] = {
     "front face input", "polygon offset",
     "program stopped: fetch from a resource without a texture",
     "program stopped: stack overflow", "program stopped: pop of empty stack",
-    "program stopped: ELSE with a pop count", "program stopped: loop nesting",
+    "program stopped: loop nesting",
     "program stopped: step limit", "program stopped: CF instruction",
     "program stopped: derivative",
 };

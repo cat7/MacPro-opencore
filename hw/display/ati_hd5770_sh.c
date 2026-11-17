@@ -1579,11 +1579,10 @@ static bool run_prog(Run *r)
         case CF_ELSE: {
             bool before = r->sp ? r->stack[r->sp - 1] : true;
 
-            if (popn) {
-                run_fail(r, HD5770_GAP_RUN_ELSE_POP);
-            }
+            /* POP_COUNT is taken with the jump, as JUMP's */
             r->active = before && !r->active;
             if (!r->active) {
+                pop(r, popn);
                 pc = addr;
             }
             break;

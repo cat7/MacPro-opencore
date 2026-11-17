@@ -677,11 +677,17 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
                 g_string_append_printf(ob, "            pc = %u;\n        }\n", op->addr);
                 break;
             }
-            case E_ELSE:
-                g_string_append_printf(ob,
+            case E_ELSE: {
+                char n[4];
+
+                snprintf(n, sizeof(n), "%u", op->popn);
+                g_string_append(ob,
                     "        act_ = (sp > 0 ? stk[sp - 1] : true) && !act_;\n"
-                    "        if (!act_) {\n            pc = %u;\n        }\n", op->addr);
+                    "        if (!act_) {\n");
+                e_pop(ob, n);
+                g_string_append_printf(ob, "            pc = %u;\n        }\n", op->addr);
                 break;
+            }
             case E_POP: {
                 char n[4];
 
