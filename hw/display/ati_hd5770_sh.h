@@ -142,6 +142,12 @@ const HD5770IR *hd5770_prog_ir(const HD5770Prog *p);
  * form only; exports to HD5770_IR_POS and HD5770_IR_PARAM0 + n), else NULL
  */
 const HD5770IR *hd5770_vs_ir(HD5770Prog *vs, const HD5770Prog *fs);
+/*
+ * HD5770_WHY_GPU when the program has its IR, else why not (an
+ * HD5770_WHY_IR_*); the vertex shader's as of its last hd5770_vs_ir()
+ */
+unsigned hd5770_prog_ir_why(const HD5770Prog *p);
+unsigned hd5770_vs_ir_why(const HD5770Prog *vs);
 /* resources [0..*n) the program's fetch instructions read */
 void hd5770_prog_resources(const HD5770Prog *p, uint8_t *ids, unsigned *n,
                            unsigned max);

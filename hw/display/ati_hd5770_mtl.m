@@ -1115,6 +1115,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
         return false;
     case MTL_P_FAILED:
         m->declined[MTL_NO_PROG]++;
+        m->pub.why = HD5770_WHY_BK_PROG;
         return false;
     default:
         break;
@@ -1126,6 +1127,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
              rs->voff + hd5770_surf_size(&rs->s) > m->vram_size) ||
             (rs->space && !m->ram) || !(rs->s.fast || rs->s.split)) {
             m->declined[MTL_NO_SURF]++;
+            m->pub.why = HD5770_WHY_BK_SURF;
             return false;
         }
     }
@@ -1137,6 +1139,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
                 (!t->surf.space && (k ? t->lv[k].voff : t->surf.voff) +
                  mtl_tex_lvbytes(t, k) > m->vram_size)) {
                 m->declined[MTL_NO_SURF]++;
+                m->pub.why = HD5770_WHY_BK_SURF;
                 return false;
             }
         }
@@ -1147,6 +1150,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
          (d->has_s && (d->ss.space || !(d->ss.s.fast || d->ss.s.split) ||
                        d->ss.voff + hd5770_surf_size(&d->ss.s) > m->vram_size)))) {
         m->declined[MTL_NO_SURF]++;
+        m->pub.why = HD5770_WHY_BK_SURF;
         return false;
     }
     need = sizeof(GDraw) + sizeof(GTex) * HD5770_GPU_TEX + 4096 +
@@ -1191,6 +1195,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
                        (!d->rs.space && d->rs.voff +
                         hd5770_surf_size(&d->rs.s) > m->vram_size))) {
         m->declined[MTL_NO_SURF]++;
+        m->pub.why = HD5770_WHY_BK_SURF;
         return false;
     }
     for (i = 0; i < d->nmrt; i++) {
@@ -1199,6 +1204,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     for (i = 0; i < d->ntex; i++) {
         if (d->tex[i].surf.space && !m->ram) {
             m->declined[MTL_NO_SURF]++;
+            m->pub.why = HD5770_WHY_BK_SURF;
             return false;
         }
         need += (d->tex[i].surf.npages + 1) * 4 + MTL_ALIGN;
@@ -1208,6 +1214,7 @@ static bool mtl_draw(void *opaque, const HD5770GpuDraw *d)
     }
     if (need > MTL_STAGING) {
         m->declined[MTL_NO_ROOM]++;
+        m->pub.why = HD5770_WHY_BK_ROOM;
         return false;
     }
     if (m->st_used + need > MTL_STAGING) {

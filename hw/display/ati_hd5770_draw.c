@@ -283,6 +283,8 @@ typedef struct Draw {
     HD5770Lanes *lanes, *nh, *nv;   /* nh, nv: neighbours for gradients */
     bool gpu_prog;              /* the program may go to the host GPU */
     unsigned gfb;               /* why the last draw stayed on the CPU */
+    /* HD5770_WHY_*: of the last part, and the draw's first CPU reason */
+    unsigned cwhy, why;
     HD5770Val *kv;
     int lx[HD5770_LANES], ly[HD5770_LANES];
     /* the triangles of a draw for the host GPU */
@@ -3111,14 +3113,71 @@ enum {
 };
 
 /* a draw falls back to the CPU for reason r */
-#define GPU_FB(d, r) ((d)->gfb = (r), (d)->g->gst.fallback[(r)]++)
+#define GPU_FB(d, r, w) ((d)->gfb = (r), (d)->cwhy = (w), \
+                         (d)->g->gst.fallback[(r)]++)
+
+static const char *const why_names[HD5770_WHY_N] = {
+    [HD5770_WHY_GPU] = "host GPU",
+    [HD5770_WHY_BUILDING] = "left out while building",
+    [HD5770_WHY_EMPTY] = "nothing to draw",
+    [HD5770_WHY_SKIPPED] = "skipped",
+    [HD5770_WHY_SMALL] = "small",
+    [HD5770_WHY_RESOLVE] = "resolve",
+    [HD5770_WHY_NO_TARGET] = "no colour, no depth",
+    [HD5770_WHY_DEPTH] = "depth/stencil",
+    [HD5770_WHY_ZEXPORT] = "depth export",
+    [HD5770_WHY_RT_WIDE] = "target over 8 bytes",
+    [HD5770_WHY_MRT] = "more render targets",
+    [HD5770_WHY_RT_SURF] = "target surface",
+    [HD5770_WHY_RT_RAM_VERIFY] = "target in RAM (verify)",
+    [HD5770_WHY_MIPS] = "mipmaps",
+    [HD5770_WHY_FEEDBACK] = "samples its target",
+    [HD5770_WHY_IR_NONE] = "no IR",
+    [HD5770_WHY_IR_FS_CF] = "no IR: fetch shader",
+    [HD5770_WHY_IR_CLAUSE] = "no IR: ALU clause kind",
+    [HD5770_WHY_IR_ALU_OP] = "no IR: ALU op",
+    [HD5770_WHY_IR_REL_CONST] = "no IR: indexed constant",
+    [HD5770_WHY_IR_GPRS] = "no IR: registers",
+    [HD5770_WHY_IR_TEX_UNITS] = "no IR: texture units",
+    [HD5770_WHY_IR_FLOW] = "no IR: flow control",
+    [HD5770_WHY_IR_CF_OP] = "no IR: CF op",
+    [HD5770_WHY_CF_FORM] = "CF form",
+    [HD5770_WHY_EXPORTS] = "colour/depth exports",
+    [HD5770_WHY_RESINFO] = "RESINFO",
+    [HD5770_WHY_FETCH_OP] = "SAMPLE_C",
+    [HD5770_WHY_CUBE] = "CUBE",
+    [HD5770_WHY_FLAT_LAST] = "flat input, last vertex",
+    [HD5770_WHY_TEX_SETUP] = "texture not modelled",
+    [HD5770_WHY_TEX_SAMPLERS] = "texture with two samplers",
+    [HD5770_WHY_TEX_KIND] = "BC/3D/cube/array texture",
+    [HD5770_WHY_TEX_SURF] = "texture surface",
+    [HD5770_WHY_TEX_MIP_SURF] = "mip level surface",
+    [HD5770_WHY_VB_FMT] = "vertex format",
+    [HD5770_WHY_VB_COUNT] = "vertex buffers",
+    [HD5770_WHY_VB_SIZE] = "vertex buffer size",
+    [HD5770_WHY_DB_SURF] = "depth surface",
+    [HD5770_WHY_RS_SURF] = "resolve surface",
+    [HD5770_WHY_BK_PROG] = "backend: program",
+    [HD5770_WHY_BK_SURF] = "backend: surface",
+    [HD5770_WHY_BK_ROOM] = "backend: room",
+    [HD5770_WHY_BK_DEAD] = "backend: lost",
+    [HD5770_WHY_BK_OTHER] = "backend: other",
+};
+
+const char *hd5770_why_name(unsigned why)
+{
+    return why < HD5770_WHY_N && why_names[why] ? why_names[why] : "?";
+}
 
 /* the program of a resolve: none */
 static HD5770IR resolve_ir = { .hash = 0x7265736f6c766500ull };
 
-/* texture unit u of a request: the CPU path's Tex, in VRAM */
-static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
-                    HD5770GpuTex *gt)
+/*
+ * texture unit u of a request: the CPU path's Tex, in VRAM;
+ * HD5770_WHY_GPU, else why not
+ */
+static unsigned gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
+                        HD5770GpuTex *gt)
 {
     unsigned id = ir->res[u], sid = 0, i, k;
     bool seen = false;
@@ -3130,20 +3189,24 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
 
         if (f->kind == HD5770_IRF_TEX && f->res == id) {
             if (seen && s != sid) {
-                return false;
+                return HD5770_WHY_TEX_SAMPLERS;
             }
             sid = s;
             seen = true;
         }
     }
     memset(gt, 0, sizeof(*gt));
-    if (!tex_setup(d, id, sid, &t) ||
-        (!d->g->gpu->ops->full && (t.bc || (t.dim != 0 && t.dim != 1))) ||
-        !gpu_surf_n(d->g, &t.s, MAX(t.slice_bytes[0] * MAX(t.slices, 1u),
+    if (!tex_setup(d, id, sid, &t)) {
+        return HD5770_WHY_TEX_SETUP;
+    }
+    if (!d->g->gpu->ops->full && (t.bc || (t.dim != 0 && t.dim != 1))) {
+        /* compressed, 3D, cube and array textures: backends with full */
+        return HD5770_WHY_TEX_KIND;
+    }
+    if (!gpu_surf_n(d->g, &t.s, MAX(t.slice_bytes[0] * MAX(t.slices, 1u),
                                     hd5770_surf_size(&t.s)), false,
                     &gt->surf)) {
-        /* compressed, 3D, cube and array textures: backends with full */
-        return false;
+        return HD5770_WHY_TEX_SURF;
     }
     gt->bc = t.bc;
     gt->slices = MAX(t.slices, 1u);
@@ -3181,7 +3244,7 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
                             MAX(t.slice_bytes[k] * tex_slices(&t, k),
                                 hd5770_surf_size(&t.lv[k])),
                             false, &lv[k]) || lv[k].space) {
-                return false;
+                return HD5770_WHY_TEX_MIP_SURF;
             }
             gt->lw[k] = t.lw[k];
             gt->lh[k] = t.lh[k];
@@ -3195,11 +3258,14 @@ static bool gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
         gt->max_lod = t.max_lod;
         gt->lod_bias = t.lod_bias;
     }
-    return true;
+    return HD5770_WHY_GPU;
 }
 
-/* the vertex buffers the pixel shader fetches from, copied */
-static bool gpu_vbs(Draw *d, const HD5770IR *ir, HD5770GpuDraw *q)
+/*
+ * the vertex buffers the pixel shader fetches from, copied;
+ * HD5770_WHY_GPU, else why not
+ */
+static unsigned gpu_vbs(Draw *d, const HD5770IR *ir, HD5770GpuDraw *q)
 {
     HD5770Gfx *g = d->g;
     unsigned i, k;
@@ -3217,7 +3283,7 @@ static bool gpu_vbs(Draw *d, const HD5770IR *ir, HD5770GpuDraw *q)
         r = &g->ctx[(SQ_RESOURCE_0 - 0x28000) / 4 + bid * 8];
         fmt = (f->w[1] >> 21) & 1 ? (r[2] >> 20) & 0x3f : (f->w[1] >> 22) & 0x3f;
         if (!hd5770_fmt_bytes(fmt)) {
-            return false;
+            return HD5770_WHY_VB_FMT;
         }
         for (k = 0; k < q->nvb && q->vb[k].id != bid; k++) {
             /* search */
@@ -3226,12 +3292,12 @@ static bool gpu_vbs(Draw *d, const HD5770IR *ir, HD5770GpuDraw *q)
             continue;
         }
         if (q->nvb == HD5770_GPU_VB) {
-            return false;
+            return HD5770_WHY_VB_COUNT;
         }
         base = r[0] | ((uint64_t)(r[2] & 0xff) << 32);
         size = r[1] + 1;
         if (size > 4 * 1024 * 1024) {
-            return false;
+            return HD5770_WHY_VB_SIZE;
         }
         pend_check(g, base, size);
         q->vb[k].id = bid;
@@ -3241,7 +3307,7 @@ static bool gpu_vbs(Draw *d, const HD5770IR *ir, HD5770GpuDraw *q)
         hd5770_mem_read(&g->mem, base, (uint8_t *)q->vb[k].data, size);
         q->nvb++;
     }
-    return true;
+    return HD5770_WHY_GPU;
 }
 
 static void gpu_req_free(HD5770GpuDraw *q)
@@ -3812,6 +3878,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     const HD5770IR *ir;
     HD5770GpuDraw *q;
     uint64_t area = 0, rng[11][2];
+    unsigned why;
     uint8_t *pre[11] = { NULL };
     const HD5770GpuSurf *ws[11];
     unsigned i, nr = 0, nws;
@@ -3825,24 +3892,28 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     full = g->gpu->ops->full;
     if ((d->resolve && !full) || (!d->color && !d->db) ||
         (d->db && !g->gpu->ops->depth) || (d->db && d->zexport && !full)) {
-        GPU_FB(d, GFB_DB);
+        GPU_FB(d, GFB_DB, d->resolve ? HD5770_WHY_RESOLVE :
+                          !d->color && !d->db ? HD5770_WHY_NO_TARGET :
+                          d->db && !g->gpu->ops->depth ? HD5770_WHY_DEPTH :
+                          HD5770_WHY_ZEXPORT);
         return false;
     }
     if ((d->rt_bpe > 8 || d->mrt) && !full) {
-        GPU_FB(d, GFB_RT);
+        GPU_FB(d, GFB_RT, d->mrt ? HD5770_WHY_MRT : HD5770_WHY_RT_WIDE);
         return false;
     }
     if (d->mips && !g->gpu->ops->mipmaps) {
-        GPU_FB(d, GFB_TEX);
+        GPU_FB(d, GFB_TEX, HD5770_WHY_MIPS);
         return false;
     }
     if (!d->gpu_prog && !d->resolve) {
-        GPU_FB(d, GFB_PROG);
+        why = hd5770_prog_ir_why(d->ps);
+        GPU_FB(d, GFB_PROG, why == HD5770_WHY_GPU ? HD5770_WHY_FEEDBACK : why);
         return false;
     }
     ir = d->resolve ? &resolve_ir : hd5770_prog_ir(d->ps);
     if (!full && (ir->cf || ir->cmask > 1 || ir->zexport)) {
-        GPU_FB(d, GFB_PROG);
+        GPU_FB(d, GFB_PROG, ir->cf ? HD5770_WHY_CF_FORM : HD5770_WHY_EXPORTS);
         return false;
     }
     for (i = 0; i < ir->nfetches; i++) {
@@ -3851,27 +3922,28 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         if (ir->fetches[i].kind == HD5770_IRF_TEX &&
             ((fop == 0x04 && !g->gpu->ops->resinfo) ||
              (fop >= 0x18 && !full))) {
-            GPU_FB(d, GFB_PROG);
+            GPU_FB(d, GFB_PROG, fop == 0x04 ? HD5770_WHY_RESINFO
+                                            : HD5770_WHY_FETCH_OP);
             return false;
         }
     }
     for (i = 0; i < ir->ninsts && !full; i++) {
         if (ir->insts[i].cube) {
-            GPU_FB(d, GFB_PROG);
+            GPU_FB(d, GFB_PROG, HD5770_WHY_CUBE);
             return false;
         }
     }
     if (d->prov_last) {
         for (i = 0; i < ir->ninsts; i++) {
             if (ir->insts[i].interp && ir->insts[i].flat) {
-                GPU_FB(d, GFB_PROG);
+                GPU_FB(d, GFB_PROG, HD5770_WHY_FLAT_LAST);
                 return false;
             }
         }
     }
     q = g_new0(HD5770GpuDraw, 1);
     if (d->color && !gpu_surf(g, &d->rt, true, &q->rt)) {
-        GPU_FB(d, GFB_RT);
+        GPU_FB(d, GFB_RT, HD5770_WHY_RT_SURF);
         goto out;
     }
     if (d->mrt) {
@@ -3897,7 +3969,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
             q->nmrt++;
             if (!sok) {
                 memcpy(cur, d->mrt, MRT_BYTES);
-                GPU_FB(d, GFB_RT);
+                GPU_FB(d, GFB_RT, HD5770_WHY_RT_SURF);
                 goto out;
             }
         }
@@ -3912,7 +3984,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
 
         if (!gpu_surf(g, &d->rs, false, &q->rs) ||
             (!q->rs.space && !vram_off(g, d->rs.base, 1, &off))) {
-            GPU_FB(d, GFB_DB);
+            GPU_FB(d, GFB_DB, HD5770_WHY_RS_SURF);
             goto out;
         }
         q->resolve = true;
@@ -3935,7 +4007,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         if ((d->zfmt && (!gpu_surf(g, &d->zs, true, &q->zs) || q->zs.space)) ||
             (d->has_s && (!gpu_surf(g, &d->ss, true, &q->ss) ||
                           q->ss.space))) {
-            GPU_FB(d, GFB_DB);
+            GPU_FB(d, GFB_DB, HD5770_WHY_DB_SURF);
             goto out;
         }
         q->db = true;
@@ -3977,14 +4049,16 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     q->persp = d->persp;
     q->pos_gpr = d->pos_ena ? (int)d->pos_gpr : -1;
     for (i = 0; i < ir->nres; i++) {
-        if (!gpu_tex(d, ir, i, &q->tex[i])) {
-            GPU_FB(d, GFB_TEX);
+        why = gpu_tex(d, ir, i, &q->tex[i]);
+        if (why != HD5770_WHY_GPU) {
+            GPU_FB(d, GFB_TEX, why);
             goto out;
         }
     }
     q->ntex = ir->nres;
-    if (!gpu_vbs(d, ir, q)) {
-        GPU_FB(d, GFB_VB);
+    why = gpu_vbs(d, ir, q);
+    if (why != HD5770_WHY_GPU) {
+        GPU_FB(d, GFB_VB, why);
         goto out;
     }
     d->gnin = 0;
@@ -4021,7 +4095,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         (d->db ? area * ps_cost(d, ir) < HD5770_DB_MIN_PIXELS
                : area * ps_cost(d, ir) < g->gpu->ops->min_pixels &&
                  !gpu_queued(g, d, y0, y1))) {
-        GPU_FB(d, GFB_SMALL);
+        GPU_FB(d, GFB_SMALL, HD5770_WHY_SMALL);
         goto out;
     }
     /* the VRAM rows the draw writes: targets, depth, stencil */
@@ -4049,13 +4123,13 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         g->ram_pend |= q->mrt[i].surf.space;
         g->ram_wpend |= q->mrt[i].surf.space;
         if (q->mrt[i].surf.space && g->gpu_mode == HD5770_GPU_VERIFY) {
-            GPU_FB(d, GFB_RT);
+            GPU_FB(d, GFB_RT, HD5770_WHY_RT_RAM_VERIFY);
             goto out;
         }
     }
     if (q->rt.space && g->gpu_mode == HD5770_GPU_VERIFY) {
         /* verified draws are the ones in VRAM */
-        GPU_FB(d, GFB_RT);
+        GPU_FB(d, GFB_RT, HD5770_WHY_RT_RAM_VERIFY);
         goto out;
     }
     if (g->gpu_mode == HD5770_GPU_VERIFY) {
@@ -4065,6 +4139,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         }
     }
     g->gpu->building = false;
+    g->gpu->why = 0;
     if (q->ntri && !g->gpu->ops->draw(g->gpu->b, q)) {
         for (i = 0; i < nr; i++) {
             g_free(pre[i]);
@@ -4075,13 +4150,15 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
              * seconds: the frame is incomplete until the program is built
              */
             g->gst.build_skips++;
+            d->cwhy = HD5770_WHY_BUILDING;
             ok = true;
             goto out;
         }
-        GPU_FB(d, GFB_BACKEND);
+        GPU_FB(d, GFB_BACKEND, g->gpu->why ? g->gpu->why : HD5770_WHY_BK_OTHER);
         goto out;
     }
     ok = true;
+    d->cwhy = HD5770_WHY_GPU;
     g->gst.taken++;
     g->gst.taken_db += q->db;
     for (i = 0; i < nr; i++) {
@@ -4440,9 +4517,15 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
 
     memset(t, 0, sizeof(*t));
     d->gfb = GFB_NONE;
+    d->cwhy = HD5770_WHY_N;
     gpu_lock(g, true);
     taken = gpu_draw(d, vp, nv, prim, t);
     gpu_lock(g, false);
+    if (d->cwhy < HD5770_WHY_N &&
+        (d->why >= HD5770_WHY_N ||
+         (d->why <= HD5770_WHY_BUILDING && d->cwhy > HD5770_WHY_BUILDING))) {
+        d->why = d->cwhy;
+    }
     if (!taken) {
         const HD5770Surf *ws[10] = { d->color ? &d->rt : NULL,
                                      d->db && d->zfmt ? &d->zs : NULL,
@@ -4480,6 +4563,10 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
         assemble(d, vp, nv, prim, t, raster_tri);
         g->gst.fb_ns[MIN(d->gfb, GFB_NONE)] += get_clock() - t0;
         g->gst.fb_px[MIN(d->gfb, GFB_NONE)] += d->st->pixels - px0;
+        if (d->cwhy < HD5770_WHY_N) {
+            g->gst.why_ns[d->cwhy] += get_clock() - t0;
+            g->gst.why_px[d->cwhy] += d->st->pixels - px0;
+        }
         for (i = 0; i < nws && d->ok && d->wy1 >= d->wy0; i++) {
             uint64_t lo, hi;
 
@@ -4517,9 +4604,11 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     if (!draw_indices(g, b, n, &count, &idx, &isrc)) {
         st->skip_reason[HD5770_SKIP_INDEX]++;
         st->skipped++;
+        g->gst.why_draws[HD5770_WHY_SKIPPED]++;
         return;
     }
     d = g_new0(Draw, 1);
+    d->why = HD5770_WHY_N;
     d->g = g;
     d->st = st;
     d->ok = true;
@@ -4672,6 +4761,10 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         (d->fs && hd5770_prog_bad(d->fs))) {
         reason = HD5770_SKIP_SHADER;
         goto out;
+    }
+    if (g->gpu && g->gpu_mode != HD5770_GPU_OFF &&
+        !hd5770_vs_ir((HD5770Prog *)d->vs, d->fs)) {
+        g->gst.vs_why[hd5770_vs_ir_why(d->vs)]++;
     }
     d->vs_env.opaque = d;
     d->vs_env.stage = HD5770_STAGE_VS;
@@ -4828,6 +4921,8 @@ out:
         st->skip_reason[reason]++;
         st->skipped++;
     }
+    g->gst.why_draws[reason != HD5770_SKIP_MAX ? HD5770_WHY_SKIPPED :
+                     d->why < HD5770_WHY_N ? d->why : HD5770_WHY_EMPTY]++;
     vs_check_free(&vc);
     g_free(vm);
     g_free(vb);
@@ -4999,6 +5094,33 @@ void hd5770_gfx_stats(HD5770Gfx *g, GString *out)
     }
 }
 
+/*
+ * Draws by where they ran, one line per reason: "why NAME: draws D
+ * cpu-ms M cpu-kpixels P" (M and P also from draws partly on the GPU),
+ * then "vs-why NAME: draws D" for vertex shaders without host IR.
+ */
+void hd5770_gfx_why_stats(HD5770Gfx *g, GString *out)
+{
+    const HD5770GpuStats *t = &g->gst;
+    unsigned i;
+
+    for (i = 0; i < HD5770_WHY_N; i++) {
+        if (t->why_draws[i] || t->why_ns[i] || t->why_px[i]) {
+            g_string_append_printf(out, "why %s: draws %" PRIu64 " cpu-ms %"
+                                   PRIu64 " cpu-kpixels %" PRIu64 "\n",
+                                   hd5770_why_name(i), t->why_draws[i],
+                                   t->why_ns[i] / 1000000,
+                                   t->why_px[i] / 1000);
+        }
+    }
+    for (i = 0; i < HD5770_WHY_N; i++) {
+        if (t->vs_why[i]) {
+            g_string_append_printf(out, "vs-why %s: draws %" PRIu64 "\n",
+                                   hd5770_why_name(i), t->vs_why[i]);
+        }
+    }
+}
+
 void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
 {
     HD5770GpuStats *t = &g->gst;
@@ -5046,6 +5168,7 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
         t->fb_ns[GFB_VB] / 1000000, t->fb_px[GFB_VB] / 1000,
         t->fb_ns[GFB_BACKEND] / 1000000, t->fb_px[GFB_BACKEND] / 1000,
         t->fb_ns[GFB_DB] / 1000000, t->fb_px[GFB_DB] / 1000);
+    hd5770_gfx_why_stats(g, out);
     g->gpu->ops->stats(g->gpu->b, out);
 }
 

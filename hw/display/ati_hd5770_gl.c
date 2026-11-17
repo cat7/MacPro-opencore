@@ -2017,6 +2017,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
 
     if (qatomic_read(&g->dead)) {
         g->declined[GLD_DEAD]++;
+        g->pub.why = HD5770_WHY_BK_DEAD;
         return false;
     }
     for (i = 0; i < d->ntex; i++) {
@@ -2030,17 +2031,20 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         return false;
     case GLP_FAILED:
         g->declined[GLD_PROG]++;
+        g->pub.why = HD5770_WHY_BK_PROG;
         return false;
     }
     if ((d->rt.space ? !g->ram_host :
          d->rt.voff + hd5770_surf_size(&d->rt.s) > g->vram_size) ||
         !(d->rt.s.fast || d->rt.s.split)) {
         g->declined[GLD_SURF]++;
+        g->pub.why = HD5770_WHY_BK_SURF;
         return false;
     }
     if (d->resolve && (d->rs.space || !(d->rs.s.fast || d->rs.s.split) ||
                        d->rs.voff + hd5770_surf_size(&d->rs.s) > g->vram_size)) {
         g->declined[GLD_SURF]++;
+        g->pub.why = HD5770_WHY_BK_SURF;
         return false;
     }
     for (i = 1; i < d->nmrt; i++) {
@@ -2049,6 +2053,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         if (ms->space || !(ms->s.fast || ms->s.split) ||
             ms->voff + hd5770_surf_size(&ms->s) > g->vram_size) {
             g->declined[GLD_SURF]++;
+            g->pub.why = HD5770_WHY_BK_SURF;
             return false;
         }
     }
@@ -2059,18 +2064,21 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         if (ts->space ? !g->ram_host :
             ts->voff + gl_tex_lvbytes(t, 0) > g->vram_size) {
             g->declined[GLD_SURF]++;
+            g->pub.why = HD5770_WHY_BK_SURF;
             return false;
         }
         for (k = 1; t->mip && k <= t->last_lv; k++) {
             ts = &t->lv[k];
             if (ts->space || ts->voff + gl_tex_lvbytes(t, k) > g->vram_size) {
                 g->declined[GLD_SURF]++;
+                g->pub.why = HD5770_WHY_BK_SURF;
                 return false;
             }
         }
         for (k = 0; k <= (t->mip ? t->last_lv : 0); k++) {
             if (t->slice_bytes[k] > UINT32_MAX) {
                 g->declined[GLD_SURF]++;
+                g->pub.why = HD5770_WHY_BK_SURF;
                 return false;
             }
         }
@@ -2082,6 +2090,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
             (ps->space || !(ps->s.fast || ps->s.split) ||
              ps->voff + hd5770_surf_size(&ps->s) > g->vram_size)) {
             g->declined[GLD_SURF]++;
+            g->pub.why = HD5770_WHY_BK_SURF;
             return false;
         }
     }
@@ -2097,6 +2106,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     }
     if (ntiles > GL_MAX_TILES) {
         g->declined[GLD_ROOM]++;
+        g->pub.why = HD5770_WHY_BK_ROOM;
         return false;
     }
     /* slots for the pages in guest RAM; all of them again if none is written */
@@ -2116,6 +2126,7 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         }
         if (k || g->pool_busy) {
             g->declined[GLD_ROOM]++;
+            g->pub.why = HD5770_WHY_BK_ROOM;
             return false;
         }
         gl_pool_reset(g);

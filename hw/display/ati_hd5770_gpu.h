@@ -362,6 +362,11 @@ typedef struct HD5770Gpu {
      * program is still being built; the draw is then left out
      */
     bool building;
+    /*
+     * added 2026-11-17: set by draw() when it declines, HD5770_WHY_BK_*;
+     * cleared before each call; 0 counts as HD5770_WHY_BK_OTHER
+     */
+    unsigned why;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

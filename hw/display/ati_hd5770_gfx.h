@@ -212,6 +212,61 @@ enum {
 
 #define HD5770_PENDING          16
 
+/*
+ * Where a draw ran: on the host GPU, or the first condition that kept it
+ * on the CPU (HD5770GpuStats.why_*); hd5770_why_name() names them.
+ */
+enum {
+    HD5770_WHY_GPU,             /* on the host GPU */
+    HD5770_WHY_BUILDING,        /* left out while its program builds */
+    HD5770_WHY_EMPTY,           /* nothing to draw */
+    HD5770_WHY_SKIPPED,         /* not drawn: skip_reason */
+    HD5770_WHY_SMALL,
+    HD5770_WHY_RESOLVE,
+    HD5770_WHY_NO_TARGET,
+    HD5770_WHY_DEPTH,
+    HD5770_WHY_ZEXPORT,
+    HD5770_WHY_RT_WIDE,         /* more than 8 bytes per element */
+    HD5770_WHY_MRT,
+    HD5770_WHY_RT_SURF,
+    HD5770_WHY_RT_RAM_VERIFY,
+    HD5770_WHY_MIPS,
+    HD5770_WHY_FEEDBACK,        /* samples a target it writes */
+    HD5770_WHY_IR_NONE,         /* no IR, reason unknown */
+    HD5770_WHY_IR_FS_CF,        /* fetch shader inline in the CF form */
+    HD5770_WHY_IR_CLAUSE,       /* ALU clause other than plain ALU */
+    HD5770_WHY_IR_ALU_OP,       /* predicate, MOVA or relative operand */
+    HD5770_WHY_IR_REL_CONST,    /* indexed constant */
+    HD5770_WHY_IR_GPRS,
+    HD5770_WHY_IR_TEX_UNITS,
+    HD5770_WHY_IR_FLOW,         /* flow control in the straight form */
+    HD5770_WHY_IR_CF_OP,        /* CF instruction not translated */
+    HD5770_WHY_CF_FORM,
+    HD5770_WHY_EXPORTS,         /* more colour exports or depth export */
+    HD5770_WHY_RESINFO,
+    HD5770_WHY_FETCH_OP,        /* SAMPLE_C and later */
+    HD5770_WHY_CUBE,
+    HD5770_WHY_FLAT_LAST,       /* flat input, last vertex provokes */
+    HD5770_WHY_TEX_SETUP,       /* resource not modelled */
+    HD5770_WHY_TEX_SAMPLERS,    /* one resource, two samplers */
+    HD5770_WHY_TEX_KIND,        /* BC, 3D, cube or array */
+    HD5770_WHY_TEX_SURF,
+    HD5770_WHY_TEX_MIP_SURF,
+    HD5770_WHY_VB_FMT,
+    HD5770_WHY_VB_COUNT,
+    HD5770_WHY_VB_SIZE,
+    HD5770_WHY_DB_SURF,
+    HD5770_WHY_RS_SURF,
+    HD5770_WHY_BK_PROG,         /* the backend: program failed */
+    HD5770_WHY_BK_SURF,         /* surface it cannot reach */
+    HD5770_WHY_BK_ROOM,
+    HD5770_WHY_BK_DEAD,
+    HD5770_WHY_BK_OTHER,
+    HD5770_WHY_N
+};
+
+const char *hd5770_why_name(unsigned why);
+
 typedef struct HD5770GpuStats {
     uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
@@ -230,6 +285,14 @@ typedef struct HD5770GpuStats {
     uint64_t vs_tri_draws, vs_tris, vs_tri_bad, vs_tri_ulp, vs_tri_count;
     /* the CPU's time and pixels for the draws it took, by reason */
     uint64_t fb_ns[8], fb_px[8];
+    /*
+     * draws by where they ran (HD5770_WHY_*, a draw's first reason), and
+     * the CPU's time and pixels by the reason of each part of a draw
+     */
+    uint64_t why_draws[HD5770_WHY_N], why_ns[HD5770_WHY_N];
+    uint64_t why_px[HD5770_WHY_N];
+    /* draws whose vertex shader has no host IR, by reason */
+    uint64_t vs_why[HD5770_WHY_N];
 } HD5770GpuStats;
 
 typedef struct HD5770Gfx {
@@ -291,6 +354,8 @@ void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len);
 /* whether queued draws may write VRAM bytes [off, off + len) */
 bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len);
 void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out);
+/* draws by where they ran (HD5770_WHY_*), part of hd5770_gfx_gpu_stats() */
+void hd5770_gfx_why_stats(HD5770Gfx *g, GString *out);
 /* a draw packet, b[0] its header, n dwords */
 void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n);
 /* a packet that sets draw state; false when op is not one of them */

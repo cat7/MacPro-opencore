@@ -143,6 +143,8 @@ struct HD5770Prog {
     uint32_t ngroups;
     bool bad;
     uint32_t hash;
+    /* why lane_compile() failed, HD5770_WHY_IR_*: PS, VS */
+    uint8_t ir_why, vir_why;
 };
 
 /* ---------------------------------------------------------------- */
@@ -458,7 +460,7 @@ uint32_t hd5770_prog_size(const uint32_t *code, uint32_t max)
 
 static void lane_free(LaneProg *lp);
 static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
-                              bool cfm);
+                              bool cfm, uint8_t *why);
 
 HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
                             unsigned stage, HD5770GfxStats *st)
@@ -526,9 +528,9 @@ HD5770Prog *hd5770_prog_new(const uint32_t *code, uint32_t ndw,
         }
     }
     if (stage == HD5770_STAGE_PS && !p->bad) {
-        p->lane = lane_compile(p, NULL, false);
+        p->lane = lane_compile(p, NULL, false, &p->ir_why);
         if (!p->lane) {
-            p->lane = lane_compile(p, NULL, true);
+            p->lane = lane_compile(p, NULL, true, &p->ir_why);
         }
     }
     return p;
@@ -1962,7 +1964,7 @@ static unsigned lane_seq(const HD5770Prog *p, const HD5770Prog *fs,
 }
 
 static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
-                              bool cfm)
+                              bool cfm, uint8_t *why)
 {
     LaneProg *lp = g_new0(LaneProg, 1);
     HD5770IR *ir = &lp->ir;
@@ -2000,8 +2002,10 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
         h = (h ^ fs->code[i]) * 0x100000001b3ull;
     }
     ir->hash = h;
+    *why = HD5770_WHY_IR_NONE;
     if (fs && cfm) {
         /* the fetch shader inline moves the addresses: straight form only */
+        *why = HD5770_WHY_IR_FS_CF;
         goto fail;
     }
     if (cfm && prog_rel(p)) {
@@ -2040,6 +2044,7 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
             unsigned g;
 
             if (!cfm && (cf->op & 0xf) != CF_ALU) {
+                *why = HD5770_WHY_IR_CLAUSE;
                 goto fail;
             }
             o->kind = HD5770_IRO_ALU;
@@ -2056,6 +2061,7 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
                     HD5770IRInst *li = &ir->insts[ir->ninsts++];
 
                     if (!cfm && !op_lane_ok(in)) {
+                        *why = HD5770_WHY_IR_ALU_OP;
                         goto fail;
                     }
                     li->priv = in;
@@ -2087,11 +2093,14 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
                         }
                         if (!lane_src(ir, cf, ext, in, ag, k, &li->src[k],
                                       &ccap)) {
+                            *why = in->sel[k] < 128 ? HD5770_WHY_IR_GPRS
+                                                    : HD5770_WHY_IR_REL_CONST;
                             goto fail;
                         }
                     }
                     li->wr = in->write && in->op != OP2_NOP;
                     if (li->wr && !lane_gpr(ir, in->dst_gpr, &li->dst)) {
+                        *why = HD5770_WHY_IR_GPRS;
                         goto fail;
                     }
                 }
@@ -2125,6 +2134,7 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
                 f->fs = sp != p;
                 if (!lane_gpr(ir, (w[0] >> 16) & 0x7f, &f->src) ||
                     !lane_gpr(ir, w[1] & 0x7f, &f->dst)) {
+                    *why = HD5770_WHY_IR_GPRS;
                     goto fail;
                 }
                 if (cf->op == CF_VTX || op == 0) {
@@ -2141,6 +2151,7 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
                     }
                     if (k == ir->nres) {
                         if (ir->nres == ARRAY_SIZE(ir->res)) {
+                            *why = HD5770_WHY_IR_TEX_UNITS;
                             goto fail;
                         }
                         ir->res[ir->nres++] = f->res;
@@ -2178,6 +2189,7 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
                 e->target = !ir->vs || type == 1 ? base + n
                                                  : HD5770_IR_PARAM0 + base + n;
                 if (!lane_gpr(ir, (gpr + n) & 127, &e->gpr)) {
+                    *why = HD5770_WHY_IR_GPRS;
                     goto fail;
                 }
                 for (k = 0; k < 4; k++) {
@@ -2218,11 +2230,13 @@ static LaneProg *lane_compile(const HD5770Prog *p, const HD5770Prog *fs,
         case CF_RETURN:
         case CF_KILL:
             if (!cfm) {
+                *why = HD5770_WHY_IR_FLOW;
                 goto fail;
             }
             ir->nops++;
             break;
         default:
+            *why = HD5770_WHY_IR_CF_OP;
             goto fail;
         }
         if (!cfm && ((cf->w1 >> 21) & 1)) {
@@ -2253,6 +2267,16 @@ const HD5770IR *hd5770_prog_ir(const HD5770Prog *p)
     return p->lane ? &p->lane->ir : NULL;
 }
 
+unsigned hd5770_prog_ir_why(const HD5770Prog *p)
+{
+    return p->lane ? HD5770_WHY_GPU : MAX(p->ir_why, HD5770_WHY_IR_NONE);
+}
+
+unsigned hd5770_vs_ir_why(const HD5770Prog *vs)
+{
+    return vs->vlane ? HD5770_WHY_GPU : MAX(vs->vir_why, HD5770_WHY_IR_NONE);
+}
+
 const HD5770IR *hd5770_vs_ir(HD5770Prog *vs, const HD5770Prog *fs)
 {
     if (vs->stage != HD5770_STAGE_VS || vs->bad || (fs && fs->bad)) {
@@ -2266,7 +2290,7 @@ const HD5770IR *hd5770_vs_ir(HD5770Prog *vs, const HD5770Prog *fs)
     }
     if (!vs->vtried || vs->vfs != h) {
         lane_free(vs->vlane);
-        vs->vlane = lane_compile(vs, fs, false);
+        vs->vlane = lane_compile(vs, fs, false, &vs->vir_why);
         vs->vfs = h;
         vs->vtried = true;
     }
