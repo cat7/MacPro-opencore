@@ -248,6 +248,7 @@ static void gfx_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     uint32_t i = (off - EG_GFX_FIRST) >> 2;
 
     s->gfx[i] = val;
+    ati_hd5770_note_write(s, off, val);
     if (off < EG_CONTEXT_REG_END) {
         s->census_ctx_writes[i]++;
         if (off == EG_CB_COLOR0_INFO) {

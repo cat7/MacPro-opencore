@@ -303,6 +303,9 @@ struct ATIHD5770State {
     HD5770CPStats cp;
     HD5770Census census_cb0, census_ps, census_vs, census_prim;
     uint64_t census_ctx_writes[1024];
+    /* guest writes per register dword below 0x40000, and the last value */
+    uint32_t reg_writes[0x40000 / 4];
+    uint32_t reg_last[0x40000 / 4];
 
     /* asynchronous DMA engine */
     uint32_t dma_rptr;          /* bytes */
@@ -325,6 +328,8 @@ struct ATIHD5770State {
 void ati_hd5770_ih_push(ATIHD5770State *s, uint32_t src_id, uint32_t src_data);
 uint32_t ati_hd5770_reg_read(ATIHD5770State *s, uint32_t off);
 void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
+/* count a guest write for the silent-regs property, off below 0x40000 */
+void ati_hd5770_note_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 /* with the lock the register needs (REGISTER ACCESS in ati_hd5770.c) */
 void ati_hd5770_reg_write_locked(ATIHD5770State *s, uint32_t off,
                                  uint32_t val);

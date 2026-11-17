@@ -24,6 +24,7 @@
 #include "system/qtest.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_regs.h"
+#include "ati_hd5770_audit.h"
 #include "trace.h"
 
 /* ---------------------------------------------------------------- */
@@ -384,6 +385,7 @@ static void reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
     off &= ATI_HD5770_MMIO_SIZE - 4;
     trace_ati_hd5770_reg_write(off, val);
     note_unknown(s, off, true, val);
+    ati_hd5770_note_write(s, off, val);
     if (ati_hd5770_atom_write(s, off, val)) {
         return;
     }
@@ -1216,6 +1218,40 @@ static char *ati_hd5770_get_gaps(Object *obj, Error **errp)
     return g_string_free(out, FALSE);
 }
 
+void ati_hd5770_note_write(ATIHD5770State *s, uint32_t off, uint32_t val)
+{
+    off >>= 2;
+    if (s->reg_writes[off] != UINT32_MAX) {
+        s->reg_writes[off]++;
+    }
+    s->reg_last[off] = val;
+}
+
+/*
+ * `silent-regs` property: every register the guest wrote that the model
+ * never consumes (ati_hd5770_audit.h), one per line: offset, writes,
+ * last value; "none" when there is none.
+ */
+static char *ati_hd5770_get_silent_regs(Object *obj, Error **errp)
+{
+    ATIHD5770State *s = ATI_HD5770(obj);
+    GString *out = g_string_new(NULL);
+    unsigned i;
+
+    for (i = 0; i < HD5770_AUDIT_LIMIT / 4; i++) {
+        if (s->reg_writes[i] &&
+            !(ati_hd5770_reg_consumed[i >> 5] & (1u << (i & 31)))) {
+            g_string_append_printf(out, "%s0x%05x: %u writes, last 0x%08x",
+                                   out->len ? "\n" : "", i << 2,
+                                   s->reg_writes[i], s->reg_last[i]);
+        }
+    }
+    if (!out->len) {
+        g_string_append(out, "none");
+    }
+    return g_string_free(out, FALSE);
+}
+
 /* `cp-stats` property: command processor, DMA and GART counters */
 static char *ati_hd5770_get_cp_stats(Object *obj, Error **errp)
 {
@@ -1336,6 +1372,8 @@ static void ati_hd5770_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     object_class_property_add_str(klass, "gaps", ati_hd5770_get_gaps, NULL);
+    object_class_property_add_str(klass, "silent-regs",
+                                  ati_hd5770_get_silent_regs, NULL);
     object_class_property_add_str(klass, "cp-stats", ati_hd5770_get_cp_stats,
                                   NULL);
     object_class_property_add_str(klass, "atom-calls",
