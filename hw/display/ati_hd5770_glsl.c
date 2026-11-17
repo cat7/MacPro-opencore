@@ -2476,3 +2476,232 @@ char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask)
         "}\n");
     return g_string_free(o, false);
 }
+
+/*
+ * A vertex shader (hd5770_vs_ir()) as a compute shader, pass A of
+ * HD5770GpuVs as hd_vs in ati_hd5770_msl.c runs it: invocation n runs
+ * slot n % nslot of instance n / nslot and writes record n of storage
+ * buffer 8. Its arguments are words from uniform vso of storage buffer
+ * 5, in the layout of GVsDraw (ati_hd5770_mtl.m), offsets in words; a
+ * buffer in guest RAM lies in storage buffer 0's RAM slots, its slots in
+ * words from its pt on.
+ */
+static const char glsl_vs_lib[] =
+"layout(std430, binding = 8) writeonly buffer Recs { uint recs[]; };\n"
+"uniform uint vso;\n"
+"#define VW(i) words[vso + (i)]\n"
+"/* storage buffer 0 offset of byte o of the buffer whose words are at b */\n"
+"uint hd_bat(uint b, uint o)\n"
+"{\n"
+"    if (words[b + 1u] != 0u) {\n"
+"        uint q = words[b + 3u] + o;\n"
+"\n"
+"        return words[b] + words[words[b + 2u] + (q >> 12u)] * 4096u + (q & 4095u);\n"
+"    }\n"
+"    return words[b] + o;\n"
+"}\n"
+"uint hd_brd(uint b, uint o, uint n)\n"
+"{\n"
+"    uint v = 0u;\n"
+"\n"
+"    if (n == 4u && (o & 3u) == 0u) {\n"
+"        return vram[hd_bat(b, o) >> 2u];\n"
+"    }\n"
+"    for (uint i = 0u; i < n; i++) {\n"
+"        uint a = hd_bat(b, o + i);\n"
+"\n"
+"        v |= ((vram[a >> 2u] >> ((a & 3u) * 8u)) & 0xffu) << (8u * i);\n"
+"    }\n"
+"    return v;\n"
+"}\n"
+"/* vfetch_vs(): the fetch type's offset, then vfetch_stage() */\n"
+"void hd_vsfetch(uint w0, uint w1, uint w2, uint index, uint fsb, out uint o[4])\n"
+"{\n"
+"    uint bid = (w0 >> 8u) & 0xffu, off = w2 & 0xffffu, fmt, num, sgn, n, k;\n"
+"    uint c[4], w[4];\n"
+"\n"
+"    if (((w0 >> 5u) & 3u) == 0u) {\n"
+"        index += VW(7u);\n"
+"    } else if (((w0 >> 5u) & 3u) == 1u) {\n"
+"        index += VW(8u);\n"
+"    }\n"
+"    if (bid == 128u) {\n"
+"        uint e = index + off / 16u;\n"
+"\n"
+"        for (k = 0u; k < 4u; k++) {\n"
+"            o[k] = e < 256u ? words[VW(5u) + e * 4u + k] : 0u;\n"
+"        }\n"
+"        return;\n"
+"    }\n"
+"    o[0] = U(0.0); o[1] = U(0.0); o[2] = U(0.0);\n"
+"    o[3] = U(1.0);\n"
+"    for (k = 0u; k < VW(6u) && VW(24u + 16u * k) != bid + fsb; k++) {\n"
+"    }\n"
+"    if (k == VW(6u)) {\n"
+"        return;\n"
+"    }\n"
+"    uint vb = vso + 24u + 16u * k;\n"
+"    uint size = words[vb + 5u] + 1u, r2 = words[vb + 6u], stride = (r2 >> 8u) & 0x7ffu;\n"
+"    if (((w1 >> 21u) & 1u) != 0u) {\n"
+"        fmt = (r2 >> 20u) & 0x3fu;\n"
+"        num = (r2 >> 26u) & 3u;\n"
+"        sgn = (r2 >> 28u) & 1u;\n"
+"    } else {\n"
+"        fmt = (w1 >> 22u) & 0x3fu;\n"
+"        num = (w1 >> 28u) & 3u;\n"
+"        sgn = (w1 >> 30u) & 1u;\n"
+"    }\n"
+"    n = hd_fmt_bytes(fmt);\n"
+"    uint mhi, at;\n"
+"    umulExtended(index, stride, mhi, at);\n"
+"    uint at2 = at + off;\n"
+"    if (mhi != 0u || at2 < at || at2 + n < at2 || at2 + n > size) {\n"
+"        o[0] = 0u; o[1] = 0u; o[2] = 0u;\n"
+"        return;\n"
+"    }\n"
+"    for (k = 0u; k < 4u; k++) {\n"
+"        w[k] = 4u * k < n ? hd_brd(vb + 12u, at2 + 4u * k, min(n - 4u * k, 4u)) : 0u;\n"
+"    }\n"
+"    c[0] = 0u; c[1] = 0u; c[2] = 0u; c[3] = 0u;\n"
+"    if (n > 8u) {\n"
+"        for (k = 0u; k < 4u && hd_fbits(fmt, k) != 0u; k++) {\n"
+"            c[k] = w[k];\n"
+"        }\n"
+"    } else {\n"
+"        uint sh = 0u;\n"
+"\n"
+"        for (k = 0u; k < 4u && hd_fbits(fmt, k) != 0u; k++) {\n"
+"            uint bb = hd_fbits(fmt, k);\n"
+"\n"
+"            c[k] = hd_ext(w[0], w[1], sh, bb);\n"
+"            sh += bb;\n"
+"        }\n"
+"    }\n"
+"    for (k = 0u; k < 4u && hd_fbits(fmt, k) != 0u; k++) {\n"
+"        o[k] = hd_comp(c[k], hd_fbits(fmt, k), hd_fmt_float(fmt), sgn != 0u, num);\n"
+"    }\n"
+"}\n"
+"/* the vertex index of slot s, as hd5770_gfx_draw(); false: a restart */\n"
+"bool hd_vsindex(uint s, out uint x)\n"
+"{\n"
+"    uint raw;\n"
+"\n"
+"    x = 0u;\n"
+"    if (VW(9u) == 0u) {\n"
+"        x = s + VW(13u);\n"
+"        return true;\n"
+"    }\n"
+"    if (VW(9u) == 2u) {\n"
+"        raw = words[VW(18u) + s];\n"
+"    } else if (s >= VW(12u)) {\n"
+"        raw = 0u;\n"
+"    } else if (VW(10u) != 0u) {\n"
+"        raw = hd_brd(vso + 20u, s * 4u, 4u);\n"
+"        if (VW(11u) == 1u) {\n"
+"            raw = ((raw & 0x00ff00ffu) << 8u) | ((raw >> 8u) & 0x00ff00ffu);\n"
+"        } else if (VW(11u) == 2u) {\n"
+"            raw = (raw << 24u) | ((raw << 8u) & 0xff0000u) | ((raw >> 8u) & 0xff00u) | (raw >> 24u);\n"
+"        } else if (VW(11u) == 3u) {\n"
+"            raw = (raw << 16u) | (raw >> 16u);\n"
+"        }\n"
+"    } else {\n"
+"        raw = hd_brd(vso + 20u, s * 2u, 2u);\n"
+"        if (VW(11u) == 1u) {\n"
+"            raw = ((raw & 0xffu) << 8u) | (raw >> 8u);\n"
+"        }\n"
+"    }\n"
+"    if (VW(16u) != 0u && raw == VW(17u)) {\n"
+"        return false;\n"
+"    }\n"
+"    x = min(max(raw + VW(13u), VW(14u)), VW(15u));\n"
+"    return true;\n"
+"}\n";
+
+char *hd5770_glsl_vs_program(const HD5770IR *ir)
+{
+    GString *o = g_string_new(NULL);
+    unsigned i, j, k, ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+    unsigned rw = HD5770_VS_REC(np);
+
+    emit_head(o);
+    g_string_append(o, hd5770_glsl_lib);
+    g_string_append(o, glsl_vs_lib);
+    g_string_append_printf(o,
+        "void main()\n"
+        "{\n"
+        "    uint gid = gl_GlobalInvocationID.x;\n"
+        "    if (gid >= VW(0u) * VW(1u)) {\n        return;\n    }\n"
+        "    uint kvo = VW(4u), inst = gid / VW(0u), index, pm = 0u, fl = 0u;\n"
+        "    uint rec = gid * %uu;\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        recs[rec + i] = 0u;\n    }\n"
+        "    if (!hd_vsindex(gid %% VW(0u), index)) {\n"
+        "        recs[rec + %uu] = %uu;\n        return;\n    }\n"
+        "    bool killed = false;\n"
+        "    uvec4 r[%u];\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        r[i] = uvec4(0u);\n    }\n"
+        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n"
+        "    r[%u][0] = index;\n    r[%u][3] = inst;\n",
+        rw, rw, rw - 1, HD5770_VSF_RESTART, ng, ng, ir->map[0], ir->map[0]);
+    for (i = 0; i < ir->nops; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+
+        switch (op->kind) {
+        case HD5770_IRO_ALU:
+            for (j = 0; j < op->n; j++) {
+                emit_group(o, ir, &ir->groups[op->first + j], 0);
+            }
+            break;
+        case HD5770_IRO_FETCH:
+            for (j = 0; j < op->n; j++) {
+                const HD5770IRFetch *f = &ir->fetches[op->first + j];
+
+                g_string_append_printf(o,
+                    "    {\n        uint o[4];\n"
+                    "        hd_vsfetch(0x%08xu, 0x%08xu, 0x%08xu, r[%u][%u], %uu, o);\n",
+                    f->w[0], f->w[1], f->w[2], f->src, (f->w[0] >> 24) & 3,
+                    f->fs ? 160 : 0);
+                for (k = 0; k < 4; k++) {
+                    unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
+
+                    if (sel < 4) {
+                        g_string_append_printf(o, "        r[%u][%u] = o[%u];\n",
+                                               f->dst, k, sel);
+                    } else if (sel == 4 || sel == 5) {
+                        g_string_append_printf(o, "        r[%u][%u] = U(%s);\n",
+                                               f->dst, k, sel == 5 ? "1.0" : "0.0");
+                    }
+                }
+                g_string_append(o, "    }\n");
+            }
+            break;
+        default:
+            for (j = 0; j < op->n; j++) {
+                const HD5770IRExport *e = &ir->exports[op->first + j];
+                bool pos = e->target == HD5770_IR_POS;
+                unsigned base = pos ? 0 : 4 + 4 * (e->target - HD5770_IR_PARAM0);
+
+                for (k = 0; k < 4; k++) {
+                    unsigned sel = e->sel[k];
+
+                    if (sel < 4) {
+                        g_string_append_printf(o, "    recs[rec + %uu] = r[%u][%u];\n",
+                                               base + k, e->gpr, sel);
+                    } else if (sel == 4 || sel == 5) {
+                        g_string_append_printf(o, "    recs[rec + %uu] = U(%s);\n",
+                                               base + k, sel == 5 ? "1.0" : "0.0");
+                    }
+                }
+                if (pos) {
+                    g_string_append_printf(o, "    fl = %uu;\n", HD5770_VSF_POS);
+                } else {
+                    g_string_append_printf(o, "    pm |= %uu;\n",
+                                           1u << (e->target - HD5770_IR_PARAM0));
+                }
+            }
+            break;
+        }
+    }
+    g_string_append_printf(o, "    recs[rec + %uu] = pm;\n    recs[rec + %uu] = fl;\n}\n",
+                           rw - 2, rw - 1);
+    return g_string_free(o, false);
+}

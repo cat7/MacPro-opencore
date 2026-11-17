@@ -847,3 +847,17 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
     g_string_append(o, "}\n\n");
     g_free(pidx);
 }
+
+unsigned hd5770_vs_np(const HD5770IR *ir)
+{
+    unsigned i, np = 0;
+
+    for (i = 0; i < ir->nexports; i++) {
+        unsigned t = ir->exports[i].target;
+
+        if (t >= HD5770_IR_PARAM0 && t - HD5770_IR_PARAM0 + 1 > np) {
+            np = t - HD5770_IR_PARAM0 + 1;
+        }
+    }
+    return np;
+}

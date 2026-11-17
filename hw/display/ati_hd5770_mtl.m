@@ -39,6 +39,46 @@
 #define MTL_TILE        64      /* threads per tile */
 #define MTL_ACC         128     /* accesses tracked between barriers */
 
+/* the layouts of hd5770_msl_setup and the vertex kernels */
+typedef struct GSetup {
+    uint32_t nemit, nvtx, rec_words, k;
+    uint32_t prims_off, rec_off, tri_off, prm_off;
+    uint32_t prm_st, ninputs, flat, vte;
+    uint32_t sc_mode, wofs, clip_on, clip_dx;
+    uint32_t clip_near, clip_far, cull, face_cw;
+    uint32_t prov_last, zfmt;
+    int32_t poly_bits;
+    float pix_center;
+    int32_t x0, y0, x1, y1;
+    float vport[6];
+    float poly_scale[2], poly_units[2];
+    float poly_clamp;
+    uint32_t np;
+    int32_t src[32];
+    float def[32][4];
+} GSetup;
+
+typedef struct GBuf {
+    uint32_t voff, space, pt_off, pg0;
+} GBuf;
+
+typedef struct GVsVb {
+    uint32_t id, pad0, pad1, pad2;
+    uint32_t res[8];
+    GBuf b;
+} GVsVb;
+
+typedef struct GVsDraw {
+    uint32_t nslot, ninst, rec_words, np;
+    uint32_t kv_off, cfile_off, nvb, base_vtx;
+    uint32_t start_inst, idx_kind, ib_i32, ib_swap;
+    uint32_t ib_max, ioff, lo, hi;
+    uint32_t restart, reset, imm_off, pad;
+    GBuf ib;
+    GVsVb vb[8];
+} GVsDraw;
+
+
 /* the layouts of hd5770_msl_lib */
 typedef struct GSurf {
     uint32_t voff, mode, bpe, row_bytes, mt_per_row, tile_bytes, mt_bytes;
@@ -154,6 +194,11 @@ typedef struct HD5770Mtl {
     id<MTLCommandBuffer> cb, last;
     id<MTLComputeCommandEncoder> enc;
     size_t st_used;
+    /* the vertex stage: its kernels (the set-up once used), records */
+    GHashTable *vprogs;
+    id<MTLComputePipelineState> setup;
+    bool setup_tried;
+    id<MTLBuffer> vrec;
     unsigned pending;
     GHashTable *progs;
     GArray *ranges;             /* uint64_t pairs, VRAM written */
@@ -261,12 +306,223 @@ static MtlProg *mtl_prog(HD5770Mtl *m, const HD5770IR *ir, uint32_t mipmask)
     return p;
 }
 
+/* a vertex shader's kernel, compiled in the background as mtl_prog() */
+static MtlProg *mtl_vsprog(HD5770Mtl *m, const HD5770IR *ir)
+{
+    uint64_t hash = ir->hash;
+    MtlProg *p = g_hash_table_lookup(m->vprogs, &hash);
+    char *src;
+
+    if (p) {
+        return p;
+    }
+    p = g_new0(MtlProg, 1);
+    g_hash_table_insert(m->vprogs, g_memdup2(&hash, sizeof(hash)), p);
+    src = hd5770_msl_vs_program(ir);
+    m->compiles++;
+    qatomic_inc(&m->building);
+    @autoreleasepool {
+        MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+        id<MTLDevice> dev = m->dev;
+        int64_t t0 = get_clock();
+
+        mtl_exact_math(opt);
+        [dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                          options:opt
+                completionHandler:^(id<MTLLibrary> lib, NSError *e) {
+            id<MTLFunction> fn = [lib newFunctionWithName:@"hd_vs"];
+            id<MTLComputePipelineState> pso = nil;
+
+            if (fn) {
+                pso = [dev newComputePipelineStateWithFunction:fn error:nil];
+                [fn release];
+            }
+            if (!pso) {
+                fprintf(stderr, "ati-hd5770: Metal vertex program %016" PRIx64
+                        " not built: %s\n", hash,
+                        e ? [[e localizedDescription] UTF8String] : "?");
+            }
+            p->pso = pso;
+            qatomic_add(&m->compile_ns, get_clock() - t0);
+            qatomic_store_release(&p->state, pso ? MTL_P_READY : MTL_P_FAILED);
+            qatomic_dec(&m->building);
+        }];
+        [opt release];
+    }
+    g_free(src);
+    return p;
+}
+
 static size_t mtl_take(HD5770Mtl *m, size_t len)
 {
     size_t o = ROUND_UP(m->st_used, MTL_ALIGN);
 
     m->st_used = o + len;
     return o;
+}
+
+/* kernel hd_setup (hd5770_msl_setup), built at its first use */
+static id<MTLComputePipelineState> mtl_setup(HD5770Mtl *m)
+{
+    if (m->setup_tried) {
+        return m->setup;
+    }
+    m->setup_tried = true;
+    @autoreleasepool {
+        MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+        NSError *e = nil;
+        id<MTLLibrary> lib;
+
+        mtl_exact_math(opt);
+        lib = [m->dev newLibraryWithSource:
+                   [NSString stringWithUTF8String:hd5770_msl_setup]
+                                   options:opt error:&e];
+        if (lib) {
+            id<MTLFunction> fn = [lib newFunctionWithName:@"hd_setup"];
+
+            m->setup = [m->dev newComputePipelineStateWithFunction:fn
+                                                             error:&e];
+            [fn release];
+            [lib release];
+        }
+        if (!m->setup) {
+            fprintf(stderr, "ati-hd5770: Metal set-up kernel not built: %s\n",
+                    e ? [[e localizedDescription] UTF8String] : "?");
+        }
+        [opt release];
+    }
+    return m->setup;
+}
+
+/* staging bytes mtl_vs_stage() takes */
+static size_t mtl_vs_need(const HD5770GpuVs *v)
+{
+    size_t n = sizeof(GVsDraw) + 4096 + (v->ir->nconsts + 1) * 4 + 4 * MTL_ALIGN;
+    unsigned i;
+
+    if (v->idx_kind == 2) {
+        n += (size_t)v->nslot * 4 + MTL_ALIGN;
+    }
+    n += v->ib.npages * 4 + MTL_ALIGN;
+    for (i = 0; i < v->nvb; i++) {
+        n += v->vb[i].buf.npages * 4 + MTL_ALIGN;
+    }
+    return n;
+}
+
+static void mtl_buf(HD5770Mtl *m, GBuf *g, const HD5770GpuSurf *s)
+{
+    memset(g, 0, sizeof(*g));
+    g->voff = s->voff;
+    if (s->space) {
+        size_t o = mtl_take(m, s->npages * 4);
+
+        memcpy((uint8_t *)m->st.contents + o, s->pages, s->npages * 4);
+        g->space = 1;
+        g->pt_off = o;
+        g->pg0 = s->pg0;
+    }
+}
+
+/* pass A's arguments in staging (kernel hd_vs), at the offset returned */
+static size_t mtl_vs_stage(HD5770Mtl *m, const HD5770GpuVs *v)
+{
+    uint8_t *st = m->st.contents;
+    size_t o_vd = mtl_take(m, sizeof(GVsDraw));
+    size_t o_kv = mtl_take(m, (v->ir->nconsts + 1) * 4);
+    size_t o_cf = mtl_take(m, 4096);
+    GVsDraw *vd = (GVsDraw *)(st + o_vd);
+    unsigned i;
+
+    memset(vd, 0, sizeof(*vd));
+    memcpy(st + o_kv, v->kv, v->ir->nconsts * 4);
+    memcpy(st + o_cf, v->cfile, 4096);
+    vd->nslot = v->nslot;
+    vd->ninst = v->ninst;
+    vd->rec_words = HD5770_VS_REC(v->np);
+    vd->np = v->np;
+    vd->kv_off = o_kv;
+    vd->cfile_off = o_cf;
+    vd->nvb = v->nvb;
+    vd->base_vtx = v->base_vtx;
+    vd->start_inst = v->start_inst;
+    vd->idx_kind = v->idx_kind;
+    vd->ib_i32 = v->ib_i32;
+    vd->ib_swap = v->ib_swap;
+    vd->ib_max = v->ib_max;
+    vd->ioff = v->ioff;
+    vd->lo = v->lo;
+    vd->hi = v->hi;
+    vd->restart = v->restart;
+    vd->reset = v->reset;
+    if (v->idx_kind == 2) {
+        vd->imm_off = mtl_take(m, (size_t)v->nslot * 4);
+        memcpy(st + vd->imm_off, v->imm, (size_t)v->nslot * 4);
+    }
+    mtl_buf(m, &vd->ib, &v->ib);
+    for (i = 0; i < v->nvb; i++) {
+        vd->vb[i].id = v->vb[i].id;
+        memcpy(vd->vb[i].res, v->vb[i].res, sizeof(vd->vb[i].res));
+        mtl_buf(m, &vd->vb[i].b, &v->vb[i].buf);
+    }
+    return o_vd;
+}
+
+/*
+ * Kernel hd_setup's arguments: nemit emits (at o_em in staging) of k
+ * slots each, records at r_rec, triangles at r_tri, their inputs at
+ * r_prm (ps bytes per slot)
+ */
+static void mtl_setup_fill(GSetup *su, const HD5770GpuVs *v, unsigned nemit,
+                           unsigned k, size_t o_em, size_t r_rec,
+                           size_t r_tri, size_t r_prm, size_t ps)
+{
+    memset(su, 0, sizeof(*su));
+    su->nemit = nemit;
+    su->nvtx = v->nslot * v->ninst;
+    su->np = v->np;
+    su->rec_words = HD5770_VS_REC(v->np);
+    su->k = k;
+    su->prims_off = o_em;
+    su->rec_off = r_rec;
+    su->tri_off = r_tri;
+    su->prm_off = r_prm;
+    su->prm_st = ps;
+    su->ninputs = v->ninputs;
+    su->flat = v->flat;
+    su->vte = v->vte;
+    su->sc_mode = v->sc_mode;
+    su->wofs = v->window_offset;
+    su->clip_on = v->clip_on;
+    su->clip_dx = v->clip_dx;
+    su->clip_near = v->clip_near;
+    su->clip_far = v->clip_far;
+    su->cull = v->cull;
+    su->face_cw = v->face_cw;
+    su->prov_last = v->prov_last;
+    su->zfmt = v->zfmt;
+    su->poly_bits = v->poly_db_bits;
+    su->pix_center = v->pix_center;
+    su->x0 = v->x0;
+    su->y0 = v->y0;
+    su->x1 = v->x1;
+    su->y1 = v->y1;
+    memcpy(su->vport, v->vport, sizeof(su->vport));
+    memcpy(su->poly_scale, v->poly_scale, sizeof(su->poly_scale));
+    memcpy(su->poly_units, v->poly_units, sizeof(su->poly_units));
+    su->poly_clamp = v->poly_clamp;
+    memcpy(su->src, v->src, sizeof(su->src));
+    memcpy(su->def, v->def, sizeof(su->def));
+}
+
+static void mtl_vs_bind(HD5770Mtl *m, id<MTLComputeCommandEncoder> enc,
+                        MtlProg *vp, size_t o_vd)
+{
+    [enc setComputePipelineState:vp->pso];
+    [enc setBuffer:m->vram offset:0 atIndex:0];
+    [enc setBuffer:m->st offset:0 atIndex:1];
+    [enc setBuffer:m->ram ? m->ram : m->st offset:0 atIndex:3];
+    [enc setBuffer:m->st offset:o_vd atIndex:4];
 }
 
 /* the batch as one dispatch */
@@ -1265,6 +1521,7 @@ static void mtl_close(void *opaque)
     }
     @autoreleasepool {
         g_hash_table_destroy(m->progs);
+        g_hash_table_destroy(m->vprogs);
         {
             MtlFence *f;
 
@@ -1278,12 +1535,119 @@ static void mtl_close(void *opaque)
         g_array_free(m->tiles, true);
         g_array_free(m->ram_ranges, true);
         [m->ram release];
+        [m->vrec release];
+        [m->setup release];
         [m->st release];
         [m->vram release];
         [m->q release];
         [m->dev release];
     }
     g_free(m);
+}
+
+/*
+ * HD5770GpuOps.vs_records: after a sync, the vertex shader (and with tri
+ * the set-up) alone, waited for
+ */
+static bool mtl_vs_records(void *opaque, const HD5770GpuVs *v, uint32_t *rec,
+                           HD5770GpuTri *tri, float *prm, unsigned *ntri)
+{
+    HD5770Mtl *m = opaque;
+    size_t rlen = (size_t)v->nslot * v->ninst * HD5770_VS_REC(v->np) * 4;
+    unsigned nemit = tri ? hd5770_vs_emits(v, NULL) : 0;
+    unsigned k = v->clip_on ? 3 : 1, i, q;
+    size_t ps = ROUND_UP(MAX((size_t)v->ninputs * 48, 16), 16);
+    size_t r_tri = ROUND_UP(rlen, MTL_ALIGN);
+    size_t r_prm = ROUND_UP(r_tri + (size_t)nemit * k * MTL_TRI_SLOT, MTL_ALIGN);
+    size_t len = r_prm + (size_t)nemit * k * ps;
+    MtlProg *vp;
+
+    if (!v->nslot || !v->ninst ||
+        mtl_vs_need(v) + sizeof(GSetup) + (size_t)nemit * 20 + 2 * MTL_ALIGN >
+        MTL_STAGING || (tri && !mtl_setup(m))) {
+        return false;
+    }
+    if (!m->ram && v->ib.space) {
+        return false;
+    }
+    for (i = 0; i < v->nvb; i++) {
+        if (!m->ram && v->vb[i].buf.space) {
+            return false;
+        }
+    }
+    vp = mtl_vsprog(m, v->ir);
+    while (qatomic_load_acquire(&vp->state) == MTL_P_BUILDING) {
+        g_usleep(1000);
+    }
+    if (qatomic_load_acquire(&vp->state) != MTL_P_READY) {
+        return false;
+    }
+    mtl_sync(m);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [m->q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        size_t o_vd = mtl_vs_stage(m, v);
+        uint8_t *st = m->st.contents;
+        const uint8_t *out;
+
+        if (!m->vrec || m->vrec.length < len) {
+            [m->vrec release];
+            m->vrec = [m->dev newBufferWithLength:MAX(len, 1 << 20)
+                                          options:MTLResourceStorageModeShared];
+        }
+        mtl_vs_bind(m, enc, vp, o_vd);
+        [enc setBuffer:m->vrec offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)v->nslot * v->ninst, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        if (nemit) {
+            size_t o_em = mtl_take(m, (size_t)nemit * 20);
+            size_t o_su = mtl_take(m, sizeof(GSetup));
+
+            hd5770_vs_emits(v, (uint32_t *)(st + o_em));
+            mtl_setup_fill((GSetup *)(st + o_su), v, nemit, k, o_em, 0, r_tri,
+                           r_prm, ps);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:m->setup];
+            [enc setBuffer:m->st offset:o_su atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(nemit, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        out = m->vrec.contents;
+        memcpy(rec, out, rlen);
+        if (tri) {
+            /* the slots set, in order */
+            *ntri = 0;
+            for (i = 0; i < nemit * k; i++) {
+                const GTri *g = (const GTri *)(out + r_tri + (size_t)i * MTL_TRI_SLOT);
+                HD5770GpuTri *t = &tri[*ntri];
+
+                if (g->x1 < g->x0) {
+                    continue;
+                }
+                for (q = 0; q < 3; q++) {
+                    t->x[q] = g->x[q];
+                    t->y[q] = g->y[q];
+                    t->w[q] = g->w[q];
+                    t->z[q] = g->z[q];
+                }
+                t->area = g->area;
+                t->x0 = g->x0;
+                t->y0 = g->y0;
+                t->x1 = g->x1;
+                t->y1 = g->y1;
+                t->prim = 0;
+                t->front = g->front;
+                memcpy(prm + (size_t)*ntri * v->ninputs * 12,
+                       out + r_prm + (size_t)i * ps, (size_t)v->ninputs * 48);
+                (*ntri)++;
+            }
+        }
+    }
+    m->st_used = 0;
+    return true;
 }
 
 static bool mtl_ram(void *opaque, uint8_t *host, uint64_t size)
@@ -1317,6 +1681,7 @@ static const HD5770GpuOps mtl_ops = {
     .close = mtl_close,
     .ram = mtl_ram,
     .fence = mtl_fence,
+    .vs_records = mtl_vs_records,
 };
 
 HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
@@ -1361,6 +1726,8 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
         }
         m->q = [dev newCommandQueue];
     }
+    m->vprogs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+                                      mtl_prog_free);
     m->progs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                      mtl_prog_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));

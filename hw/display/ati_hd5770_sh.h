@@ -137,11 +137,19 @@ typedef struct HD5770Lanes {
 bool hd5770_prog_lanes(const HD5770Prog *p, unsigned *nconst, bool *grad);
 /* the IR of a pixel shader (straight-line, or the CF form), else NULL */
 const HD5770IR *hd5770_prog_ir(const HD5770Prog *p);
+/*
+ * the IR of vertex shader vs with its fetch shader fs inline (straight
+ * form only; exports to HD5770_IR_POS and HD5770_IR_PARAM0 + n), else NULL
+ */
+const HD5770IR *hd5770_vs_ir(HD5770Prog *vs, const HD5770Prog *fs);
 /* resources [0..*n) the program's fetch instructions read */
 void hd5770_prog_resources(const HD5770Prog *p, uint8_t *ids, unsigned *n,
                            unsigned max);
 void hd5770_prog_bind(const HD5770Prog *p, const HD5770ShEnv *env,
                       HD5770Val *kv);
+/* the same for an IR (a vertex shader's from hd5770_vs_ir()) */
+void hd5770_ir_bind(const HD5770IR *ir, const HD5770ShEnv *env,
+                    HD5770Val *kv);
 void hd5770_prog_run_lanes(const HD5770Prog *p, const HD5770ShEnv *env,
                            const HD5770Val *kv, HD5770Lanes *l,
                            HD5770Lanes *nh, HD5770Lanes *nv);

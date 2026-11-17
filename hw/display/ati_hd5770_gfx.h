@@ -217,6 +217,17 @@ typedef struct HD5770GpuStats {
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
     uint64_t syncs, touch_syncs;
     uint64_t build_skips;       /* left out while their program builds */
+    /*
+     * verify mode: the host GPU's vertex records (HD5770GpuVs) against
+     * the CPU's vertices: draws, records, records and words differing,
+     * the largest difference in units in the last place
+     */
+    uint64_t vs_draws, vs_recs, vs_bad, vs_bad_words, vs_ulp;
+    /*
+     * the same for the triangles set up from them, and the draws whose
+     * triangle count differs
+     */
+    uint64_t vs_tri_draws, vs_tris, vs_tri_bad, vs_tri_ulp, vs_tri_count;
     /* the CPU's time and pixels for the draws it took, by reason */
     uint64_t fb_ns[8], fb_px[8];
 } HD5770GpuStats;

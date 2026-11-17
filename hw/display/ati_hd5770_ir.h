@@ -100,6 +100,7 @@ enum {
 typedef struct HD5770IRFetch {
     uint8_t kind, src, dst;
     uint8_t res;                /* TEX: resource id (PS resources 0..) */
+    bool fs;                    /* VTX of the fetch shader (its resources) */
     uint32_t w[3];
 } HD5770IRFetch;
 
@@ -110,6 +111,9 @@ typedef struct HD5770IRExport {
 } HD5770IRExport;
 
 #define HD5770_IR_DEPTH         61
+/* vertex shaders: the position, and parameter n at HD5770_IR_PARAM0 + n */
+#define HD5770_IR_POS           60
+#define HD5770_IR_PARAM0        64
 
 enum { HD5770_IRO_ALU, HD5770_IRO_FETCH, HD5770_IRO_EXPORT, HD5770_IRO_CF };
 
@@ -146,6 +150,7 @@ typedef struct HD5770IR {
     uint32_t cmask;             /* colour buffers exported */
     bool zexport;               /* the depth/stencil export */
     bool cf;                    /* CF FORM above */
+    bool vs;                    /* a vertex shader (and its fetch shader) */
     bool rel;                   /* relative register addressing */
 } HD5770IR;
 

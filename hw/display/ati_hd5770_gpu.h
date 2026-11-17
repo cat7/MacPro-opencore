@@ -231,6 +231,82 @@ typedef struct HD5770GpuDraw {
     uint32_t rs_fmt, rs_num, rs_comps, rs_src[4];
 } HD5770GpuDraw;
 
+/*
+ * The vertex stage of a draw. Pass A runs vertex shader ir once per
+ * index slot: for instance i < ninst and slot s < nslot the index is
+ *   idx_kind 0 (auto):  s + ioff
+ *   idx_kind 1, 2:      raw = (1) element s of buffer ib (ib_i32 ? 32
+ *                       : 16 bits, byte order ib_swap as draw_indices()
+ *                       reads it; 0 from element ib_max on) or (2)
+ *                       imm[s]; raw == reset with restart set marks a
+ *                       restart slot, else MIN(MAX(raw + ioff, lo), hi)
+ * and the shader runs with R0 = (index, 0, 0, i), its vertex fetches as
+ * vfetch_vs() does them, reading buffer vb[k].buf in place (vb[k].id:
+ * the fetch's resource id, plus 160 for the fetch shader's), DX9
+ * constant file cfile, constants kv (bound as hd5770_ir_bind() binds
+ * them). It writes record i * nslot + s of HD5770_VS_REC(np) words: the
+ * clip space position, parameters 0..np-1, the mask of the parameters
+ * exported, flags HD5770_VSF_* (channels not exported are 0).
+ *
+ * The rest is for the triangle set-up after it: slot[s] is UINT32_MAX
+ * at a restart slot; the slots are assembled as primitives of type prim
+ * (VGT_PRIMITIVE_TYPE) and set up as assemble() and gpu_tri() set them
+ * up, with the registers below. Pixel inputs: input p of the pixel
+ * shader is parameter src[p] of the vertex shader (-1: def[p]), flat if
+ * bit p of flat is set (the provoking vertex's).
+ */
+#define HD5770_VS_REC(np)       (4 + 4 * (np) + 2)
+#define HD5770_VSF_RESTART      1u
+#define HD5770_VSF_POS          2u
+
+typedef struct HD5770GpuVsVb {
+    uint32_t id;
+    uint32_t res[8];            /* SQ_RESOURCE words */
+    HD5770GpuSurf buf;          /* its bytes 0..res[1] */
+} HD5770GpuVsVb;
+
+typedef struct HD5770GpuVs {
+    const HD5770IR *ir;
+    const uint32_t *kv;
+    const uint32_t *cfile;      /* VS DX9 constant file, 256 x 4 */
+    unsigned nslot, ninst, np, prim;
+    unsigned idx_kind;
+    HD5770GpuSurf ib;
+    bool ib_i32, restart;
+    uint32_t ib_swap, ib_max, ioff, lo, hi, reset;
+    const uint32_t *imm;
+    uint32_t base_vtx, start_inst;  /* the fetch types' offsets */
+    unsigned nvb;
+    HD5770GpuVsVb vb[HD5770_GPU_VB];
+    /* set-up */
+    const uint32_t *slot;
+    unsigned ninputs;           /* as HD5770GpuDraw's */
+    uint32_t flat;
+    float pix_center;
+    uint32_t vte, sc_mode, window_offset;
+    float vport[6];
+    bool clip_on, clip_dx, clip_near, clip_far;
+    unsigned cull;              /* bit 0 front, bit 1 back */
+    bool face_cw, prov_last;
+    int32_t x0, y0, x1, y1;     /* scissor, x1 and y1 exclusive */
+    float poly_scale[2], poly_units[2], poly_clamp;  /* front, back */
+    int8_t poly_db_bits;
+    uint32_t zfmt;
+    int32_t src[32];
+    float def[32][4];
+} HD5770GpuVs;
+
+/* the parameters a vertex shader's records hold (HD5770GpuVs.np) */
+unsigned hd5770_vs_np(const HD5770IR *ir);
+
+/*
+ * The emits of a vertex stage, as assemble() makes them: entries of five
+ * words (a, b, c, provoking vertex, kind), records i * nslot + s;
+ * kind 1: the second half of a rectangle, its third vertex a + b - c.
+ * out NULL: only the count.
+ */
+unsigned hd5770_vs_emits(const HD5770GpuVs *v, uint32_t *out);
+
 typedef struct HD5770GpuOps {
     const char *name;
     bool (*draw)(void *b, const HD5770GpuDraw *d);
@@ -260,6 +336,14 @@ typedef struct HD5770GpuOps {
      * when len is 0; NULL for a backend that reads memory in place
      */
     void (*wrote)(void *b, uint64_t off, uint64_t len);
+    /*
+     * added 2026-11-17: vertex stage v alone, after the work before it:
+     * its records to rec (HD5770GpuVs); with tri set, also its triangles
+     * (*ntri of them, at most hd5770_vs_emits() * 3) and their inputs
+     * (prm as HD5770GpuDraw.prm). false: not run.
+     */
+    bool (*vs_records)(void *b, const HD5770GpuVs *v, uint32_t *rec,
+                       HD5770GpuTri *tri, float *prm, unsigned *ntri);
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -292,6 +376,15 @@ HD5770Gpu *hd5770_mtl_open(uint8_t *vram, uint64_t vram_size,
 char *hd5770_msl_program(const HD5770IR *ir);
 /* the same for draws whose texture units in mipmask are mipmapped */
 char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask);
+/*
+ * A vertex shader's IR (hd5770_vs_ir()) as MSL kernel hd_vs, interface
+ * in ati_hd5770_msl.c
+ */
+char *hd5770_msl_vs_program(const HD5770IR *ir);
+/* the same as a GLSL compute shader (ati_hd5770_glsl.c) */
+char *hd5770_glsl_vs_program(const HD5770IR *ir);
+/* the triangle set-up and box drawing of the vertex stage */
+extern const char hd5770_msl_setup[];
 extern const char hd5770_msl_lib[];
 
 /*
