@@ -104,6 +104,7 @@ typedef struct NatSurf {
     uint8_t *held;
     uint64_t *bgen, *bstamp;
     uint64_t hstamp;            /* the stamp the write log was read at */
+    uint8_t *amiss;             /* per band: the audit reported it */
     uint64_t pin;               /* the draw that uses it */
     uint64_t pass;              /* the last pass that uses it */
     uint8_t run;                /* elements of a micro tile row in a run */
@@ -148,6 +149,11 @@ typedef struct HD5770Mtlr {
     uint64_t builds, pso_builds, build_ns, draw_build_ns;
     int64_t draw_ns, sync_ns, wait_ns, check_ns, upload_ns, wback_ns;
     GArray *build_ms;
+    /* HD5770_NAT_AUDIT */
+    bool audit;
+    uint64_t au_bands, au_bytes, au_named, au_ram, au_missed, au_pages;
+    uint64_t au_events, au_lines;
+    int64_t au_ns;
 } HD5770Mtlr;
 
 static void nat_exact_math(MTLCompileOptions *o)
@@ -379,6 +385,28 @@ static void nat_named(HD5770Mtlr *m, uint64_t lo, uint64_t hi)
     }
 }
 
+/* the device's log for the entry's pages, 64 pages at a time */
+static void nat_log(HD5770Mtlr *m, const NatSurf *e)
+{
+    uint64_t p;
+
+    for (p = (e->lo >> 12) & ~63ull; p <= (e->hi - 1) >> 12; p += 64) {
+        uint64_t bits = m->pub.written
+                        ? m->pub.written(m->pub.opaque, p << 12) : ~0ull;
+        unsigned i;
+
+        if (!bits) {
+            continue;
+        }
+        m->gen++;
+        for (i = 0; i < 64 && p + i < m->vram_size >> 12; i++) {
+            if ((bits >> i) & 1) {
+                m->pgen[p + i] = m->gen;
+            }
+        }
+    }
+}
+
 /* band b has rows drawn and not written back */
 static bool nat_band_dirty(const NatSurf *e, uint32_t b)
 {
@@ -403,7 +431,7 @@ static void nat_check(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
 {
     int64_t t0 = get_clock(), up0 = m->upload_ns, w0 = m->wait_ns;
     uint32_t b, r0, b0 = y0 / e->bh, b1 = (y1 - 1) / e->bh;
-    uint64_t a, z, o, p;
+    uint64_t a, z, o;
     uint64_t stamp = m->stamp[e->space];
     uint8_t *fl;
 
@@ -419,22 +447,7 @@ static void nat_check(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
     }
     fl = m->flags;
     if (!e->space && e->hstamp != stamp) {
-        /* the device's log, 64 pages at a time */
-        for (p = (e->lo >> 12) & ~63ull; p <= (e->hi - 1) >> 12; p += 64) {
-            uint64_t bits = m->pub.written
-                            ? m->pub.written(m->pub.opaque, p << 12) : ~0ull;
-            unsigned i;
-
-            if (!bits) {
-                continue;
-            }
-            m->gen++;
-            for (i = 0; i < 64 && p + i < m->vram_size >> 12; i++) {
-                if ((bits >> i) & 1) {
-                    m->pgen[p + i] = m->gen;
-                }
-            }
-        }
+        nat_log(m, e);
         e->hstamp = stamp;
     }
     for (b = b0; b <= b1; b++) {
@@ -679,6 +692,7 @@ static void nat_surf_free(gpointer p)
     g_free(e->held);
     g_free(e->bgen);
     g_free(e->bstamp);
+    g_free(e->amiss);
     g_free(e->pages);
     g_free(e);
 }
@@ -807,6 +821,7 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     e->held = g_new0(uint8_t, e->nb);
     e->bgen = g_new0(uint64_t, e->nb);
     e->bstamp = g_new0(uint64_t, e->nb);
+    e->amiss = g_new0(uint8_t, e->nb);
     for (e->run = 8; e->run > 1; e->run >>= 1) {
         for (i = 0; i < 64; i++) {
             if ((i & (e->run - 1)) &&
@@ -1363,6 +1378,100 @@ static bool nat_draw(void *opaque, const HD5770GpuDraw *d)
     return ok;
 }
 
+/*
+ * HD5770_NAT_AUDIT: every band held against memory, in full, after a
+ * sync's write-back. A VRAM page that differs from the shadow although
+ * nothing named it since the band's last comparison is a missed write:
+ * no later comparison would look at it. Memory is compared before the
+ * log is read, so a write that lands in between is named.
+ */
+static void nat_audit(HD5770Mtlr *m)
+{
+    int64_t t0 = get_clock();
+    unsigned i;
+    uint32_t b;
+
+    for (i = 0; i < m->surfs->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->surfs, i);
+        bool logged = false;
+
+        for (b = 0; b < e->nb; b++) {
+            uint64_t a, z, o, first = 0;
+            uint32_t named = 0, missed = 0;
+
+            if (!e->held[b] || nat_band_dirty(e, b)) {
+                continue;
+            }
+            nat_band(e, b, &a, &z);
+            m->au_bands++;
+            m->au_bytes += z - a;
+            for (o = a; o < z; ) {
+                size_t n;
+                uint8_t *p8 = nat_at(m, e, o, &n);
+
+                n = MIN(n, z - o);
+                if (!e->space) {
+                    n = MIN(n, 4096 - ((e->voff + o) & 4095));
+                }
+                if (memcmp(p8, e->shadow + o, n)) {
+                    if (e->space) {
+                        named++;
+                    } else {
+                        if (!logged) {
+                            nat_log(m, e);
+                            logged = true;
+                        }
+                        if (m->pgen[(e->voff + o) >> 12] > e->bgen[b]) {
+                            named++;
+                        } else if (!missed++) {
+                            first = o;
+                        }
+                    }
+                }
+                o += n;
+            }
+            if (e->space) {
+                m->au_ram += named != 0;
+                continue;
+            }
+            m->au_named += named != 0;
+            if (!missed) {
+                e->amiss[b] = 0;
+                continue;
+            }
+            m->au_missed++;
+            m->au_pages += missed;
+            if (e->amiss[b]) {
+                continue;
+            }
+            e->amiss[b] = 1;
+            m->au_events++;
+            if (m->au_lines++ < 500) {
+                const uint8_t *q = m->vram + e->voff + first;
+                const uint8_t *h = e->shadow + first;
+                size_t k, n = MIN(4096 - ((e->voff + first) & 4095),
+                                  z - first);
+
+                for (k = 0; k + 1 < n && q[k] == h[k]; k++) {
+                }
+                k = MIN(k, n < 4 ? 0 : n - 4);
+                fprintf(stderr, "nat-audit: missed write: sync %" PRIu64
+                        " draw %" PRIu64 " surface vram 0x%" PRIx64 " %ux%u"
+                        " bpe %u mode %u format %u rows %u-%u: %u pages,"
+                        " first at 0x%" PRIx64 " memory %02x%02x%02x%02x"
+                        " held %02x%02x%02x%02x\n", m->syncs, m->seq,
+                        e->voff, e->s.pitch, e->s.height, e->s.bpe,
+                        e->s.mode, e->hf, b * e->bh,
+                        MIN((b + 1) * e->bh, e->s.height) - 1, missed,
+                        e->voff + first + k, q[k & ~3], q[(k & ~3) + 1],
+                        q[(k & ~3) + 2], q[(k & ~3) + 3], h[k & ~3],
+                        h[(k & ~3) + 1], h[(k & ~3) + 2], h[(k & ~3) + 3]);
+            }
+        }
+    }
+    m->au_ns += get_clock() - t0;
+}
+
 static void nat_sync(void *opaque)
 {
     HD5770Mtlr *m = opaque;
@@ -1382,6 +1491,9 @@ static void nat_sync(void *opaque)
         }
     }
     g_array_set_size(m->ranges, 0);
+    if (m->audit) {
+        nat_audit(m);
+    }
     m->stamp[0]++;
     m->stamp[1]++;
     m->seq++;
@@ -1462,6 +1574,17 @@ static void nat_stats(void *opaque, GString *out)
                            m->build_ns / 1000000,
                            s->len ? g_array_index(s, float, s->len / 2) : 0.0f,
                            s->len ? g_array_index(s, float, s->len - 1) : 0.0f);
+    if (m->audit) {
+        g_string_append_printf(out, "native: audit: bands compared %" PRIu64
+                               " (%" PRIu64 " MB), differing and named %"
+                               PRIu64 ", differing in guest RAM %" PRIu64
+                               ", missed writes: %" PRIu64 " bands (%" PRIu64
+                               " band-syncs, %" PRIu64 " pages), ms %" PRId64
+                               "\n", m->au_bands, m->au_bytes >> 20,
+                               m->au_named, m->au_ram, m->au_events,
+                               m->au_missed, m->au_pages,
+                               m->au_ns / 1000000);
+    }
     g_array_free(s, true);
 }
 
@@ -1567,6 +1690,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
     m->pgen = g_new0(uint64_t, (vram_size >> 12) + 1);
     m->stamp[0] = m->stamp[1] = 1;
     m->build_ms = g_array_new(false, false, sizeof(float));
+    m->audit = getenv("HD5770_NAT_AUDIT") != NULL;
     m->pub.ops = &nat_ops;
     m->pub.b = m;
     return &m->pub;
