@@ -408,6 +408,24 @@ extern const char hd5770_msl_lib[];
 void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
                     bool straight);
 
+/*
+ * The native pipeline (macOS, ati_hd5770_mtlr.m): draws go through the
+ * host's rasteriser into host textures kept coherent with VRAM, close to
+ * but not bit for bit what the CPU path produces. A pixel program is a
+ * fragment function hd_nfs, with the pass-through vertex function
+ * hd_nvs, for the draws of key k: ninputs inputs (those in flat by the
+ * provoking vertex), the position in GPR pos_gpr (-1 none), byte i of
+ * the target from channel rt_src[i]. NULL: not expressible.
+ */
+typedef struct HD5770NatKey {
+    uint8_t ninputs;
+    int8_t pos_gpr;
+    uint8_t rt_src[4];
+    uint32_t flat;
+} HD5770NatKey;
+const char *hd5770_msl_alu(void);
+char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);
+
 /* the OpenGL backend (Windows); NULL and *err set if there is none */
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,
                           const char **err);

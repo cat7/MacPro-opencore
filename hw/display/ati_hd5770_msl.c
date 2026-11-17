@@ -2673,3 +2673,279 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
         "}\n");
     return g_string_free(o, false);
 }
+
+/*
+ * The native pipeline (ati_hd5770_mtlr.m). hd5770_msl_alu() is the part
+ * of hd5770_msl_lib a native program needs: the prelude and the ALU
+ * functions, without formats, surfaces, fetches, rasterisation and the
+ * output stage.
+ */
+const char *hd5770_msl_alu(void)
+{
+    static char *alu;
+
+    if (!alu) {
+        const char *a = strstr(hd5770_msl_lib, "/* layouts shared");
+        const char *b = strstr(hd5770_msl_lib, "/* exp2f() rounded");
+        const char *c = strstr(hd5770_msl_lib, "/* ---- fetches ---- */");
+        GString *o = g_string_new_len(hd5770_msl_lib, a - hd5770_msl_lib);
+
+        g_string_append_len(o, b, c - b);
+        g_string_append(o,
+            "static float hd_mulieee(float a, float b) { return a * b; }\n");
+        alu = g_string_free(o, false);
+    }
+    return alu;
+}
+
+/* a TEX fetch as a sample of the unit's host texture */
+static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
+{
+    unsigned k, unit, op = f->w[0] & 0x1f;
+    int ox = ((int32_t)(f->w[2] << 27)) >> 27;
+    int oy = ((int32_t)(f->w[2] << 22)) >> 27;
+
+    g_string_append(o, "    {\n        uint o[4] = { 0, 0, 0, 0 };\n");
+    if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "        o[%u] = U(%s(F(R0[%u][%u])));\n",
+                                       k, f->kind == HD5770_IRF_GRAD_H ?
+                                       "dfdx" : "dfdy", f->src, sel);
+            } else {
+                g_string_append_printf(o, "        o[%u] = U(0.0f);\n", k);
+            }
+        }
+    } else if (f->kind != HD5770_IRF_TEX ||
+               !(op == 0x03 || (op >= 0x10 && op <= 0x13))) {
+        return false;
+    } else {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        g_string_append(o, "        uint c[4] = {");
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, " R0[%u][%u]", f->src, sel);
+            } else {
+                g_string_append(o, sel == 5 ? " U(1.0f)" : " U(0.0f)");
+            }
+            g_string_append(o, k < 3 ? "," : " };\n");
+        }
+        g_string_append_printf(o, "        float4 ts = u.tsize[%u], v;\n", unit);
+        if (op == 0x03) {
+            g_string_append_printf(o,
+                "        int2 xy = int2(I(c[0]) + %d, I(c[1]) + %d);\n"
+                "        v = float4(0.0f);\n"
+                "        if (xy.x >= 0 && xy.y >= 0 && xy.x < (int)ts.x && xy.y < (int)ts.y) {\n"
+                "            v = hd_nsel(t%u.read(uint2(xy)), u.tsel[%u]);\n"
+                "        }\n", ox / 2, oy / 2, unit, unit);
+        } else {
+            g_string_append_printf(o,
+                "        float2 tc = float2(F(c[0])%s, F(c[1])%s);\n"
+                "        bool bo = false;\n"
+                "        tc = tc + float2(%d.0f, %d.0f) * 0.5f;\n"
+                "        tc.x = hd_nwrap(tc.x, ts.x, u.twrap[%u].x, bo);\n"
+                "        tc.y = hd_nwrap(tc.y, ts.y, u.twrap[%u].y, bo);\n"
+                "        v = t%u.sample(s%u, tc / ts.zw);\n"
+                "        v = bo ? u.tborder[%u] : hd_nsel(v, u.tsel[%u]);\n",
+                (f->w[1] >> 28) & 1 ? " * ts.x" : "",
+                (f->w[1] >> 29) & 1 ? " * ts.y" : "", ox, oy, unit, unit, unit,
+                unit, unit, unit);
+        }
+        g_string_append(o, "        o[0] = U(v.x);\n        o[1] = U(v.y);\n"
+                           "        o[2] = U(v.z);\n        o[3] = U(v.w);\n");
+    }
+    for (k = 0; k < 4; k++) {
+        unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
+
+        if (sel < 4) {
+            g_string_append_printf(o, "        R0[%u][%u] = o[%u];\n", f->dst, k, sel);
+        } else if (sel == 4 || sel == 5) {
+            g_string_append_printf(o, "        R0[%u][%u] = U(%s);\n", f->dst, k,
+                                   sel == 5 ? "1.0f" : "0.0f");
+        }
+    }
+    g_string_append(o, "    }\n");
+    return true;
+}
+
+char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
+{
+    GString *o;
+    unsigned i, j, ng = MAX(ir->ngpr, 1u);
+    uint32_t iflat = 0, ivar = 0;
+
+    if (ir->cf || ir->vs || ir->zexport || ir->cmask != 1 || k->ninputs > 32) {
+        return NULL;
+    }
+    for (i = 0; i < ir->ninsts; i++) {
+        const HD5770IRInst *in = &ir->insts[i];
+
+        if (in->interp && in->needed && in->prm < k->ninputs) {
+            *(in->flat ? &iflat : &ivar) |= 1u << in->prm;
+        }
+    }
+    if (iflat & ivar & ~k->flat) {
+        return NULL;
+    }
+    o = g_string_new(hd5770_msl_alu());
+    g_string_append(o,
+        "struct NU {\n"
+        "    float4 tsize[16];\n"
+        "    uint4 tsel[16];\n"
+        "    uint4 twrap[16];\n"
+        "    float4 tborder[16];\n"
+        "    float4 vp;\n"
+        "    float alpha_ref;\n"
+        "    uint alpha_func;\n"
+        "    float pc;\n"
+        "    uint persp;\n"
+        "};\n"
+        "struct NV {\n    float4 pos [[position]];\n");
+    for (i = 0; i < k->ninputs; i++) {
+        bool fl = ((k->flat | iflat) >> i) & 1;
+
+        g_string_append_printf(o, "    %s p%u [[user(p%u)%s]];\n",
+                               fl ? "uint4" : "float4", i, i, fl ? ", flat" : "");
+    }
+    g_string_append(o, "};\nstruct NF {\n    float4 pos [[position]];\n");
+    for (i = 0; i < k->ninputs; i++) {
+        bool fl = ((k->flat | iflat) >> i) & 1;
+
+        g_string_append_printf(o, "    %s p%u [[user(p%u)%s]];\n",
+                               fl ? "uint4" : "float4", i, i, fl ? ", flat" : "");
+    }
+    g_string_append(o,
+        "    float3 bc [[barycentric_coord, center_no_perspective]];\n};\n");
+    /* the vertices: window x, y, z, 1/w, then the inputs */
+    g_string_append_printf(o,
+        "vertex NV hd_nvs(uint vid [[vertex_id]], const device float *vb [[buffer(0)]],\n"
+        "                 constant NU &u [[buffer(1)]])\n"
+        "{\n"
+        "    const device float *v = vb + vid * %uu;\n"
+        "    float cw = u.persp ? 1.0f / v[3] : 1.0f;\n"
+        "    NV r;\n"
+        "    r.pos = float4(((v[0] - u.pc + 0.5f) * u.vp.x - 1.0f) * cw,\n"
+        "                   (1.0f - (v[1] - u.pc + 0.5f) * u.vp.y) * cw, 0.0f, cw);\n",
+        4 + 4 * k->ninputs);
+    for (i = 0; i < k->ninputs; i++) {
+        bool fl = ((k->flat | iflat) >> i) & 1;
+
+        g_string_append_printf(o, "    r.p%u = %sfloat4(v[%u], v[%u], v[%u], v[%u])%s;\n",
+                               i, fl ? "as_type<uint4>(" : "", 4 + 4 * i,
+                               5 + 4 * i, 6 + 4 * i, 7 + 4 * i, fl ? ")" : "");
+    }
+    g_string_append(o, "    return r;\n}\n");
+    for (i = 0; i < 32; i++) {
+        bool fl = ((k->flat | iflat) >> i) & 1;
+
+        if (i >= k->ninputs) {
+            g_string_append_printf(o, "#define HD_NI_%u(ch) 0.0f\n", i);
+        } else {
+            g_string_append_printf(o, "#define HD_NI_%u(ch) %s(in.p%u[ch])\n", i,
+                                   fl ? "F" : "", i);
+        }
+    }
+    g_string_append(o,
+        "#define hd_interp(u, t, prm, p, ch, fl, b0, b1, b2, pw) HD_NI_##p(ch)\n"
+        "static __attribute__((always_inline)) float4 hd_nsel(float4 v, uint4 s)\n"
+        "{\n"
+        "    float4 r;\n"
+        "    for (uint k = 0; k < 4; k++) {\n"
+        "        r[k] = s[k] < 4 ? v[s[k]] : s[k] == 5 ? 1.0f : 0.0f;\n"
+        "    }\n"
+        "    return r;\n"
+        "}\n"
+        "/* hd_wrap() on a coordinate in texels of a w wide texture */\n"
+        "static __attribute__((always_inline)) float hd_nwrap(float t, float w, uint m, thread bool &out)\n"
+        "{\n"
+        "    switch (m) {\n"
+        "    case 0: t = t - floor(t / w) * w; break;\n"
+        "    case 1: {\n"
+        "        float p = t - floor(t / (2.0f * w)) * 2.0f * w;\n"
+        "        t = p < w ? p : 2.0f * w - p;\n"
+        "        break;\n"
+        "    }\n"
+        "    case 2: break;\n"
+        "    case 3: case 5: case 7: t = fabs(t); break;\n"
+        "    default: if (!(t >= 0.0f && t < w)) { out = true; } break;\n"
+        "    }\n"
+        "    return clamp(t, 0.5f, w - 0.5f);\n"
+        "}\n"
+        "static __attribute__((always_inline)) bool hd_nalpha(uint fn, float r, float a)\n"
+        "{\n"
+        "    switch (fn) {\n"
+        "    case 0: return false;\n"
+        "    case 1: return a < r;\n"
+        "    case 2: return a == r;\n"
+        "    case 3: return a <= r;\n"
+        "    case 4: return a > r;\n"
+        "    case 5: return a != r;\n"
+        "    case 6: return a >= r;\n"
+        "    default: return true;\n"
+        "    }\n"
+        "}\n"
+        "fragment float4 hd_nfs(NF in [[stage_in]], constant NU &u [[buffer(0)]],\n"
+        "                       constant uint *kv [[buffer(1)]]");
+    for (i = 0; i < ir->nres; i++) {
+        g_string_append_printf(o, ",\n    texture2d<float> t%u [[texture(%u)]], "
+                               "sampler s%u [[sampler(%u)]]", i, i, i, i);
+    }
+    g_string_append_printf(o,
+        ")\n{\n"
+        "    uint C[8][4];\n"
+        "    for (uint i = 0; i < 8; i++) {\n"
+        "        C[i][0] = C[i][1] = C[i][2] = C[i][3] = 0;\n"
+        "    }\n"
+        "    uint cm = 0;\n"
+        "    bool killed = false;\n"
+        "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
+        "    for (uint i = 0; i < %u; i++) {\n"
+        "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
+        "    }\n", ng, ng);
+    if (k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
+        g_string_append_printf(o,
+            "    R0[%d][0] = U(in.pos.x - 0.5f + u.pc);\n"
+            "    R0[%d][1] = U(in.pos.y - 0.5f + u.pc);\n"
+            "    R0[%d][2] = U(0.0f);\n    R0[%d][3] = U(1.0f);\n",
+            k->pos_gpr, k->pos_gpr, k->pos_gpr, k->pos_gpr);
+    }
+    g_string_append_printf(o, "    R0[%u][0] = U(in.bc.y);\n    R0[%u][1] = U(in.bc.z);\n",
+                           ir->map[0], ir->map[0]);
+    for (i = 0; i < ir->nops; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+
+        switch (op->kind) {
+        case HD5770_IRO_ALU:
+            for (j = 0; j < op->n; j++) {
+                emit_group(o, ir, &ir->groups[op->first + j], 0);
+            }
+            break;
+        case HD5770_IRO_FETCH:
+            for (j = 0; j < op->n; j++) {
+                if (!nat_fetch(o, ir, &ir->fetches[op->first + j])) {
+                    g_string_free(o, true);
+                    return NULL;
+                }
+            }
+            break;
+        default:
+            emit_export(o, ir, op);
+            break;
+        }
+    }
+    /* byte i of the target is channel rt_src[i] */
+    g_string_append_printf(o,
+        "    if (killed || !(cm & 1) || !hd_nalpha(u.alpha_func, u.alpha_ref, F(C[0][3]))) {\n"
+        "        discard_fragment();\n"
+        "    }\n"
+        "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
+        "    return select(r, float4(0.0f), isnan(r));\n"
+        "}\n", k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+    return g_string_free(o, false);
+}
