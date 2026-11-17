@@ -25,7 +25,8 @@
  * DEPTH AND STENCIL. The depth plane and the stencil plane are entries
  * of their own, host depth and stencil textures (Z_16: Depth16Unorm;
  * Z_24 and Z_32_FLOAT: Depth32Float; stencil: Stencil8) attached to
- * the pass separately, kept like the colour entries: the shadow holds
+ * the pass separately (both in one draw: Apple GPUs only, else
+ * declined), kept like the colour entries: the shadow holds
  * the guest's bytes; Z_24 is converted when a band is uploaded and when
  * it is written back, the byte above the 24 bits taken from memory.
  * The host tests the fragment's depth unrounded against a plane that
@@ -155,6 +156,7 @@ typedef struct HD5770Mtlr {
     id<MTLSamplerState> samp[2];
     GHashTable *progs, *psos, *dss;
     id<MTLDepthStencilState> ds_off;
+    bool sep_ds;                /* depth and stencil attach separately */
     GPtrArray *surfs;
     GArray *ranges;
     id<MTLCommandBuffer> last;
@@ -1394,6 +1396,9 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         hh = MIN(hh, d->zs.s.height);
     }
     if (d->db && d->has_s) {
+        if (zs && !m->sep_ds) {
+            return nat_decline(m, ND_DB_SURF, HD5770_WHY_BK_SURF);
+        }
         ss = d->ss.space ? NULL : nat_surf(m, &d->ss, NF_S8);
         if (!ss) {
             return nat_decline(m, ND_DB_SURF, HD5770_WHY_BK_SURF);
@@ -2045,6 +2050,8 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
 
         m->ds_off = [m->dev newDepthStencilStateWithDescriptor:dd];
         [dd release];
+        /* Apple GPUs; others want one packed texture for both */
+        m->sep_ds = [m->dev supportsFamily:MTLGPUFamilyApple1];
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));
