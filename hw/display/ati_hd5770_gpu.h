@@ -383,6 +383,8 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask);
 char *hd5770_msl_vs_program(const HD5770IR *ir);
 /* the same as a GLSL compute shader (ati_hd5770_glsl.c) */
 char *hd5770_glsl_vs_program(const HD5770IR *ir);
+/* pass B, the triangle set-up, as a GLSL compute shader */
+char *hd5770_glsl_setup_program(void);
 /* the triangle set-up and box drawing of the vertex stage */
 extern const char hd5770_msl_setup[];
 extern const char hd5770_msl_lib[];

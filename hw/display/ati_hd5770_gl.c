@@ -249,6 +249,55 @@ QEMU_BUILD_BUG_ON(sizeof(GTex) != 4 * 84);
 QEMU_BUILD_BUG_ON(sizeof(GDraw) != 4 * 206);
 QEMU_BUILD_BUG_ON(sizeof(GTri) != 4 * 18);
 
+/*
+ * The vertex stage's arguments in the words (hd5770_glsl_vs_program(),
+ * hd5770_glsl_setup_program()), offsets in words; a buffer in guest RAM
+ * has voff at the slots and its slot table at pt_off
+ */
+typedef struct GBuf {
+    uint32_t voff, space, pt_off, pg0;
+} GBuf;
+
+typedef struct GVsVb {
+    uint32_t id, pad0, pad1, pad2;
+    uint32_t res[8];
+    GBuf b;
+} GVsVb;
+
+typedef struct GVsDraw {
+    uint32_t nslot, ninst, rec_words, np;
+    uint32_t kv_off, cfile_off, nvb, base_vtx;
+    uint32_t start_inst, idx_kind, ib_i32, ib_swap;
+    uint32_t ib_max, ioff, lo, hi;
+    uint32_t restart, reset, imm_off, pad;
+    GBuf ib;
+    GVsVb vb[8];
+} GVsDraw;
+
+typedef struct GSetup {
+    uint32_t nemit, nvtx, rec_words, k;
+    uint32_t prims_off, rec_off, tri_off, prm_off;
+    uint32_t prm_st, ninputs, flat, vte;
+    uint32_t sc_mode, wofs, clip_on, clip_dx;
+    uint32_t clip_near, clip_far, cull, face_cw;
+    uint32_t prov_last, zfmt;
+    int32_t poly_bits;
+    float pix_center;
+    int32_t x0, y0, x1, y1;
+    float vport[6];
+    float poly_scale[2], poly_units[2];
+    float poly_clamp;
+    uint32_t np;
+    int32_t src[32];
+    float def[32][4];
+} GSetup;
+
+QEMU_BUILD_BUG_ON(sizeof(GVsDraw) != 4 * (24 + 16 * 8));
+QEMU_BUILD_BUG_ON(offsetof(GSetup, src) != 4 * 40);
+QEMU_BUILD_BUG_ON(sizeof(GSetup) != 4 * 200);
+
+#define GL_TRI_SLOT     32      /* words per triangle slot of the set-up */
+
 /* storage buffers; B_UP: upload bytes (not bound); B_STAGE, B_RB: buffers */
 enum {
     B_VRAM, B_SURFS, B_DRAWS, B_TEXS, B_TRIS, B_WORDS, B_TILES, B_UP,
@@ -306,12 +355,28 @@ typedef struct GlSeg {
 #define GL_PAGE_SH      12
 #define GL_BLK_SH       16      /* shadow allocation unit */
 
-enum { JOB_SEG, JOB_COMPILE, JOB_SYNC, JOB_QUIT };
+enum { JOB_SEG, JOB_COMPILE, JOB_SYNC, JOB_VS, JOB_QUIT };
+
+/*
+ * A vertex stage: after seg's uploads, vp over nvtx invocations (its
+ * arguments at word vso) into rlen bytes of records, then with sp the
+ * set-up of nemit emits (at word suo) into sclen bytes; both read back
+ * to rec and sc
+ */
+typedef struct GlVs {
+    GlProg *vp, *sp;
+    uint32_t vso, suo, nvtx, nemit;
+    size_t rlen, sclen;
+    uint32_t *rec;
+    uint32_t *sc;
+    bool ok;
+} GlVs;
 
 typedef struct GlJob {
     int kind;
     GlSeg *seg;
     GlProg *prog;
+    GlVs *vs;
     bool done;
 } GlJob;
 
@@ -365,8 +430,12 @@ typedef struct HD5770Gl {
     bool dead_told;
     char dead_why[160];
 
+    GLuint vbuf[2];             /* the vertex stage's records, set-up */
+
     /* the caller's */
     GHashTable *progs;
+    GHashTable *vprogs;         /* vertex programs, by IR hash */
+    GlProg *setup;              /* the set-up program, once asked for */
     GlSeg *seg;
     uint8_t **blk;              /* the shadow, per 64 KiB, NULL: none yet */
     uint32_t *pchk;             /* per page: epoch it was last checked */
@@ -893,6 +962,62 @@ static void gl_run_sync(HD5770Gl *g)
     g_array_free(rl, true);
 }
 
+/* a uniform of the program in use */
+static void gl_uniform(GlProg *p, const char *name, GLuint v)
+{
+    p_glUniform1ui(p_glGetUniformLocation(p->prog, name), v);
+}
+
+/* the vertex stage's buffer i, at least len bytes, bound at binding */
+static void gl_vbuf(HD5770Gl *g, unsigned i, size_t len, GLuint binding)
+{
+    if (!g->vbuf[i]) {
+        p_glGenBuffers(1, &g->vbuf[i]);
+    }
+    p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->vbuf[i]);
+    p_glBufferData(GL_SHADER_STORAGE_BUFFER, MAX(len, 16), NULL,
+                   GL_STREAM_READ);
+    p_glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, g->vbuf[i]);
+}
+
+/* JOB_VS on the GL thread */
+static void gl_run_vs(HD5770Gl *g, GlSeg *s, GlVs *v)
+{
+    v->ok = false;
+    gl_run_seg(g, s);
+    if (qatomic_read(&g->dead)) {
+        return;
+    }
+    if (!v->vp->prog) {
+        gl_load_prog(g, v->vp);
+    }
+    if (v->sp && !v->sp->prog) {
+        gl_load_prog(g, v->sp);
+    }
+    if (!v->vp->prog || (v->sp && !v->sp->prog)) {
+        return;
+    }
+    gl_vbuf(g, 0, v->rlen, 8);
+    p_glUseProgram(v->vp->prog);
+    gl_uniform(v->vp, "vso", v->vso);
+    p_glDispatchCompute(DIV_ROUND_UP(v->nvtx, GL_TILE), 1, 1);
+    if (v->sp) {
+        p_glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        gl_vbuf(g, 1, v->sclen, 9);
+        p_glUseProgram(v->sp->prog);
+        gl_uniform(v->sp, "suo", v->suo);
+        p_glDispatchCompute(DIV_ROUND_UP(v->nemit, GL_TILE), 1, 1);
+    }
+    p_glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->vbuf[0]);
+    p_glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, v->rlen, v->rec);
+    if (v->sp) {
+        p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->vbuf[1]);
+        p_glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, v->sclen, v->sc);
+    }
+    v->ok = gl_check(g, "running a vertex stage");
+}
+
 static void gl_close_ctx(HD5770Gl *g)
 {
     unsigned i;
@@ -1182,9 +1307,16 @@ static void *gl_thread(void *opaque)
                 gl_run_sync(g);
             }
             break;
+        case JOB_VS:
+            gl_run_vs(g, j->seg, j->vs);
+            seg_free(j->seg);
+            break;
         default:
             if (g->buf[0]) {
                 p_glDeleteBuffers(B_N, g->buf);
+            }
+            if (g->vbuf[0]) {
+                p_glDeleteBuffers(2, g->vbuf);
             }
             quit = true;
             break;
@@ -2241,6 +2373,229 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     return true;
 }
 
+/* a vertex stage program (src: its GLSL), built on the GL thread */
+static GlProg *gl_vsprog(HD5770Gl *g, GlProg *p, uint64_t hash, char *src)
+{
+    GlJob j = { .kind = JOB_COMPILE };
+
+    if (!p) {
+        p = g_new0(GlProg, 1);
+        p->hash = hash;
+        p->src = src;
+        j.prog = p;
+        gl_job(g, &j, true);
+    } else {
+        g_free(src);
+    }
+    return p;
+}
+
+/* buffer b of a vertex stage into the copy, its words in gb */
+static void gl_vs_buf(HD5770Gl *g, const HD5770GpuSurf *b, GBuf *gb)
+{
+    memset(gb, 0, sizeof(*gb));
+    if (b->space) {
+        gb->voff = g->vram_size;
+        gb->space = 1;
+        gb->pt_off = gl_ram_surf(g, b, 0, UINT32_MAX, false);
+        gb->pg0 = b->pg0;
+    } else {
+        gb->voff = b->voff;
+        if (b->s.pitch) {
+            gl_need(g, b->voff, b->voff + b->s.pitch);
+        }
+    }
+}
+
+static bool gl_vs_fits(HD5770Gl *g, const HD5770GpuSurf *b, uint32_t *need)
+{
+    if (b->space) {
+        *need += gl_slots_new(g, b, 0, UINT32_MAX);
+        return g->ram_host != NULL;
+    }
+    return b->voff + b->s.pitch <= g->vram_size;
+}
+
+/*
+ * HD5770GpuOps.vs_records: after a sync, the vertex shader (and with tri
+ * the set-up) alone, waited for
+ */
+static bool gl_vs_records(void *opaque, const HD5770GpuVs *v, uint32_t *rec,
+                          HD5770GpuTri *tri, float *prm, unsigned *ntri)
+{
+    HD5770Gl *g = opaque;
+    uint64_t hash = v->ir->hash;
+    unsigned nemit = tri ? hd5770_vs_emits(v, NULL) : 0;
+    unsigned k = v->clip_on ? 3 : 1, i, q;
+    size_t nvtx = (size_t)v->nslot * v->ninst;
+    size_t ps = MAX((size_t)v->ninputs * 12, 4);
+    size_t nsl = (size_t)nemit * k;
+    GlVs vs = { 0 };
+    GlJob j = { .kind = JOB_VS };
+    GVsDraw vd;
+    GSetup su;
+    uint32_t need = 0, *em;
+    GArray *w;
+
+    if (qatomic_read(&g->dead) || !nvtx ||
+        DIV_ROUND_UP(nvtx, GL_TILE) > GL_GROUPS ||
+        DIV_ROUND_UP(nemit, GL_TILE) > GL_GROUPS ||
+        nsl * (GL_TRI_SLOT + ps) * 4 > (1u << 30)) {
+        return false;
+    }
+    vs.vp = g_hash_table_lookup(g->vprogs, &hash);
+    if (!vs.vp) {
+        vs.vp = gl_vsprog(g, NULL, hash, hd5770_glsl_vs_program(v->ir));
+        g_hash_table_insert(g->vprogs, g_memdup2(&hash, sizeof(hash)), vs.vp);
+    }
+    if (tri && !g->setup) {
+        g->setup = gl_vsprog(g, NULL, 0x5e7a9, hd5770_glsl_setup_program());
+    }
+    if (qatomic_load_acquire(&vs.vp->state) != GLP_READY ||
+        (tri && qatomic_load_acquire(&g->setup->state) != GLP_READY)) {
+        return false;
+    }
+    gl_sync(g);
+    for (i = 0; i < 2; i++) {
+        bool ok = true;
+
+        need = 0;
+        if (v->idx_kind == 1 && v->ib_max) {
+            ok &= gl_vs_fits(g, &v->ib, &need);
+        }
+        for (q = 0; q < v->nvb; q++) {
+            ok &= gl_vs_fits(g, &v->vb[q].buf, &need);
+        }
+        if (!ok) {
+            return false;
+        }
+        if (g->nused + need <= g->nslots) {
+            break;
+        }
+        if (i || g->pool_busy) {
+            return false;
+        }
+        gl_pool_reset(g);
+    }
+    memset(&vd, 0, sizeof(vd));
+    vd.nslot = v->nslot;
+    vd.ninst = v->ninst;
+    vd.rec_words = HD5770_VS_REC(v->np);
+    vd.np = v->np;
+    vd.kv_off = gl_words(g, v->kv, (size_t)v->ir->nconsts * 4);
+    vd.cfile_off = gl_words(g, v->cfile, 4096);
+    vd.nvb = v->nvb;
+    vd.base_vtx = v->base_vtx;
+    vd.start_inst = v->start_inst;
+    vd.idx_kind = v->idx_kind;
+    vd.ib_i32 = v->ib_i32;
+    vd.ib_swap = v->ib_swap;
+    vd.ib_max = v->ib_max;
+    vd.ioff = v->ioff;
+    vd.lo = v->lo;
+    vd.hi = v->hi;
+    vd.restart = v->restart;
+    vd.reset = v->reset;
+    if (v->idx_kind == 2) {
+        vd.imm_off = gl_words(g, v->imm, (size_t)v->nslot * 4);
+    }
+    if (v->idx_kind == 1 && v->ib_max) {
+        gl_vs_buf(g, &v->ib, &vd.ib);
+    }
+    for (i = 0; i < v->nvb; i++) {
+        vd.vb[i].id = v->vb[i].id;
+        memcpy(vd.vb[i].res, v->vb[i].res, sizeof(vd.vb[i].res));
+        gl_vs_buf(g, &v->vb[i].buf, &vd.vb[i].b);
+    }
+    vs.vso = gl_words(g, &vd, sizeof(vd));
+    vs.nvtx = nvtx;
+    vs.rlen = nvtx * HD5770_VS_REC(v->np) * 4;
+    vs.rec = rec;
+    if (nemit) {
+        w = g->seg->a[B_WORDS];
+        i = w->len;
+        g_array_set_size(w, i + (size_t)nemit * 5);
+        em = &g_array_index(w, uint32_t, i);
+        hd5770_vs_emits(v, em);
+        memset(&su, 0, sizeof(su));
+        su.nemit = nemit;
+        su.nvtx = nvtx;
+        su.rec_words = HD5770_VS_REC(v->np);
+        su.k = k;
+        su.prims_off = i;
+        su.rec_off = 0;
+        su.tri_off = 0;
+        su.prm_off = nsl * GL_TRI_SLOT;
+        su.prm_st = ps;
+        su.ninputs = v->ninputs;
+        su.flat = v->flat;
+        su.vte = v->vte;
+        su.sc_mode = v->sc_mode;
+        su.wofs = v->window_offset;
+        su.clip_on = v->clip_on;
+        su.clip_dx = v->clip_dx;
+        su.clip_near = v->clip_near;
+        su.clip_far = v->clip_far;
+        su.cull = v->cull;
+        su.face_cw = v->face_cw;
+        su.prov_last = v->prov_last;
+        su.zfmt = v->zfmt;
+        su.poly_bits = v->poly_db_bits;
+        su.pix_center = v->pix_center;
+        su.x0 = v->x0;
+        su.y0 = v->y0;
+        su.x1 = v->x1;
+        su.y1 = v->y1;
+        memcpy(su.vport, v->vport, sizeof(su.vport));
+        memcpy(su.poly_scale, v->poly_scale, sizeof(su.poly_scale));
+        memcpy(su.poly_units, v->poly_units, sizeof(su.poly_units));
+        su.poly_clamp = v->poly_clamp;
+        su.np = v->np;
+        memcpy(su.src, v->src, sizeof(su.src));
+        memcpy(su.def, v->def, sizeof(su.def));
+        vs.suo = gl_words(g, &su, sizeof(su));
+        vs.sp = g->setup;
+        vs.nemit = nemit;
+        vs.sclen = nsl * (GL_TRI_SLOT + ps) * 4;
+        vs.sc = g_malloc(MAX(vs.sclen, 4));
+    }
+    /* the uploads and words as a segment of their own */
+    j.seg = g->seg;
+    j.vs = &vs;
+    g->seg = seg_new();
+    gl_job(g, &j, true);
+    if (vs.ok && tri) {
+        *ntri = 0;
+        for (i = 0; i < nsl; i++) {
+            const uint32_t *t = vs.sc + (size_t)i * GL_TRI_SLOT;
+            HD5770GpuTri *o = &tri[*ntri];
+
+            if ((int32_t)t[12] < (int32_t)t[10]) {
+                continue;
+            }
+            for (q = 0; q < 3; q++) {
+                memcpy(&o->x[q], &t[q], 4);
+                memcpy(&o->y[q], &t[3 + q], 4);
+                memcpy(&o->w[q], &t[6 + q], 4);
+                memcpy(&o->z[q], &t[14 + q], 4);
+            }
+            memcpy(&o->area, &t[9], 4);
+            o->x0 = t[10];
+            o->y0 = t[11];
+            o->x1 = t[12];
+            o->y1 = t[13];
+            o->prim = 0;
+            o->front = t[17];
+            memcpy(prm + (size_t)*ntri * v->ninputs * 12,
+                   vs.sc + nsl * GL_TRI_SLOT + i * ps,
+                   (size_t)v->ninputs * 48);
+            (*ntri)++;
+        }
+    }
+    g_free(vs.sc);
+    return vs.ok;
+}
+
 static void gl_stats(void *opaque, GString *out)
 {
     HD5770Gl *g = opaque;
@@ -2301,6 +2656,10 @@ static void gl_close(void *opaque)
     g_queue_free(g->cq);
     qemu_cond_destroy(&g->ccond);
     g_hash_table_destroy(g->progs);
+    g_hash_table_destroy(g->vprogs);
+    if (g->setup) {
+        gl_prog_free(g->setup);
+    }
     seg_free(g->seg);
     for (i = 0; i < DIV_ROUND_UP(g->size, 1u << GL_BLK_SH); i++) {
         g_free(g->blk[i]);
@@ -2344,6 +2703,7 @@ static const HD5770GpuOps gl_ops = {
     .resinfo = true,
     .full = true,
     .wrote = gl_wrote,
+    .vs_records = gl_vs_records,
 };
 
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)
@@ -2375,6 +2735,8 @@ HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size, const char **err)
     *err = NULL;
     g->progs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                      gl_prog_free);
+    g->vprogs = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
+                                      gl_prog_free);
     qemu_cond_init(&g->ccond);
     g->cq = g_queue_new();
     for (i = 0; i < g->nworkers; i++) {
