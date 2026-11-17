@@ -426,7 +426,9 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
  * provoking vertex), the position in GPR pos_gpr (-1 none). The target
  * is a host texture of rt_bytes (1 or 4) 8-bit channels: with out 0,
  * channel i is component rt_src[i] of rt_comps (1 or 4) as UNORM; with
- * out 1 the channels are the bytes of component rt_src[0] as an integer.
+ * out 1 the channels are the bytes of component rt_src[0] as an integer;
+ * with out 2 the texture's channels are floats, channel i component
+ * rt_src[i].
  * clip: the clip rectangle rule applies. vb[0..nvb-1]: the buffers of
  * its vertex fetches, as HD5770GpuDraw.vb, with the format, number type
  * and sign of the resource. mip[i]: texture unit i is mipmapped, with

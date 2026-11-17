@@ -9,7 +9,8 @@
  *
  * SURFACES. Targets and textures are host textures holding the bytes of
  * the guest surface (RGBA8, R8 or R16 by the element size: byte i of an
- * element in channel i, a 16-bit element in one), in bands of rows: a
+ * element in channel i, a 16-bit element in one; RGBA16Float for
+ * 16_16_16_16_FLOAT), in bands of rows: a
  * band is held once a draw needs it (a texture's rows, the rows a draw
  * covers of its target), with a shadow of its bytes. At a band's first
  * use after each sync, and after wrote() or a write-back over its
@@ -30,11 +31,13 @@
  * The host tests the fragment's depth unrounded against a plane that
  * holds unrounded depths where it drew.
  *
- * Accepted: one colour target (8_8_8_8 or 8 UNORM, 8 or 32 integer) in
+ * Accepted: one colour target (8_8_8_8 or 8 UNORM, 16_16_16_16_FLOAT, 8
+ * or 32 integer) in
  * VRAM or guest RAM, or none; depth and stencil planes in VRAM with
  * tests, writes, two-sided stencil and the clears; programs in the
  * straight form with texture fetches, RESINFO and vertex fetches of 8
- * and 32 bit elements; 2D 8_8_8_8, 8 and 16 UNORM textures, mipmapped
+ * and 32 bit elements; 2D 8_8_8_8, 8 and 16 UNORM and
+ * 16_16_16_16_FLOAT textures, mipmapped
  * ones with each level an entry; clip rectangles. Builds are
  * synchronous.
  *
@@ -92,14 +95,17 @@ typedef struct NatU {
 } NatU;
 
 /* host formats: the element's bytes */
-enum { NF_RGBA8, NF_R8, NF_R16, NF_D16, NF_D24, NF_D32, NF_S8, NF_N };
+enum {
+    NF_RGBA8, NF_R8, NF_R16, NF_D16, NF_D24, NF_D32, NF_S8, NF_RGBA16F, NF_N
+};
 
 static const MTLPixelFormat nf_fmt[NF_N] = {
     MTLPixelFormatRGBA8Unorm, MTLPixelFormatR8Unorm, MTLPixelFormatR16Unorm,
     MTLPixelFormatDepth16Unorm, MTLPixelFormatDepth32Float,
     MTLPixelFormatDepth32Float, MTLPixelFormatStencil8,
+    MTLPixelFormatRGBA16Float,
 };
-static const uint8_t nf_bpe[NF_N] = { 4, 1, 2, 2, 4, 4, 1 };
+static const uint8_t nf_bpe[NF_N] = { 4, 1, 2, 2, 4, 4, 1, 8 };
 
 #define NAT_BAND        32      /* rows compared and uploaded together */
 #define NAT_RECTS       4
@@ -174,7 +180,7 @@ typedef struct HD5770Mtlr {
     /* HD5770_NAT_AUDIT */
     bool audit;
     uint64_t au_bands, au_bytes, au_named, au_ram, au_missed, au_pages;
-    uint64_t au_events, au_lines;
+    uint64_t au_events, au_lines, au_db;
     int64_t au_ns;
 } HD5770Mtlr;
 
@@ -1184,6 +1190,10 @@ static unsigned nat_tex_fmt(const HD5770GpuTex *t)
     if (t->unorm8) {
         return NF_RGBA8;
     }
+    if (t->fmt == HD5770_FMT_16_16_16_16_FLOAT && t->is_float &&
+        t->comps == 4) {
+        return NF_RGBA16F;
+    }
     if (t->num != HD5770_NUM_NORM || t->sgn || t->comps != 1) {
         return NF_N;
     }
@@ -1278,7 +1288,12 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         for (i = 0; i < 4; i++) {
             perm |= d->rt_src[i] < 4 ? 1u << d->rt_src[i] : 0x10;
         }
-        if (!d->rt_unorm8 || d->rt_comps != 4 || d->rt_float || perm != 0xf) {
+        if (d->rt_fmt == HD5770_FMT_16_16_16_16_FLOAT && d->rt_float &&
+            d->rt_comps == 4 && perm == 0xf) {
+            /* floats as they are */
+            k.out = 2;
+        } else if (!d->rt_unorm8 || d->rt_comps != 4 || d->rt_float ||
+                   perm != 0xf) {
             return nat_decline(m, ND_RT_FMT, HD5770_WHY_BK_SURF);
         }
         if (blend && d->rt_src[3] != 3) {
@@ -1287,7 +1302,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         for (i = 0; i < 4; i++) {
             mask |= ((d->wmask >> d->rt_src[i]) & 1) << i;
         }
-        rhf = NF_RGBA8;
+        rhf = k.out == 2 ? NF_RGBA16F : NF_RGBA8;
     }
     if (!mask && d->db) {
         color = false;
@@ -1719,6 +1734,7 @@ static void nat_audit(HD5770Mtlr *m)
             }
             nat_band(e, b, &a, &z);
             m->au_bands++;
+            m->au_db += e->hf >= NF_D16 && e->hf <= NF_S8;
             m->au_bytes += z - a;
             for (o = a; o < z; ) {
                 size_t n;
@@ -1891,12 +1907,13 @@ static void nat_stats(void *opaque, GString *out)
                            s->len ? g_array_index(s, float, s->len - 1) : 0.0f);
     if (m->audit) {
         g_string_append_printf(out, "native: audit: bands compared %" PRIu64
-                               " (%" PRIu64 " MB), differing and named %"
+                               " (%" PRIu64 " MB; depth and stencil %" PRIu64
+                               "), differing and named %"
                                PRIu64 ", differing in guest RAM %" PRIu64
                                ", missed writes: %" PRIu64 " bands (%" PRIu64
                                " band-syncs, %" PRIu64 " pages), ms %" PRId64
                                "\n", m->au_bands, m->au_bytes >> 20,
-                               m->au_named, m->au_ram, m->au_events,
+                               m->au_db, m->au_named, m->au_ram, m->au_events,
                                m->au_missed, m->au_pages,
                                m->au_ns / 1000000);
     }

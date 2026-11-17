@@ -3177,8 +3177,9 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         /* byte i of the target is channel rt_src[i] */
         g_string_append_printf(o,
             "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
-            "    r = select(r, float4(0.0f), isnan(r));\n",
-            k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+            "%s",
+            k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3,
+            k->out == 2 ? "" : "    r = select(r, float4(0.0f), isnan(r));\n");
     }
     if (k->zout) {
         g_string_append(o,
