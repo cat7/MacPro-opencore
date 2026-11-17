@@ -2698,8 +2698,12 @@ const char *hd5770_msl_alu(void)
     return alu;
 }
 
-/* a TEX fetch as a sample of the unit's host texture */
-static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
+/*
+ * a TEX fetch as a sample of the unit's host texture; a VTX fetch as
+ * vfetch_stage() in ati_hd5770_draw.c reads an 8 or 32 bit element
+ */
+static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
+                      const HD5770NatKey *key)
 {
     unsigned k, unit, op = f->w[0] & 0x1f;
     int ox = ((int32_t)(f->w[2] << 27)) >> 27;
@@ -2718,6 +2722,61 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f)
                 g_string_append_printf(o, "        o[%u] = U(0.0f);\n", k);
             }
         }
+    } else if (f->kind == HD5770_IRF_VTX) {
+        unsigned bid = (f->w[0] >> 8) & 0xff, fmt, num, sgn, n;
+
+        for (k = 0; k < key->nvb && key->vb[k].id != bid; k++) {
+            /* search */
+        }
+        if (k == key->nvb) {
+            return false;
+        }
+        if ((f->w[1] >> 21) & 1) {
+            fmt = key->vb[k].fmt;
+            num = key->vb[k].num;
+            sgn = key->vb[k].sgn;
+        } else {
+            fmt = (f->w[1] >> 22) & 0x3f;
+            num = (f->w[1] >> 28) & 3;
+            sgn = (f->w[1] >> 30) & 1;
+        }
+        if (fmt != 0x01 && fmt != 0x0d) {
+            return false;
+        }
+        n = fmt == 0x01 ? 1 : 4;
+        g_string_append_printf(o,
+            "        uint ix = R0[%u][%u], st = u.vbi[%u].x, ln = u.vbi[%u].y;\n"
+            "        o[3] = U(1.0f);\n"
+            "        if ((st == 0u || ix <= ln / st) && ix * st + %uu <= ln) {\n"
+            "            uint at = ix * st + %uu;\n",
+            f->src, (f->w[0] >> 24) & 3, k, k, (f->w[2] & 0xffff) + n,
+            f->w[2] & 0xffff);
+        if (n == 1) {
+            g_string_append_printf(o, "            uint c = vb%u[at];\n", k);
+            if (sgn) {
+                g_string_append(o, "            c = uint(int(c << 24) >> 24);\n");
+            }
+        } else {
+            g_string_append_printf(o,
+                "            uint c = uint(vb%u[at]) | uint(vb%u[at + 1u]) << 8 |\n"
+                "                     uint(vb%u[at + 2u]) << 16 | uint(vb%u[at + 3u]) << 24;\n",
+                k, k, k, k);
+        }
+        if (num == 1) {
+            g_string_append(o, "            o[0] = c;\n");
+        } else if (num != 0) {
+            g_string_append_printf(o, "            o[0] = U(float(%sc));\n",
+                                   sgn ? "(int)" : "");
+        } else if (n == 4) {
+            g_string_append_printf(o, "            o[0] = U(float(%sc) / %s);\n",
+                                   sgn ? "(int)" : "",
+                                   sgn ? "2147483647.0f" : "4294967295.0f");
+        } else if (sgn) {
+            g_string_append(o, "            o[0] = U(max(float((int)c) / 127.0f, -1.0f));\n");
+        } else {
+            g_string_append(o, "            o[0] = U(float(c) / 255.0f);\n");
+        }
+        g_string_append(o, "        }\n");
     } else if (f->kind != HD5770_IRF_TEX ||
                !(op == 0x03 || (op >= 0x10 && op <= 0x13))) {
         return false;
@@ -2780,7 +2839,8 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
     unsigned i, j, ng = MAX(ir->ngpr, 1u);
     uint32_t iflat = 0, ivar = 0;
 
-    if (ir->cf || ir->vs || ir->zexport || ir->cmask != 1 || k->ninputs > 32) {
+    if (ir->cf || ir->vs || ir->zexport || ir->cmask != 1 || k->ninputs > 32 ||
+        k->nvb > HD5770_GPU_VB) {
         return NULL;
     }
     for (i = 0; i < ir->ninsts; i++) {
@@ -2801,10 +2861,13 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    uint4 twrap[16];\n"
         "    float4 tborder[16];\n"
         "    float4 vp;\n"
+        "    uint4 vbi[8];\n"
+        "    int4 cr[4];\n"
         "    float alpha_ref;\n"
         "    uint alpha_func;\n"
         "    float pc;\n"
         "    uint persp;\n"
+        "    uint cliprule;\n"
         "};\n"
         "struct NV {\n    float4 pos [[position]];\n");
     for (i = 0; i < k->ninputs; i++) {
@@ -2892,6 +2955,10 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "}\n"
         "fragment float4 hd_nfs(NF in [[stage_in]], constant NU &u [[buffer(0)]],\n"
         "                       constant uint *kv [[buffer(1)]]");
+    for (i = 0; i < k->nvb; i++) {
+        g_string_append_printf(o, ",\n    const device uchar *vb%u [[buffer(%u)]]",
+                               i, 2 + i);
+    }
     for (i = 0; i < ir->nres; i++) {
         g_string_append_printf(o, ",\n    texture2d<float> t%u [[texture(%u)]], "
                                "sampler s%u [[sampler(%u)]]", i, i, i, i);
@@ -2928,7 +2995,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             break;
         case HD5770_IRO_FETCH:
             for (j = 0; j < op->n; j++) {
-                if (!nat_fetch(o, ir, &ir->fetches[op->first + j])) {
+                if (!nat_fetch(o, ir, &ir->fetches[op->first + j], k)) {
                     g_string_free(o, true);
                     return NULL;
                 }
@@ -2939,13 +3006,43 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             break;
         }
     }
-    /* byte i of the target is channel rt_src[i] */
-    g_string_append_printf(o,
+    if (k->clip) {
+        /* clip_pass() in ati_hd5770_draw.c */
+        g_string_append(o,
+            "    {\n"
+            "        int2 p = int2(in.pos.xy);\n"
+            "        uint idx = 0;\n"
+            "        for (uint i = 0; i < 4; i++) {\n"
+            "            if (p.x >= u.cr[i].x && p.x < u.cr[i].z && p.y >= u.cr[i].y &&\n"
+            "                p.y < u.cr[i].w) {\n"
+            "                idx |= 1u << i;\n"
+            "            }\n"
+            "        }\n"
+            "        killed = killed || !((u.cliprule >> idx) & 1u);\n"
+            "    }\n");
+    }
+    g_string_append(o,
         "    if (killed || !(cm & 1) || !hd_nalpha(u.alpha_func, u.alpha_ref, F(C[0][3]))) {\n"
         "        discard_fragment();\n"
-        "    }\n"
-        "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
-        "    return select(r, float4(0.0f), isnan(r));\n"
-        "}\n", k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+        "    }\n");
+    if (k->out == 1) {
+        /* an integer target: the bytes of the channel */
+        g_string_append_printf(o,
+            "    uint v = C[0][%u];\n"
+            "    return float4(float(v & 0xffu), float((v >> 8) & 0xffu),\n"
+            "                  float((v >> 16) & 0xffu), float(v >> 24)) / 255.0f;\n"
+            "}\n", k->rt_src[0] & 3);
+    } else if (k->rt_comps == 1) {
+        g_string_append_printf(o,
+            "    float4 r = float4(F(C[0][%u]), 0.0f, 0.0f, 0.0f);\n"
+            "    return select(r, float4(0.0f), isnan(r));\n"
+            "}\n", k->rt_src[0] & 3);
+    } else {
+        /* byte i of the target is channel rt_src[i] */
+        g_string_append_printf(o,
+            "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
+            "    return select(r, float4(0.0f), isnan(r));\n"
+            "}\n", k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3);
+    }
     return g_string_free(o, false);
 }
