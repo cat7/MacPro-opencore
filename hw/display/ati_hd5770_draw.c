@@ -560,6 +560,16 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
 }
 
 /*
+ * A read minds only what queued draws write: with the native pipeline.
+ * The other backends are waited for by any use of the bytes, as they
+ * expect (their copies and pools turn over at a sync).
+ */
+static bool rd_written(const HD5770Gfx *g)
+{
+    return g->gpu && g->gpu->ops->native;
+}
+
+/*
  * queued draws use VRAM [off, off + len); vb: or read it in place;
  * rd: write it
  */
@@ -568,6 +578,7 @@ static bool pend_hit(const HD5770Gfx *g, uint64_t off, uint64_t len, bool vb,
 {
     unsigned i;
 
+    rd &= rd_written(g);
     for (i = 0; rd && i < g->nwpend; i++) {
         if (off < g->wpend[i][1] && g->wpend[i][0] < off + len) {
             return true;
@@ -705,8 +716,9 @@ static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
 {
     uint64_t off, n;
     uint8_t *p;
+    bool ram = rd_written(g) ? g->ram_wpend : g->ram_pend;
 
-    if (!g->nwpend && !g->ram_wpend) {
+    if (!(rd_written(g) ? g->nwpend : g->npend) && !ram) {
         return;
     }
     if (vram_off(g, mc, len, &off)) {
@@ -717,7 +729,7 @@ static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
     if (p && p >= g->vram && p < g->vram + g->vram_size && n >= len) {
         /* VRAM through a GART page */
         pend_touch(g, p - g->vram, len, false);
-    } else if (g->ram_wpend || !p ||
+    } else if (ram || !p ||
                (p >= g->vram && p < g->vram + g->vram_size)) {
         hd5770_gfx_sync(g);
     }
