@@ -176,6 +176,7 @@ static const uint8_t nf_bpe[NF_N] = {
 #define NF_BLK(hf)      ((hf) >= NF_BC1 ? 4u : 1u)
 
 #define NAT_BAND        32      /* rows compared and uploaded together */
+#define NAT_HASH        4096
 #define NAT_RECTS       4
 
 typedef struct NatSurf {
@@ -219,6 +220,8 @@ typedef struct NatSurf {
     int nr, r[NAT_RECTS][4];    /* where: x0, y0, x1, y1 */
     size_t ro[NAT_RECTS];       /* their pixels in the read buffer */
     uint64_t used;
+    struct NatSurf *hnext;      /* the next entry of its hash chain */
+    bool act;                   /* listed in HD5770Mtlr.act */
 } NatSurf;
 
 /* a rectangle a fence writes back */
@@ -263,6 +266,8 @@ typedef struct HD5770Mtlr {
     bool pk_ok;                 /* 4_4_4_4 is a format */
     bool zlazy;                 /* planes drawn stay out of a fence */
     GPtrArray *surfs;
+    NatSurf *hb[NAT_HASH];      /* the entries by where they start */
+    GPtrArray *act;             /* the entries newer than memory or in flight */
     GArray *ranges;
     id<MTLCommandBuffer> last;
     id<MTLCommandBuffer> cb;
@@ -1101,6 +1106,16 @@ static void nat_fly(NatSurf *e, const int *rc, int by)
     e->nfly += by;
 }
 
+static inline unsigned nat_hash(unsigned space, uint64_t at)
+{
+    return ((at >> 8) * 0x9e3779b97f4a7c15ull + space) >> 52;
+}
+
+static inline unsigned nat_hash_of(const NatSurf *e)
+{
+    return nat_hash(e->space, e->space ? e->pages[0] : e->voff);
+}
+
 /*
  * The fences whose command buffers are complete, oldest first: their
  * rectangles to memory, the ranges reported (lk held)
@@ -1248,8 +1263,8 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
     int k;
 
     nat_drain(m);
-    for (i = 0; i < m->surfs->len; i++) {
-        NatSurf *e = g_ptr_array_index(m->surfs, i);
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->act, i);
 
         if (!e->dirty || (only && e != only)) {
             continue;
@@ -1295,8 +1310,8 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
     }
     nat_wait(m);
     t0 = get_clock();
-    for (i = 0; i < m->surfs->len; i++) {
-        NatSurf *e = g_ptr_array_index(m->surfs, i);
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->act, i);
         uint32_t bpe = e->s.bpe;
 
         if (!e->dirty || (only && e != only)) {
@@ -1337,8 +1352,8 @@ static void nat_fenced(HD5770Mtlr *m)
     unsigned i;
 
     m->pub.kept = false;
-    for (i = 0; i < m->surfs->len; i++) {
-        NatSurf *e = g_ptr_array_index(m->surfs, i);
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->act, i);
 
         m->pub.kept |= e->dirty;
         e->recent = false;
@@ -1377,8 +1392,8 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
     unsigned i, n = 0;
     int k;
 
-    for (i = 0; i < m->surfs->len; i++) {
-        NatSurf *e = g_ptr_array_index(m->surfs, i);
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->act, i);
 
         for (k = 0; e->dirty && !nat_kept(m, e) && k < e->nr; k++) {
             need += ROUND_UP((size_t)(e->r[k][2] - e->r[k][0]) *
@@ -1421,8 +1436,8 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
         f->rc = g_new(NatRect, n);
         f->buf = buf;
         bl = [cb blitCommandEncoder];
-        for (i = 0; i < m->surfs->len; i++) {
-            NatSurf *e = g_ptr_array_index(m->surfs, i);
+        for (i = 0; i < m->act->len; i++) {
+            NatSurf *e = g_ptr_array_index(m->act, i);
 
             if (nat_kept(m, e)) {
                 m->kept_rects += e->dirty ? e->nr : 0;
@@ -1468,12 +1483,17 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
 }
 
 /* the rectangle joins the ones drawn */
-static void nat_drew(NatSurf *e, int x0, int y0, int x1, int y1)
+static void nat_drew(HD5770Mtlr *m, NatSurf *e, int x0, int y0, int x1,
+                     int y1)
 {
     int k, n = 0;
 
     e->dirty = true;
     e->recent = true;
+    if (!e->act) {
+        e->act = true;
+        g_ptr_array_add(m->act, e);
+    }
     for (k = 0; k < e->nr; k++) {
         int *r = e->r[k];
 
@@ -1491,7 +1511,7 @@ static void nat_drew(NatSurf *e, int x0, int y0, int x1, int y1)
     if (n < e->nr) {
         /* the larger rectangle may touch others */
         e->nr = n;
-        nat_drew(e, x0, y0, x1, y1);
+        nat_drew(m, e, x0, y0, x1, y1);
         return;
     }
     e->r[n][0] = x0;
@@ -1526,6 +1546,7 @@ static uint64_t nat_bytes(const NatSurf *e)
 /* drops the entries last used before sync number before, but this draw's */
 static void nat_evict(HD5770Mtlr *m, uint64_t before)
 {
+    NatSurf **h;
     unsigned i;
 
     for (i = m->surfs->len; i-- > 0; ) {
@@ -1539,6 +1560,13 @@ static void nat_evict(HD5770Mtlr *m, uint64_t before)
                 nat_end_pass(m);
             }
             m->bytes -= nat_bytes(e);
+            for (h = &m->hb[nat_hash_of(e)]; *h != e; h = &(*h)->hnext) {
+                /* search */
+            }
+            *h = e->hnext;
+            if (e->act) {
+                g_ptr_array_remove_fast(m->act, e);
+            }
             g_ptr_array_remove_index_fast(m->surfs, i);
         }
     }
@@ -1566,6 +1594,25 @@ static bool nat_same(const NatSurf *e, const HD5770GpuSurf *s, unsigned hf)
            !memcmp(e->pages, s->pages, s->npages * sizeof(uint32_t));
 }
 
+/* the entry that holds the surface in host format hf, if there is one */
+static NatSurf *nat_find(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
+{
+    NatSurf *e;
+
+    if (s->space && !s->npages) {
+        return NULL;
+    }
+    for (e = m->hb[nat_hash(s->space, s->space ? s->pages[0] : s->voff)]; e;
+         e = e->hnext) {
+        if (nat_same(e, s, hf)) {
+            e->used = m->epoch;
+            e->pin = m->seq;
+            return e;
+        }
+    }
+    return NULL;
+}
+
 /* a surface the pipeline can hold in host format hf: its entry, else NULL */
 static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
 {
@@ -1579,13 +1626,9 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
         !hd5770_surf_mode_ok(s->s.mode)) {
         return NULL;
     }
-    for (i = 0; i < m->surfs->len; i++) {
-        e = g_ptr_array_index(m->surfs, i);
-        if (nat_same(e, s, hf)) {
-            e->used = m->epoch;
-            e->pin = m->seq;
-            return e;
-        }
+    e = nat_find(m, s, hf);
+    if (e || (s->space && !s->npages)) {
+        return e;
     }
     hd5770_surf_rows(&s->s, 0, s->s.height, &lo, &hi);
     cov = MAX(hd5770_surf_size(&s->s), hi - s->s.base);
@@ -1692,6 +1735,9 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     e->pin = m->seq;
     m->bytes += nat_bytes(e);
     g_ptr_array_add(m->surfs, e);
+    i = nat_hash_of(e);
+    e->hnext = m->hb[i];
+    m->hb[i] = e;
     return e;
 }
 
@@ -1703,10 +1749,15 @@ static void nat_ready(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
 {
     unsigned i;
 
-    for (i = 0; i < m->surfs->len; i++) {
-        NatSurf *f = g_ptr_array_index(m->surfs, i);
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *f = g_ptr_array_index(m->act, i);
 
-        if (f != e && (f->dirty || f->nfly) && nat_alias(f, e)) {
+        if (!f->dirty && !f->nfly) {
+            f->act = false;
+            g_ptr_array_remove_index_fast(m->act, i--);
+            continue;
+        }
+        if (f != e && nat_alias(f, e)) {
             if (f->dirty) {
                 nat_writeback(m, f);
             } else {
@@ -2865,13 +2916,13 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         zs->vsm |= bit;
     }
     for (i = 0; i < nt; i++) {
-        nat_drew(tg[i].e, x0, y0, x1, y1);
+        nat_drew(m, tg[i].e, x0, y0, x1, y1);
     }
     if (zwrite) {
-        nat_drew(zs, x0, y0, x1, y1);
+        nat_drew(m, zs, x0, y0, x1, y1);
     }
     if (ss) {
-        nat_drew(ss, x0, y0, x1, y1);
+        nat_drew(m, ss, x0, y0, x1, y1);
     }
     m->nd[ND_TAKEN]++;
     m->tris += d->ntri;
@@ -3198,6 +3249,7 @@ static void nat_close(void *opaque)
     g_mutex_clear(&m->lk);
     g_mutex_clear(&m->rlock);
     g_ptr_array_free(m->surfs, true);
+    g_ptr_array_free(m->act, true);
     g_hash_table_destroy(m->dss);
     [m->ds_off release];
     g_hash_table_destroy(m->psos);
@@ -3314,6 +3366,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->zlazy = !g_strcmp0(g_getenv("HD5770_NAT_ZLAZY") ?: "1", "1");
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
+    m->act = g_ptr_array_new();
     m->ranges = g_array_new(false, false, sizeof(uint64_t));
     m->bufs = g_ptr_array_new();
     g_queue_init(&m->fences);
