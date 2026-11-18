@@ -264,6 +264,7 @@
 #define EG_CP_ME_HALT                   (1u << 28)
 #define EG_CP_PFP_HALT                  (1u << 26)
 #define EG_CP_RB_RPTR                   0x8700
+#define EG_THREADS_ACTIVE               0x8e30  /* name not known */
 #define EG_VGT_PRIMITIVE_TYPE           0x8958
 #define EG_GB_ADDR_CONFIG               0x98f8
 #define EG_GB_ADDR_CONFIG_JUNIPER       0x02010002

@@ -509,7 +509,7 @@ void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 static bool status_reg(ATIHD5770State *s, uint32_t off)
 {
     return s->accel && (off == EG_GRBM_STATUS || off == EG_CP_STAT ||
-                        off == EG_CP_RB_RPTR);
+                        off == EG_CP_RB_RPTR || off == EG_THREADS_ACTIVE);
 }
 
 static uint32_t reg_read_locked(ATIHD5770State *s, uint32_t off)

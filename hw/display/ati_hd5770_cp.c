@@ -1518,6 +1518,14 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
     case EG_CP_STAT:
         *val = s->cp_stalled || qatomic_read(&s->eng_busy) ? 0x80000000u : 0;
         return true;
+    case EG_THREADS_ACTIVE:
+        /*
+         * Bit 30: work in progress. A guest driver whose timestamp is
+         * late goes on waiting while it reads set and reports a hang
+         * when it reads clear; set while the engine runs packets.
+         */
+        *val = qatomic_read(&s->eng_busy) && !s->cp_stalled ? 1u << 30 : 0;
+        return true;
     case EG_CP_COHER_STATUS:
         *val = 0;
         return true;
