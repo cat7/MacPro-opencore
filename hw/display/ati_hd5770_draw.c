@@ -4245,11 +4245,12 @@ static void vs_check(Draw *d, const uint32_t *rec, unsigned np,
 /*
  * One rasteriser per depth plane: the host GPU's interpolated depth and
  * the CPU's differ in the last place, so a LEQUAL or EQUAL pass of one
- * over depth the other wrote loses pixels. Kept for backends with full.
+ * over depth the other wrote loses pixels. Kept for the native pipeline;
+ * the other backends draw as the CPU does.
  */
 static bool zown_on(const HD5770Gfx *g, const Draw *d)
 {
-    return g->gpu && g->gpu_mode == HD5770_GPU_ON && g->gpu->ops->full &&
+    return g->gpu && g->gpu_mode == HD5770_GPU_ON && g->gpu->ops->native &&
            d->db && d->zfmt;
 }
 

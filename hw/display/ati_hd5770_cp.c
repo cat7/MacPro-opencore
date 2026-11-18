@@ -622,8 +622,10 @@ static void fx_run_end(ATIHD5770State *s)
 }
 
 /*
- * SCANOUT FLIPS. The surface CRTC 0 turns to may be one the backend
- * keeps newer than memory. The display goes on showing the surface
+ * SCANOUT FLIPS (native pipeline; the other backends have every surface
+ * in memory when a run ends, and the display shows what the registers
+ * say). The surface CRTC 0 turns to may be one the backend keeps newer
+ * than memory. The display goes on showing the surface
  * before it (ati_hd5770.c) until flip_done equals flip_req: the engine
  * has run every packet written to the ring before the flip, and the
  * fence issued at that point, which writes what lies over the scan
@@ -1448,6 +1450,11 @@ bool ati_hd5770_cp_running(ATIHD5770State *s)
            !qatomic_read(&s->eng_hold);
 }
 
+bool ati_hd5770_cp_native(ATIHD5770State *s)
+{
+    return s->gfx3d.gpu && s->gfx3d.gpu->ops->native;
+}
+
 /* SCANOUT FLIPS above; a run of the engine follows */
 void ati_hd5770_cp_scan(ATIHD5770State *s, uint64_t lo, uint64_t hi)
 {
@@ -1595,8 +1602,12 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
         /*
          * Bit 30: work in progress. A guest driver whose timestamp is
          * late goes on waiting while it reads set and reports a hang
-         * when it reads clear; set while the engine runs packets.
+         * when it reads clear; set while the engine runs packets. Only
+         * the native pipeline's builds make a timestamp that late.
          */
+        if (!ati_hd5770_cp_native(s)) {
+            return false;
+        }
         *val = qatomic_read(&s->eng_busy) && !s->cp_stalled ? 1u << 30 : 0;
         return true;
     case EG_CP_COHER_STATUS:

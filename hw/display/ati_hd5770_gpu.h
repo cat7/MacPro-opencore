@@ -379,6 +379,14 @@ typedef struct HD5770GpuOps {
      * several at a time. NULL: draw() builds as it goes.
      */
     void (*prep)(void *b, const HD5770GpuDraw *d);
+    /*
+     * added 2026-11-18: the native pipeline (below). Its surfaces may
+     * stay newer than memory after a fence and its depth differs from
+     * the CPU's in the last place: for it alone the device records the
+     * scanout's flips, keeps one rasteriser per depth plane and reads
+     * register 0x8e30 busy while the engine has work.
+     */
+    bool native;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {

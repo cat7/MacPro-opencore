@@ -509,7 +509,8 @@ void ati_hd5770_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 static bool status_reg(ATIHD5770State *s, uint32_t off)
 {
     return s->accel && (off == EG_GRBM_STATUS || off == EG_CP_STAT ||
-                        off == EG_CP_RB_RPTR || off == EG_THREADS_ACTIVE);
+                        off == EG_CP_RB_RPTR ||
+                        (off == EG_THREADS_ACTIVE && ati_hd5770_cp_native(s)));
 }
 
 static uint32_t reg_read_locked(ATIHD5770State *s, uint32_t off)
@@ -791,7 +792,7 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
         return false;
     }
     s->refreshes++;
-    if (s->gfx3d.gpu) {
+    if (ati_hd5770_cp_native(s)) {
         ati_hd5770_flip(s, mode);
     }
     memcpy(s->palette, ati_hd5770_dce4_lut(s), sizeof(s->palette));

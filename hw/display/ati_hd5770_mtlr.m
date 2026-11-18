@@ -3864,6 +3864,7 @@ static const HD5770GpuOps nat_ops = {
     .mipmaps = true,
     .resinfo = true,
     .full = true,
+    .native = true,
 };
 
 HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,

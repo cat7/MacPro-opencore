@@ -673,7 +673,7 @@ static void scan_moved(ATIHD5770State *s)
     HD5770Gpu *gpu = s->gfx3d.gpu;
     ATIHD5770Mode m;
 
-    if (!gpu || !ati_hd5770_dce4_scanout(s, &m) ||
+    if (!ati_hd5770_cp_native(s) || !ati_hd5770_dce4_scanout(s, &m) ||
         (qatomic_read(&gpu->scan_lo) == m.fb_offset &&
          qatomic_read(&gpu->scan_hi) == m.fb_offset + m.fb_len)) {
         return;
