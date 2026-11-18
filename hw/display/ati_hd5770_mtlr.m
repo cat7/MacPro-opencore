@@ -68,6 +68,7 @@
 #include "ati_hd5770_gpu.h"
 
 #define NAT_RING        (48u << 20)
+#define NAT_RINGS       3
 #define NAT_READ        (32u << 20)     /* write-backs of one wait */
 #define NAT_CACHE_MAX   (512ull << 20)  /* textures and shadows */
 #define NAT_IDLE        256             /* syncs an unused entry stays */
@@ -247,6 +248,21 @@ typedef struct NatProg {
     id<MTLFunction> vfn, ffn;
 } NatProg;
 
+/* what a wait for the GPU is for */
+enum {
+    NW_UPLOAD,                  /* a pass in flight uses the texture */
+    NW_RING,
+    NW_SYNC,                    /* write-back of everything */
+    NW_ALIAS,                   /* write-back for another view of the bytes */
+    NW_EVICT,
+    NW_RANGE,
+    NW_N,
+};
+
+static const char *const nw_names[NW_N] = {
+    "upload", "ring", "sync", "alias", "evict", "range",
+};
+
 typedef struct HD5770Mtlr {
     HD5770Gpu pub;
     id<MTLDevice> dev;
@@ -254,6 +270,10 @@ typedef struct HD5770Mtlr {
     uint8_t *vram, *ram;
     uint64_t vram_size, ram_size;
     id<MTLBuffer> ring, rbuf;
+    /* ring is rings[ring_i]; ring i is read by passes up to ring_pass[i] */
+    id<MTLBuffer> rings[NAT_RINGS];
+    uint64_t ring_pass[NAT_RINGS];
+    unsigned ring_i;
     id<MTLBuffer> bvram, bram;  /* memory in place, for vertex stages */
     size_t ring_at;
     GHashTable *vprogs;
@@ -301,6 +321,8 @@ typedef struct HD5770Mtlr {
     uint64_t nd[ND_N], tris, passes, waits, uploads, upload_bytes;
     uint64_t wbacks, wback_bytes, checks, cmp_bytes, syncs, first_bytes;
     uint64_t builds, pso_builds, build_ns, draw_build_ns;
+    uint64_t nwait[NW_N], ring_swaps, up_after;
+    int64_t wait_by_ns[NW_N];
     int64_t draw_ns, sync_ns, wait_ns, check_ns, upload_ns, wback_ns;
     uint64_t nfences, fence_empty, fence_now, drains, fly_cmp, holds;
     uint64_t kept_rects, rsyncs;
@@ -391,7 +413,7 @@ static void nat_end_pass(HD5770Mtlr *m)
 }
 
 /* everything encoded is done; lk is released meanwhile */
-static void nat_wait(HD5770Mtlr *m)
+static void nat_wait(HD5770Mtlr *m, unsigned why)
 {
     nat_end_pass(m);
     if (m->last) {
@@ -405,6 +427,8 @@ static void nat_wait(HD5770Mtlr *m)
         [last release];
         m->waits++;
         m->wait_ns += get_clock() - t0;
+        m->nwait[why]++;
+        m->wait_by_ns[why] += get_clock() - t0;
     }
     m->pass_done = m->passes;
     m->ring_at = 0;
@@ -822,7 +846,7 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
     }
     if (e->pass > m->pass_done) {
         /* a pass not yet complete uses the texture */
-        nat_wait(m);
+        nat_wait(m, NW_UPLOAD);
     }
     t0 = get_clock();
     if (!e->space && e->s.fast && e->s.mode < HD5770_ARRAY_1D_TILED_THIN1 &&
@@ -1266,7 +1290,7 @@ static void nat_retire(HD5770Mtlr *m, uint64_t ticket)
  * all, after the fences'. The GPU copies the rectangles drawn to the
  * read buffer behind the draws; one wait.
  */
-static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
+static void nat_writeback(HD5770Mtlr *m, NatSurf *only, unsigned why)
 {
     id<MTLCommandBuffer> cb = nil;
     id<MTLBlitCommandEncoder> bl = nil;
@@ -1321,7 +1345,7 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
         [m->last release];
         m->last = cb;
     }
-    nat_wait(m);
+    nat_wait(m, why);
     t0 = get_clock();
     for (i = 0; i < m->act->len; i++) {
         NatSurf *e = g_ptr_array_index(m->act, i);
@@ -1427,7 +1451,7 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
     if (n) {
         buf = nat_buf(m, need);
         if (!buf) {
-            nat_writeback(m, NULL);
+            nat_writeback(m, NULL, NW_SYNC);
             n = 0;
         }
     }
@@ -1578,7 +1602,7 @@ static void nat_evict(HD5770Mtlr *m, uint64_t before)
 
         if (e->used < before && e->pin != m->seq && !e->nfly) {
             if (e->dirty) {
-                nat_writeback(m, e);
+                nat_writeback(m, e, NW_EVICT);
             }
             if (m->cur == e || m->cur_z == e || m->cur_s == e || m->ncurm) {
                 nat_end_pass(m);
@@ -1790,7 +1814,7 @@ static void nat_ready(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
         }
         if (f != e && nat_alias(f, e)) {
             if (f->dirty) {
-                nat_writeback(m, f);
+                nat_writeback(m, f, NW_ALIAS);
             } else {
                 nat_drain(m);
             }
@@ -2117,6 +2141,42 @@ static void *nat_ring(HD5770Mtlr *m, size_t n, size_t *at)
     *at = a;
     m->ring_at = a + n;
     return (uint8_t *)m->ring.contents + a;
+}
+
+/*
+ * the ring is full: another one that no pass in flight reads, made if
+ * there is none yet; false: all are read, the caller waits
+ */
+static bool nat_ring_next(HD5770Mtlr *m)
+{
+    uint64_t done = qatomic_read(&m->cb_passes);
+    unsigned i;
+
+    m->ring_pass[m->ring_i] = m->passes;
+    for (i = 0; i < NAT_RINGS; i++) {
+        if (i == m->ring_i) {
+            continue;
+        }
+        if (!m->rings[i]) {
+            m->rings[i] = [m->dev newBufferWithLength:NAT_RING
+                                  options:MTLResourceStorageModeShared];
+            if (!m->rings[i]) {
+                continue;
+            }
+            break;
+        }
+        if (m->ring_pass[i] <= done) {
+            break;
+        }
+    }
+    if (i == NAT_RINGS) {
+        return false;
+    }
+    m->ring_i = i;
+    m->ring = m->rings[i];
+    m->ring_at = 0;
+    m->ring_swaps++;
+    return true;
 }
 
 /* the host format of a texture, NF_N: none */
@@ -2659,8 +2719,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     for (i = 0; i < nat; i++) {
         nat_ready(m, at[i], y0, y1);
     }
-    if (m->ring_at + need > NAT_RING) {
-        nat_wait(m);
+    if (m->ring_at + need > NAT_RING && !nat_ring_next(m)) {
+        nat_wait(m, NW_RING);
     }
     /* the pass goes on if it has what the draw needs, at the same size */
     reuse = m->pass_on && m->cur == rt && (!zs || m->cur_z == zs) &&
@@ -3114,7 +3174,7 @@ static void nat_sync_locked(HD5770Mtlr *m)
     int64_t t0 = get_clock();
 
     @autoreleasepool {
-        nat_writeback(m, NULL);
+        nat_writeback(m, NULL, NW_SYNC);
     }
     nat_report(m);
     if (m->audit) {
@@ -3150,11 +3210,11 @@ static void nat_sync_range(void *opaque, uint64_t off, uint64_t len)
             NatSurf *e = g_ptr_array_index(m->act, i);
 
             if (e->dirty && !e->space && e->lo < off + len && off < e->hi) {
-                nat_writeback(m, e);
+                nat_writeback(m, e, NW_RANGE);
             }
         }
         /* draws that read memory in place */
-        nat_wait(m);
+        nat_wait(m, NW_RANGE);
     }
     nat_report(m);
     m->pub.kept = false;
@@ -3273,6 +3333,15 @@ static void nat_stats(void *opaque, GString *out)
                            m->fence_empty, m->drains, m->fly_cmp, m->holds,
                            m->fence_ns / 1000000, m->drain_ns / 1000000,
                            m->fcopy_ns / 1000000, m->kept_rects, m->rsyncs);
+    g_string_append_printf(out, "native: waits for:");
+    for (i = 0; i < NW_N; i++) {
+        g_string_append_printf(out, " %s %" PRIu64 " (%" PRId64 " ms)",
+                               nw_names[i], m->nwait[i],
+                               m->wait_by_ns[i] / 1000000);
+    }
+    g_string_append_printf(out, ", ring changes %" PRIu64
+                           ", uploads after a pass in flight %" PRIu64 "\n",
+                           m->ring_swaps, m->up_after);
     g_string_append_printf(out, "native: programs %" PRIu64 " pipelines %"
                            PRIu64 " draws that built %u, ms: total %" PRIu64
                            " median %.1f worst %.1f\n", m->builds,
@@ -3339,7 +3408,9 @@ static void nat_close(void *opaque)
     g_free(m->pgen);
     [m->samp[0] release];
     [m->samp[1] release];
-    [m->ring release];
+    for (i = 0; i < NAT_RINGS; i++) {
+        [m->rings[i] release];
+    }
     [m->rbuf release];
     [m->q release];
     [m->dev release];
@@ -3386,6 +3457,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->q = [dev newCommandQueue];
         m->ring = [dev newBufferWithLength:NAT_RING
                                    options:MTLResourceStorageModeShared];
+        m->rings[0] = m->ring;
         m->rbuf = [dev newBufferWithLength:NAT_READ
                                    options:MTLResourceStorageModeShared];
         for (i = 0; i < 2; i++) {
