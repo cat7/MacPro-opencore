@@ -509,6 +509,53 @@ bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len, bool rd)
     return hit;
 }
 
+/* bytes [lo, hi) leave the ranges written: nothing queued writes them */
+static void wpend_cut(HD5770Gfx *g, uint64_t lo, uint64_t hi)
+{
+    unsigned i;
+
+    for (i = 0; i < g->nwpend; i++) {
+        uint64_t a = g->wpend[i][0], b = g->wpend[i][1];
+
+        if (lo >= b || a >= hi) {
+            continue;
+        }
+        if (lo <= a && b <= hi) {
+            g->wpend[i][0] = g->wpend[g->nwpend - 1][0];
+            g->wpend[i][1] = g->wpend[g->nwpend - 1][1];
+            g->nwpend--;
+            i--;
+        } else if (lo <= a) {
+            g->wpend[i][0] = hi;
+        } else if (b <= hi) {
+            g->wpend[i][1] = lo;
+        } else if (g->nwpend < HD5770_WPENDING) {
+            g->wpend[i][1] = lo;
+            g->wpend[g->nwpend][0] = hi;
+            g->wpend[g->nwpend][1] = b;
+            g->nwpend++;
+        }
+    }
+}
+
+/* the backend brings VRAM [off, off + len) up to date, and no more */
+static void pend_sync_range(HD5770Gfx *g, uint64_t off, uint64_t len)
+{
+    g->gpu->ops->sync_range(g->gpu->b, off, len);
+    g->gst.range_syncs++;
+    /* the work queued is done: nothing reads memory in place */
+    g->nvpend = 0;
+    g->ram_vpend = false;
+    if (!g->gpu->kept) {
+        g->npend = 0;
+        g->nwpend = 0;
+        g->ram_pend = false;
+        g->ram_wpend = false;
+    } else {
+        wpend_cut(g, off, off + len);
+    }
+}
+
 /*
  * vb false: before a read, which the vertex buffers queued and the
  * ranges only read do not mind
@@ -521,7 +568,11 @@ static void pend_touch(HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
     gpu_lock(g, true);
     if (pend_hit(g, off, len, vb, !vb)) {
         g->gst.touch_syncs++;
-        hd5770_gfx_sync(g);
+        if (g->gpu->ops->sync_range) {
+            pend_sync_range(g, off, len);
+        } else {
+            hd5770_gfx_sync(g);
+        }
     }
     gpu_lock(g, false);
 }

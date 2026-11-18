@@ -303,7 +303,7 @@ typedef struct HD5770Mtlr {
     uint64_t builds, pso_builds, build_ns, draw_build_ns;
     int64_t draw_ns, sync_ns, wait_ns, check_ns, upload_ns, wback_ns;
     uint64_t nfences, fence_empty, fence_now, drains, fly_cmp, holds;
-    uint64_t kept_rects;
+    uint64_t kept_rects, rsyncs;
     int64_t fence_ns, drain_ns, fcopy_ns;
     GArray *build_ms;
     /* HD5770_NAT_AUDIT */
@@ -3129,6 +3129,39 @@ static void nat_sync(void *opaque)
     g_mutex_unlock(&m->lk);
 }
 
+static void nat_sync_range(void *opaque, uint64_t off, uint64_t len)
+{
+    HD5770Mtlr *m = opaque;
+    int64_t t0 = get_clock();
+    unsigned i;
+
+    nat_hold(m);
+    g_mutex_lock(&m->lk);
+    @autoreleasepool {
+        nat_drain(m);
+        for (i = 0; i < m->act->len; i++) {
+            NatSurf *e = g_ptr_array_index(m->act, i);
+
+            if (e->dirty && !e->space && e->lo < off + len && off < e->hi) {
+                nat_writeback(m, e);
+            }
+        }
+        /* draws that read memory in place */
+        nat_wait(m);
+    }
+    nat_report(m);
+    m->pub.kept = false;
+    for (i = 0; i < m->act->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->act, i);
+
+        m->pub.kept |= e->dirty;
+    }
+    nat_epoch(m, false);
+    m->rsyncs++;
+    m->sync_ns += get_clock() - t0;
+    g_mutex_unlock(&m->lk);
+}
+
 static uint64_t nat_fence(void *opaque)
 {
     HD5770Mtlr *m = opaque;
@@ -3228,10 +3261,11 @@ static void nat_stats(void *opaque, GString *out)
                            " flight %" PRIu64 " holds %" PRIu64 ", ms: fence %"
                            PRId64 " early wait %" PRId64 " copy %" PRId64
                            ", plane rectangles kept %" PRIu64
+                           ", syncs for a range %" PRIu64
                            "\n", m->nfences + m->fence_now, m->fence_now,
                            m->fence_empty, m->drains, m->fly_cmp, m->holds,
                            m->fence_ns / 1000000, m->drain_ns / 1000000,
-                           m->fcopy_ns / 1000000, m->kept_rects);
+                           m->fcopy_ns / 1000000, m->kept_rects, m->rsyncs);
     g_string_append_printf(out, "native: programs %" PRIu64 " pipelines %"
                            PRIu64 " draws that built %u, ms: total %" PRIu64
                            " median %.1f worst %.1f\n", m->builds,
@@ -3315,6 +3349,7 @@ static const HD5770GpuOps nat_ops = {
     .ram = nat_ram,
     .wrote = nat_wrote,
     .fence = nat_fence,
+    .sync_range = nat_sync_range,
     .depth = true,
     .mipmaps = true,
     .resinfo = true,

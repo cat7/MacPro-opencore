@@ -358,6 +358,13 @@ typedef struct HD5770GpuOps {
      */
     void (*wrote)(void *b, uint64_t off, uint64_t len);
     /*
+     * added 2026-11-18: as sync() for the surfaces over VRAM bytes
+     * [off, off + len) only: the work queued is done and those surfaces
+     * are in memory; others drawn may stay newer than memory (kept is
+     * set then). NULL: sync() is used.
+     */
+    void (*sync_range)(void *b, uint64_t off, uint64_t len);
+    /*
      * added 2026-11-17: vertex stage v alone, after the work before it:
      * its records to rec (HD5770GpuVs); with tri set, also its triangles
      * (*ntri of them, at most hd5770_vs_emits() * 3) and their inputs

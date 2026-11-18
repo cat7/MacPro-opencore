@@ -296,6 +296,7 @@ typedef struct HD5770GpuStats {
     uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
     uint64_t syncs, touch_syncs;
+    uint64_t range_syncs;       /* of the touch_syncs: for the range only */
     uint64_t build_skips;       /* left out while their program builds */
     /*
      * verify mode: the host GPU's vertex records (HD5770GpuVs) against
