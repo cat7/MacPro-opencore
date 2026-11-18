@@ -552,7 +552,19 @@ static void pend_sync_range(HD5770Gfx *g, uint64_t off, uint64_t len)
         g->ram_pend = false;
         g->ram_wpend = false;
     } else {
+        unsigned i;
+
         wpend_cut(g, off, off + len);
+        /* what was read is read: the ranges kept are the ones pending */
+        g->npend = 0;
+        for (i = 0; i < g->nwpend; i++) {
+            pend_add(g, g->wpend[i][0], g->wpend[i][1]);
+        }
+        g->ram_pend = g->ram_wpend;
+        if (pend_hit(g, off, len, false, true)) {
+            /* no room to cut the range out */
+            hd5770_gfx_sync(g);
+        }
     }
 }
 
