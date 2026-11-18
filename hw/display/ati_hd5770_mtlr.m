@@ -1603,12 +1603,19 @@ static bool nat_same(const NatSurf *e, const HD5770GpuSurf *s, unsigned hf)
 
     if (e->space != s->space || e->hf != hf || a->pitch != b->pitch ||
         a->height < b->height || a->mode != b->mode || a->bpe != b->bpe ||
-        a->banks != b->banks || a->bankw != b->bankw ||
-        a->bankh != b->bankh || a->mtilea != b->mtilea ||
-        a->tile_split != b->tile_split || a->pipes != b->pipes ||
-        a->pipe_interleave != b->pipe_interleave ||
-        a->nondisp != b->nondisp || a->fast != b->fast ||
-        (!a->fast && a->height != b->height)) {
+        a->fast != b->fast || (!a->fast && a->height != b->height)) {
+        return false;
+    }
+    if (a->fast && a->mode < HD5770_ARRAY_1D_TILED_THIN1) {
+        /* rows one after another: the tile parameters do not matter */
+        if (a->row_bytes != b->row_bytes) {
+            return false;
+        }
+    } else if (a->banks != b->banks || a->bankw != b->bankw ||
+               a->bankh != b->bankh || a->mtilea != b->mtilea ||
+               a->tile_split != b->tile_split || a->pipes != b->pipes ||
+               a->pipe_interleave != b->pipe_interleave ||
+               a->nondisp != b->nondisp) {
         return false;
     }
     if (!s->space) {
