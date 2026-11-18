@@ -144,9 +144,25 @@ typedef struct ShEntry {
 
 #define SH_BUCKETS 256
 
-struct HD5770ShaderCache {
-    ShEntry *b[SH_BUCKETS];
-};
+/*
+ * The index work of a draw from an index buffer, kept while the
+ * buffer's bytes stay as they were read (raw): the indices, the CPU
+ * path's slots and distinct vertices, the triangles for the host's
+ * vertex stage
+ */
+typedef struct IdxEntry {
+    uint64_t base;
+    uint32_t max, nv, isz, swap, ioff, lo, hi, restart, reset, prim;
+    uint8_t *raw;
+    uint32_t *idx, *slot, *vid, *tidx;
+    unsigned nu, ntidx;
+    uint64_t used, bytes;
+    struct IdxEntry *next;
+} IdxEntry;
+
+#define IDX_BUCKETS     1024
+#define IDX_CACHE_BYTES (128u << 20)
+#define IDX_CACHE_AGE   65536   /* draws */
 
 #define HD5770_TEX_LEVELS 15
 
@@ -189,6 +205,25 @@ typedef struct Tex {
 } Tex;
 
 #define TEX_CACHE 8
+
+/* textures set up, by their resource and sampler words */
+typedef struct TexMemo {
+    uint32_t key[16];
+    bool ok;
+    Tex t;
+} TexMemo;
+
+#define TEX_MEMO        128
+
+#define SH_LAST 64
+
+struct HD5770ShaderCache {
+    ShEntry *b[SH_BUCKETS];
+    ShEntry *last[4][SH_LAST];  /* by stage and address: the last program */
+    IdxEntry *ib[IDX_BUCKETS];
+    uint64_t idx_bytes, idx_tick;
+    TexMemo tm[TEX_MEMO];
+};
 
 /* the fields of one render target in Draw */
 #define MRT_FIRST   offsetof(Draw, rt)
@@ -3585,6 +3620,7 @@ typedef struct IdxSrc {
     unsigned kind;
     uint64_t base;
     uint32_t max;
+    unsigned isz, swap;
 } IdxSrc;
 
 /* the inputs the pixel shader interpolates (its IR's), 0 without one */
@@ -4608,7 +4644,8 @@ static bool vsb_offset(Draw *d, float *zc, float *zsl)
  * all instances and runs in one request. false: not taken, the stage
  * runs here.
  */
-static bool vsb_draw(Draw *d, const IdxSrc *is, const uint32_t *idx,
+static bool vsb_draw(Draw *d, const IdxSrc *is, IdxEntry *ic,
+                     const uint32_t *idx,
                      const uint32_t *slot, const uint32_t *vid, unsigned nv,
                      unsigned nu, unsigned count, unsigned prim,
                      unsigned ninst, HD5770Thread *t)
@@ -4653,15 +4690,26 @@ static bool vsb_draw(Draw *d, const IdxSrc *is, const uint32_t *idx,
     v.zoff_const = zc;
     v.zoff_slope = zsl;
     /* the triangles of an instance, by vertex index */
-    v1 = v;
-    v1.ninst = 1;
-    n = hd5770_vs_emits(&v1, NULL);
-    em = g_new(uint32_t, MAX(n, 1u) * 5);
-    tidx = g_new(uint32_t, MAX(n, 1u) * 3);
-    hd5770_vs_emits(&v1, em);
-    for (i = 0; i < n; i++) {
-        for (j = 0; j < 3; j++) {
-            tidx[i * 3 + j] = vid[slot[em[i * 5 + j]]];
+    if (ic && ic->tidx) {
+        tidx = ic->tidx;
+        n = ic->ntidx / 3;
+    } else {
+        v1 = v;
+        v1.ninst = 1;
+        n = hd5770_vs_emits(&v1, NULL);
+        em = g_new(uint32_t, MAX(n, 1u) * 5);
+        tidx = g_new(uint32_t, MAX(n, 1u) * 3);
+        hd5770_vs_emits(&v1, em);
+        for (i = 0; i < n; i++) {
+            for (j = 0; j < 3; j++) {
+                tidx[i * 3 + j] = vid[slot[em[i * 5 + j]]];
+            }
+        }
+        if (ic) {
+            ic->tidx = tidx;
+            ic->ntidx = n * 3;
+            ic->bytes += 12ull * MAX(n, 1u);
+            d->g->cache->idx_bytes += 12ull * MAX(n, 1u);
         }
     }
     v.tidx = tidx;
@@ -4686,7 +4734,9 @@ static bool vsb_draw(Draw *d, const IdxSrc *is, const uint32_t *idx,
     gpu_vs_free(&v);
     g_free(kv);
     g_free(em);
-    g_free(tidx);
+    if (!ic) {
+        g_free(tidx);
+    }
     return taken;
 }
 
@@ -4826,8 +4876,7 @@ static bool draw_indices(HD5770Gfx *g, const uint32_t *b, uint32_t n,
     bool i32 = g->index_type & 1;
     unsigned isz = i32 ? 4 : 2, swap = (g->index_type >> 2) & 3;
     uint64_t base, max;
-    uint32_t *v, i, k;
-    uint8_t *raw;
+    uint32_t *v, i;
 
     *idx = NULL;
     memset(src, 0, sizeof(*src));
@@ -4924,9 +4973,24 @@ static bool draw_indices(HD5770Gfx *g, const uint32_t *b, uint32_t n,
     src->kind = 1;
     src->base = base;
     src->max = max;
-    v = g_new0(uint32_t, MAX(*count, 1));
-    raw = g_malloc(max * isz + 1);
+    src->isz = isz;
+    src->swap = swap;
     pend_check(g, base, max * isz);
+    return true;
+}
+
+/* the indices of a draw from an index buffer; *rawp: the bytes read */
+static uint32_t *idx_read(HD5770Gfx *g, const IdxSrc *src, uint32_t count,
+                          uint8_t **rawp)
+{
+    bool i32 = src->isz == 4;
+    unsigned isz = src->isz, swap = src->swap;
+    uint64_t base = src->base, max = src->max;
+    uint32_t *v, i, k;
+    uint8_t *raw;
+
+    v = g_new0(uint32_t, MAX(count, 1));
+    raw = g_malloc(max * isz + 1);
     hd5770_mem_read(&g->mem, base, raw, max * isz);
     for (i = 0; i < max; i++) {
         uint32_t x = i32 ? ldl_le_p(raw + 4 * i) : lduw_le_p(raw + 2 * i);
@@ -4942,12 +5006,130 @@ static bool draw_indices(HD5770Gfx *g, const uint32_t *b, uint32_t n,
         }
         v[i] = x;
     }
-    for (k = max; k < *count; k++) {
+    for (k = max; k < count; k++) {
         v[k] = 0;
     }
-    g_free(raw);
-    *idx = v;
-    return true;
+    *rawp = raw;
+    return v;
+}
+
+static void idx_entry_free(HD5770ShaderCache *c, IdxEntry *e)
+{
+    c->idx_bytes -= e->bytes;
+    g_free(e->raw);
+    g_free(e->idx);
+    g_free(e->slot);
+    g_free(e->vid);
+    g_free(e->tidx);
+    g_free(e);
+}
+
+static unsigned idx_bucket(const IdxSrc *src, uint32_t nv)
+{
+    return (uint32_t)((src->base >> 1) * 2654435761u + nv * 40503u) %
+           IDX_BUCKETS;
+}
+
+/* the entry of this draw's index work if the buffer still holds its bytes */
+static IdxEntry *idx_cache_get(HD5770Gfx *g, const IdxSrc *src, uint32_t nv,
+                               unsigned prim)
+{
+    HD5770ShaderCache *c = g->cache;
+    IdxEntry **pe, *e;
+    uint64_t len = (uint64_t)src->max * src->isz, n = 0;
+    bool restart = CTX(g, VGT_MULTI_PRIM_IB_RESET_EN) & 1, same;
+    uint8_t *p;
+
+    c->idx_tick++;
+    for (pe = &c->ib[idx_bucket(src, nv)]; (e = *pe); pe = &e->next) {
+        if (e->base == src->base && e->max == src->max && e->nv == nv &&
+            e->isz == src->isz && e->swap == src->swap && e->prim == prim &&
+            e->ioff == CTX(g, VGT_INDX_OFFSET) &&
+            e->lo == CTX(g, VGT_MIN_VTX_INDX) &&
+            e->hi == CTX(g, VGT_MAX_VTX_INDX) && e->restart == restart &&
+            e->reset == CTX(g, VGT_MULTI_PRIM_IB_RESET_INDX)) {
+            break;
+        }
+    }
+    if (!e) {
+        return NULL;
+    }
+    p = len ? g->mem.map(g->mem.opaque, src->base, &n, false) : NULL;
+    if (!len) {
+        same = true;
+    } else if (p && n >= len) {
+        same = !memcmp(p, e->raw, len);
+    } else {
+        uint8_t *tmp = g_malloc(len);
+
+        hd5770_mem_read(&g->mem, src->base, tmp, len);
+        same = !memcmp(tmp, e->raw, len);
+        g_free(tmp);
+    }
+    if (!same) {
+        *pe = e->next;
+        idx_entry_free(c, e);
+        return NULL;
+    }
+    e->used = c->idx_tick;
+    return e;
+}
+
+/* keeps a draw's index work; the arrays are the entry's from here on */
+static IdxEntry *idx_cache_put(HD5770Gfx *g, const IdxSrc *src, uint32_t nv,
+                               unsigned prim, uint8_t *raw, uint32_t *idx,
+                               uint32_t *slot, uint32_t *vid, unsigned nu)
+{
+    HD5770ShaderCache *c = g->cache;
+    IdxEntry *e = g_new0(IdxEntry, 1);
+    unsigned b;
+
+    if (c->idx_bytes > IDX_CACHE_BYTES) {
+        /* the entries not used lately go, or all of them */
+        uint64_t old = c->idx_tick > IDX_CACHE_AGE
+                       ? c->idx_tick - IDX_CACHE_AGE : 0;
+        unsigned pass;
+
+        for (pass = 0; pass < 2 && c->idx_bytes > IDX_CACHE_BYTES / 2;
+             pass++) {
+            for (b = 0; b < IDX_BUCKETS; b++) {
+                IdxEntry **pe = &c->ib[b], *o;
+
+                while ((o = *pe)) {
+                    if (pass || o->used < old) {
+                        *pe = o->next;
+                        idx_entry_free(c, o);
+                    } else {
+                        pe = &o->next;
+                    }
+                }
+            }
+        }
+    }
+    e->base = src->base;
+    e->max = src->max;
+    e->nv = nv;
+    e->isz = src->isz;
+    e->swap = src->swap;
+    e->prim = prim;
+    e->ioff = CTX(g, VGT_INDX_OFFSET);
+    e->lo = CTX(g, VGT_MIN_VTX_INDX);
+    e->hi = CTX(g, VGT_MAX_VTX_INDX);
+    e->restart = CTX(g, VGT_MULTI_PRIM_IB_RESET_EN) & 1;
+    e->reset = CTX(g, VGT_MULTI_PRIM_IB_RESET_INDX);
+    e->raw = raw;
+    e->idx = idx;
+    e->slot = slot;
+    e->vid = vid;
+    e->nu = nu;
+    e->used = c->idx_tick;
+    e->bytes = sizeof(*e) + (uint64_t)src->max * src->isz + 1 +
+               12ull * MAX(nv, 1);
+    c->idx_bytes += e->bytes;
+    b = idx_bucket(src, nv);
+    e->next = c->ib[b];
+    c->ib[b] = e;
+    return e;
 }
 
 /* the primitives of vertices vp[0..nv-1]: on the host GPU or the CPU */
@@ -5049,6 +5231,8 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     unsigned reason = HD5770_SKIP_MAX;
     uint32_t count, cctl, inst, ninst, *idx = NULL, *vid = NULL, *slot = NULL;
     IdxSrc isrc;
+    IdxEntry *ic = NULL;
+    uint8_t *raw = NULL;
     VsCheck vc = { 0 };
     uint64_t *vm = NULL;
     int64_t t0 = get_clock();
@@ -5259,6 +5443,19 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
      * shaded once per instance. A fetched index equal to
      * VGT_MULTI_PRIM_IB_RESET_INDX (when enabled) starts a new primitive.
      */
+    if (isrc.kind == 1) {
+        ic = idx_cache_get(g, &isrc, nv, prim);
+        if (!ic) {
+            idx = idx_read(g, &isrc, count, &raw);
+        }
+    }
+    if (ic) {
+        idx = ic->idx;
+        slot = ic->slot;
+        vid = ic->vid;
+        nu = ic->nu;
+        goto have_idx;
+    }
     slot = g_new(uint32_t, MAX(nv, 1));
     vid = g_new(uint32_t, MAX(nv, 1));
     if (!idx) {
@@ -5324,6 +5521,10 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
             g_hash_table_destroy(seen);
         }
     }
+    if (isrc.kind == 1) {
+        ic = idx_cache_put(g, &isrc, nv, prim, raw, idx, slot, vid, nu);
+    }
+have_idx:
     vb = g_new(Vtx, MAX(nu, 1) + 1);
     vp = g_new(Vtx *, MAX(nv, 1));
     t = g_new0(HD5770Thread, 1);
@@ -5334,7 +5535,8 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         vm = g_new(uint64_t, MAX(nu, 1));
         g->gst.vs_draws++;
     }
-    if (vsb_draw(d, &isrc, idx, slot, vid, nv, nu, count, prim, ninst, t)) {
+    if (vsb_draw(d, &isrc, ic, idx, slot, vid, nv, nu, count, prim, ninst,
+                 t)) {
         st->drawn++;
         goto out;
     }
@@ -5390,9 +5592,11 @@ out:
     g_free(vm);
     g_free(vb);
     g_free(vp);
-    g_free(vid);
-    g_free(slot);
-    g_free(idx);
+    if (!ic) {
+        g_free(vid);
+        g_free(slot);
+        g_free(idx);
+    }
     g_free(t);
     g_free(d->mrt);
     g_free(d->nt);
@@ -5442,6 +5646,14 @@ void hd5770_gfx_fini(HD5770Gfx *g)
             hd5770_prog_free(e->prog);
             g_free(e);
             e = n;
+        }
+    }
+    for (b = 0; b < IDX_BUCKETS; b++) {
+        while (g->cache->ib[b]) {
+            IdxEntry *e = g->cache->ib[b];
+
+            g->cache->ib[b] = e->next;
+            idx_entry_free(g->cache, e);
         }
     }
     g_free(g->cache);
