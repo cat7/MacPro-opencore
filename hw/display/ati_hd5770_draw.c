@@ -1299,7 +1299,8 @@ static void sample_point(Draw *d, Tex *t, unsigned lv, int x, int y,
  * The mip chain of a 2D texture: level l (1..last_lv) follows level
  * l - 1 from MIP_ADDRESS on, each as large as its own size padded to its
  * tiling; a 2D-tiled level smaller than a macro tile and all after it
- * are 1D tiled.
+ * are 1D tiled. The six faces of a cube map's level are followed by the
+ * room of two more.
  */
 static void tex_levels(Tex *t, uint64_t mip_addr)
 {
@@ -1350,7 +1351,8 @@ static void tex_levels(Tex *t, uint64_t mip_addr)
         ls->height = ph;
         hd5770_surf_prep(ls);
         t->slice_bytes[l] = (uint64_t)pw * ph * bpe;
-        off += t->slice_bytes[l] * tex_slices(t, l);
+        /* a cube map's level takes the room of 8 faces */
+        off += t->slice_bytes[l] * (t->dim == 3 ? 8 : tex_slices(t, l));
     }
 }
 
