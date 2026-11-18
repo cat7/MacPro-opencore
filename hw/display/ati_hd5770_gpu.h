@@ -399,6 +399,12 @@ typedef struct HD5770Gpu {
     uint64_t (*written)(void *opaque, uint64_t off);
     /* added 2026-11-18: takes draws with HD5770GpuDraw.vs */
     bool vs_draw;
+    /*
+     * added 2026-11-18: set by fence(), cleared by sync(): surfaces drawn
+     * are still newer than memory although the fence left nothing
+     * outstanding; the ranges queued stay pending
+     */
+    bool kept;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

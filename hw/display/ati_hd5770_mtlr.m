@@ -61,6 +61,9 @@
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
 #include "qemu/bswap.h"
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 #import <Metal/Metal.h>
 #include "ati_hd5770_gpu.h"
 
@@ -201,9 +204,18 @@ typedef struct NatSurf {
     uint64_t pin;               /* the draw that uses it */
     uint64_t pass;              /* the last pass that uses it */
     uint8_t run;                /* elements of a micro tile row in a run */
+    /*
+     * split tiles in VRAM: np parts; element i of a tile lies spg[i]
+     * after the first byte of part spp[i], which is element spj[] of it;
+     * spf: the parts' offsets + 1 per tile, once asked for
+     */
+    uint8_t np, spp[64], spj[32];
+    uint32_t spg[64];
+    uint64_t *spf;
     /* a depth plane: vertex stages of its draws since its clear */
     uint8_t vsm;                /* bit 0 the CPU's, bit 1 the host's */
     bool dirty;                 /* tex is newer than memory */
+    bool recent;                /* drawn since the last fence */
     int nr, r[NAT_RECTS][4];    /* where: x0, y0, x1, y1 */
     size_t ro[NAT_RECTS];       /* their pixels in the read buffer */
     uint64_t used;
@@ -249,6 +261,7 @@ typedef struct HD5770Mtlr {
     bool sep_ds;                /* depth and stencil attach separately */
     bool bc_ok;                 /* BC formats are textures */
     bool pk_ok;                 /* 4_4_4_4 is a format */
+    bool zlazy;                 /* planes drawn stay out of a fence */
     GPtrArray *surfs;
     GArray *ranges;
     id<MTLCommandBuffer> last;
@@ -279,6 +292,7 @@ typedef struct HD5770Mtlr {
     uint64_t builds, pso_builds, build_ns, draw_build_ns;
     int64_t draw_ns, sync_ns, wait_ns, check_ns, upload_ns, wback_ns;
     uint64_t nfences, fence_empty, fence_now, drains, fly_cmp, holds;
+    uint64_t kept_rects;
     int64_t fence_ns, drain_ns, fcopy_ns;
     GArray *build_ms;
     /* HD5770_NAT_AUDIT */
@@ -507,6 +521,270 @@ static void nat_row(HD5770Mtlr *m, const NatSurf *e, uint32_t x0, uint32_t y,
     }
 }
 
+enum { NIO_GET, NIO_PUT, NIO_PUT_Z24 };
+
+/*
+ * Rectangle x0, y0, w, h of an entry in micro tiles in VRAM, tile by
+ * tile, runs of rb bytes: from memory to px, or from px to memory and
+ * the shadow; Z24: the byte above the 24 bits stays as memory has it
+ */
+static inline __attribute__((always_inline)) void
+nat_tiles(const NatSurf *e, uint8_t *mem, uint8_t *sh, uint32_t x0,
+          uint32_t y0, uint32_t w, uint32_t h, uint8_t *px, const size_t rb,
+          const int op)
+{
+    const HD5770Surf *s = &e->s;
+    const uint32_t x1 = x0 + w, y1 = y0 + h, bpe = s->bpe, re = rb / bpe;
+    uint32_t tx, ty, x, y;
+
+    for (ty = y0 >> 3; ty <= (y1 - 1) >> 3; ty++) {
+        uint32_t ya = MAX(ty << 3, y0), yb = MIN((ty + 1) << 3, y1);
+
+        for (tx = x0 >> 3; tx <= (x1 - 1) >> 3; tx++) {
+            uint64_t t = hd5770_surf_tile(s, tx, ty);
+            uint32_t xa = MAX(tx << 3, x0), xb = MIN((tx + 1) << 3, x1);
+            uint8_t *tm = mem + t, *ts = sh + t;
+
+            for (y = ya; y < yb; y++) {
+                const uint32_t *eo = &s->eoff[(y & 7) * 8];
+                uint8_t *p = px + ((size_t)(y - y0) * w + (xa - x0)) * bpe;
+
+                if (op == NIO_PUT_Z24) {
+                    for (x = xa; x < xb; x++, p += 4) {
+                        uint32_t o = eo[x & 7];
+                        uint32_t v = ldl_le_p(p) |
+                                     (ldl_le_p(tm + o) & 0xff000000u);
+
+                        stl_le_p(tm + o, v);
+                        stl_le_p(ts + o, v);
+                    }
+                } else if (xb - xa == 8) {
+                    for (x = 0; x < 8; x += re, p += rb) {
+                        if (op == NIO_GET) {
+                            memcpy(p, tm + eo[x], rb);
+                        } else {
+                            memcpy(tm + eo[x], p, rb);
+                            memcpy(ts + eo[x], p, rb);
+                        }
+                    }
+                } else {
+                    for (x = xa; x < xb; x++, p += bpe) {
+                        if (op == NIO_GET) {
+                            memcpy(p, tm + eo[x & 7], bpe);
+                        } else {
+                            memcpy(tm + eo[x & 7], p, bpe);
+                            memcpy(ts + eo[x & 7], p, bpe);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* the layout of split tiles, checked against hd5770_surf_offset() */
+static void nat_split_prep(NatSurf *e)
+{
+    const HD5770Surf *s = &e->s;
+    uint32_t np = (64 * s->bpe) >> s->split_sh, tw = s->pitch / 8;
+    uint32_t th = s->height / 8, i, p, c;
+    uint64_t f[32];
+
+    if (np < 2 || np > 32 || !tw || !th) {
+        return;
+    }
+    memset(e->spj, 0xff, sizeof(e->spj));
+    for (i = 0; i < 64; i++) {
+        e->spp[i] = s->eoff[i] >> s->split_sh;
+        if (e->spp[i] >= np) {
+            return;
+        }
+        if (!(s->eoff[i] & ((1u << s->split_sh) - 1))) {
+            e->spj[e->spp[i]] = i;
+        }
+    }
+    for (c = 0; c < 5; c++) {
+        uint32_t tx = c == 1 || c == 3 ? tw - 1 : c == 4 ? tw / 2 : 0;
+        uint32_t ty = c == 2 || c == 3 ? th - 1 : c == 4 ? th / 2 : 0;
+
+        for (p = 0; p < np; p++) {
+            if (e->spj[p] == 0xff) {
+                return;
+            }
+            f[p] = hd5770_surf_offset(s, tx * 8 + (e->spj[p] & 7),
+                                      ty * 8 + (e->spj[p] >> 3));
+        }
+        for (i = 0; i < 64; i++) {
+            uint64_t o = hd5770_surf_offset(s, tx * 8 + (i & 7),
+                                            ty * 8 + (i >> 3));
+
+            if (o < f[e->spp[i]] || o - f[e->spp[i]] > UINT32_MAX ||
+                (c && e->spg[i] != o - f[e->spp[i]])) {
+                return;
+            }
+            e->spg[i] = o - f[e->spp[i]];
+        }
+    }
+    e->spf = g_try_new0(uint64_t, (size_t)tw * th * np);
+    e->np = e->spf ? np : 0;
+}
+
+static inline __attribute__((always_inline)) void
+nat_tiles_split(NatSurf *e, uint8_t *mem, uint8_t *sh, uint32_t x0,
+                uint32_t y0, uint32_t w, uint32_t h, uint8_t *px,
+                const size_t bpe, const int op)
+{
+    const HD5770Surf *s = &e->s;
+    const uint32_t x1 = x0 + w, y1 = y0 + h, tw = s->pitch / 8, np = e->np;
+    uint32_t tx, ty, x, y, p;
+
+    for (ty = y0 >> 3; ty <= (y1 - 1) >> 3; ty++) {
+        uint32_t ya = MAX(ty << 3, y0), yb = MIN((ty + 1) << 3, y1);
+
+        for (tx = x0 >> 3; tx <= (x1 - 1) >> 3; tx++) {
+            uint64_t *f = &e->spf[((size_t)ty * tw + tx) * np];
+            uint32_t xa = MAX(tx << 3, x0), xb = MIN((tx + 1) << 3, x1);
+
+            if (!f[0]) {
+                for (p = 0; p < np; p++) {
+                    f[p] = hd5770_surf_offset(s, tx * 8 + (e->spj[p] & 7),
+                                              ty * 8 + (e->spj[p] >> 3)) + 1;
+                }
+            }
+            for (y = ya; y < yb; y++) {
+                uint8_t *q = px + ((size_t)(y - y0) * w + (xa - x0)) * bpe;
+
+                for (x = xa; x < xb; x++, q += bpe) {
+                    uint32_t i = (y & 7) * 8 + (x & 7);
+                    uint64_t o = f[e->spp[i]] - 1 + e->spg[i];
+
+                    if (op == NIO_GET) {
+                        memcpy(q, mem + o, bpe);
+                    } else if (op == NIO_PUT) {
+                        memcpy(mem + o, q, bpe);
+                        memcpy(sh + o, q, bpe);
+                    } else {
+                        uint32_t v = ldl_le_p(q) |
+                                     (ldl_le_p(mem + o) & 0xff000000u);
+
+                        stl_le_p(mem + o, v);
+                        stl_le_p(sh + o, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* a rectangle of the entry, its elements px, as nat_row() does a row */
+static void nat_rect_io(HD5770Mtlr *m, NatSurf *e, uint32_t x0,
+                        uint32_t y0, uint32_t w, uint32_t h, uint8_t *px,
+                        int op)
+{
+    const HD5770Surf *s = &e->s;
+    uint8_t *mem = m->vram + e->voff, *sh = e->shadow;
+    uint32_t bpe = s->bpe, x, y;
+
+    if (!w || !h) {
+        return;
+    }
+    if (e->np && x0 + w <= (s->pitch & ~7u) && y0 + h <= (s->height & ~7u)) {
+#define NAT_SPLIT(n)                                                    \
+    case n:                                                             \
+        if (op == NIO_GET) {                                            \
+            nat_tiles_split(e, mem, sh, x0, y0, w, h, px, n, NIO_GET);  \
+        } else if (op == NIO_PUT) {                                     \
+            nat_tiles_split(e, mem, sh, x0, y0, w, h, px, n, NIO_PUT);  \
+        } else {                                                        \
+            nat_tiles_split(e, mem, sh, x0, y0, w, h, px, n,            \
+                            NIO_PUT_Z24);                               \
+        }                                                               \
+        return;
+        switch (bpe) {
+        NAT_SPLIT(1)
+        NAT_SPLIT(2)
+        NAT_SPLIT(4)
+        NAT_SPLIT(8)
+        NAT_SPLIT(16)
+        }
+#undef NAT_SPLIT
+    }
+    if (e->space || !s->fast || s->mode < HD5770_ARRAY_1D_TILED_THIN1) {
+        uint8_t *old = op == NIO_PUT_Z24 ? g_malloc((size_t)w * 4) : NULL;
+
+        for (y = 0; y < h; y++) {
+            uint8_t *row = px + (size_t)y * w * bpe;
+
+            if (old) {
+                nat_row(m, e, x0, y0 + y, w, old, false);
+                for (x = 0; x < w; x++) {
+                    stl_le_p(row + x * 4, ldl_le_p(row + x * 4) |
+                             (ldl_le_p(old + x * 4) & 0xff000000u));
+                }
+            }
+            nat_row(m, e, x0, y0 + y, w, row, op != NIO_GET);
+        }
+        g_free(old);
+        return;
+    }
+    if (op == NIO_PUT_Z24) {
+        nat_tiles(e, mem, sh, x0, y0, w, h, px, 4, NIO_PUT_Z24);
+        return;
+    }
+#define NAT_TILES(n)                                                    \
+    case n:                                                             \
+        if (op == NIO_GET) {                                            \
+            nat_tiles(e, mem, sh, x0, y0, w, h, px, n, NIO_GET);        \
+        } else {                                                        \
+            nat_tiles(e, mem, sh, x0, y0, w, h, px, n, NIO_PUT);        \
+        }                                                               \
+        break;
+    switch (e->run * bpe) {
+    NAT_TILES(1)
+    NAT_TILES(2)
+    NAT_TILES(4)
+    NAT_TILES(8)
+    NAT_TILES(16)
+    NAT_TILES(32)
+    NAT_TILES(64)
+    NAT_TILES(128)
+    default:
+        g_assert_not_reached();
+    }
+#undef NAT_TILES
+}
+
+/* n depths as floats to 24 bits, in place */
+static void nat_z24(uint8_t *px, size_t n)
+{
+    size_t i = 0;
+
+#ifdef __aarch64__
+    const float64x2_t k = vdupq_n_f64(16777215.0);
+    const float64x2_t one = vdupq_n_f64(1.0), zero = vdupq_n_f64(0.0);
+
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t z = vreinterpretq_f32_u8(vld1q_u8(px + i * 4));
+        float64x2_t a = vcvt_f64_f32(vget_low_f32(z));
+        float64x2_t b = vcvt_high_f64_f32(z);
+
+        a = vmulq_f64(vminnmq_f64(vmaxnmq_f64(a, zero), one), k);
+        b = vmulq_f64(vminnmq_f64(vmaxnmq_f64(b, zero), one), k);
+        vst1q_u8(px + i * 4, vreinterpretq_u8_u32(
+                     vcombine_u32(vmovn_u64(vcvtnq_u64_f64(a)),
+                                  vmovn_u64(vcvtnq_u64_f64(b)))));
+    }
+#endif
+    for (; i < n; i++) {
+        float z;
+        double zd;
+
+        memcpy(&z, px + i * 4, 4);
+        zd = z > 0.0f ? MIN((double)z, 1.0) : 0.0;
+        stl_le_p(px + i * 4, (uint32_t)lrint(zd * 16777215.0));
+    }
+}
+
 /* the surface bytes [*a, *z) band b's rows lie in */
 static void nat_band(const NatSurf *e, uint32_t b, uint64_t *a, uint64_t *z)
 {
@@ -521,7 +799,7 @@ static void nat_band(const NatSurf *e, uint32_t b, uint64_t *a, uint64_t *z)
 /* rows y0..y1-1 of memory to the host texture */
 static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
 {
-    uint32_t w = e->s.pitch, bpe = e->s.bpe, y, bk = NF_BLK(e->hf);
+    uint32_t w = e->s.pitch, bpe = e->s.bpe, bk = NF_BLK(e->hf);
     int64_t t0;
 
     if (e->pass > m->pass_done) {
@@ -540,9 +818,7 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
     } else {
         uint8_t *px = nat_tmp(m, (size_t)w * (y1 - y0) * bpe);
 
-        for (y = y0; y < y1; y++) {
-            nat_row(m, e, 0, y, w, px + (size_t)(y - y0) * w * bpe, false);
-        }
+        nat_rect_io(m, e, 0, y0, w, y1 - y0, px, NIO_GET);
         if (e->hf == NF_D24) {
             size_t i, n = (size_t)w * (y1 - y0);
 
@@ -769,34 +1045,15 @@ static void nat_report(HD5770Mtlr *m)
 static void nat_rect_out(HD5770Mtlr *m, NatSurf *e, const int *rc,
                          uint8_t *px)
 {
-    uint32_t x0 = rc[0], y0 = rc[1], w = rc[2] - x0, h = rc[3] - y0, y;
+    uint32_t x0 = rc[0], y0 = rc[1], w = rc[2] - x0, h = rc[3] - y0;
     uint32_t bpe = e->s.bpe;
     uint64_t lo, hi, r[3], o;
 
     if (e->hf == NF_D24) {
-        /* 24 bits; the byte above them as memory has it */
-        uint8_t *old = g_malloc((size_t)w * 4);
-        uint32_t x;
-
-        for (y = 0; y < h; y++) {
-            uint8_t *row = px + (size_t)y * w * 4;
-
-            nat_row(m, e, x0, y0 + y, w, old, false);
-            for (x = 0; x < w; x++) {
-                float z;
-                double zd;
-
-                memcpy(&z, row + x * 4, 4);
-                zd = z > 0.0f ? MIN((double)z, 1.0) : 0.0;
-                stl_le_p(row + x * 4,
-                         (uint32_t)lrint(zd * 16777215.0) |
-                         (ldl_le_p(old + x * 4) & 0xff000000u));
-            }
-        }
-        g_free(old);
-    }
-    for (y = 0; y < h; y++) {
-        nat_row(m, e, x0, y0 + y, w, px + (size_t)y * w * bpe, true);
+        nat_z24(px, (size_t)w * h);
+        nat_rect_io(m, e, x0, y0, w, h, px, NIO_PUT_Z24);
+    } else {
+        nat_rect_io(m, e, x0, y0, w, h, px, NIO_PUT);
     }
     hd5770_surf_rows(&e->s, y0, y0 + h, &lo, &hi);
     lo = MIN(lo - e->s.base, e->cov);
@@ -1066,6 +1323,28 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
     m->wback_ns += get_clock() - t0;
 }
 
+/* a depth or stencil plane drawn since the last fence stays out of this one */
+static inline bool nat_kept(const HD5770Mtlr *m, const NatSurf *e)
+{
+    return m->zlazy && e->recent &&
+           (e->hf == NF_D16 || e->hf == NF_D24 || e->hf == NF_D32 ||
+            e->hf == NF_S8);
+}
+
+/* the fence is made: what stays newer than memory, for the device */
+static void nat_fenced(HD5770Mtlr *m)
+{
+    unsigned i;
+
+    m->pub.kept = false;
+    for (i = 0; i < m->surfs->len; i++) {
+        NatSurf *e = g_ptr_array_index(m->surfs, i);
+
+        m->pub.kept |= e->dirty;
+        e->recent = false;
+    }
+}
+
 /* a read buffer of n bytes or more */
 static id<MTLBuffer> nat_buf(HD5770Mtlr *m, size_t n)
 {
@@ -1101,7 +1380,7 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
     for (i = 0; i < m->surfs->len; i++) {
         NatSurf *e = g_ptr_array_index(m->surfs, i);
 
-        for (k = 0; e->dirty && k < e->nr; k++) {
+        for (k = 0; e->dirty && !nat_kept(m, e) && k < e->nr; k++) {
             need += ROUND_UP((size_t)(e->r[k][2] - e->r[k][0]) *
                              (e->r[k][3] - e->r[k][1]) * e->s.bpe, 16);
             n++;
@@ -1145,6 +1424,10 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
         for (i = 0; i < m->surfs->len; i++) {
             NatSurf *e = g_ptr_array_index(m->surfs, i);
 
+            if (nat_kept(m, e)) {
+                m->kept_rects += e->dirty ? e->nr : 0;
+                continue;
+            }
             for (k = 0; e->dirty && k < e->nr; k++) {
                 NatRect *c = &f->rc[f->n++];
                 uint32_t w = e->r[k][2] - e->r[k][0];
@@ -1190,6 +1473,7 @@ static void nat_drew(NatSurf *e, int x0, int y0, int x1, int y1)
     int k, n = 0;
 
     e->dirty = true;
+    e->recent = true;
     for (k = 0; k < e->nr; k++) {
         int *r = e->r[k];
 
@@ -1230,6 +1514,7 @@ static void nat_surf_free(gpointer p)
     g_free(e->fly);
     g_free(e->fstamp);
     g_free(e->pages);
+    g_free(e->spf);
     g_free(e);
 }
 
@@ -1385,6 +1670,9 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
         if (i == 64) {
             break;
         }
+    }
+    if (!s->s.fast && s->s.split && !s->space) {
+        nat_split_prep(e);
     }
     td = [MTLTextureDescriptor
           texture2DDescriptorWithPixelFormat:nf_fmt[hf]
@@ -2741,6 +3029,7 @@ static void nat_sync_locked(HD5770Mtlr *m)
     if (m->audit) {
         nat_audit(m);
     }
+    m->pub.kept = false;
     nat_epoch(m, true);
     m->syncs++;
     m->sync_ns += get_clock() - t0;
@@ -2768,6 +3057,7 @@ static uint64_t nat_fence(void *opaque)
     @autoreleasepool {
         t = nat_fence_locked(m, &drew);
     }
+    nat_fenced(m);
     nat_epoch(m, drew);
     m->fence_ns += get_clock() - t0;
     g_mutex_unlock(&m->lk);
@@ -2852,10 +3142,11 @@ static void nat_stats(void *opaque, GString *out)
                            ") completed early %" PRIu64 " bands compared in"
                            " flight %" PRIu64 " holds %" PRIu64 ", ms: fence %"
                            PRId64 " early wait %" PRId64 " copy %" PRId64
+                           ", plane rectangles kept %" PRIu64
                            "\n", m->nfences + m->fence_now, m->fence_now,
                            m->fence_empty, m->drains, m->fly_cmp, m->holds,
                            m->fence_ns / 1000000, m->drain_ns / 1000000,
-                           m->fcopy_ns / 1000000);
+                           m->fcopy_ns / 1000000, m->kept_rects);
     g_string_append_printf(out, "native: programs %" PRIu64 " pipelines %"
                            PRIu64 " draws that built %u, ms: total %" PRIu64
                            " median %.1f worst %.1f\n", m->builds,
@@ -3020,6 +3311,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->sep_ds = [m->dev supportsFamily:MTLGPUFamilyApple1];
         m->bc_ok = m->dev.supportsBCTextureCompression;
         m->pk_ok = m->sep_ds;
+        m->zlazy = !g_strcmp0(g_getenv("HD5770_NAT_ZLAZY") ?: "1", "1");
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));

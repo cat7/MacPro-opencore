@@ -392,8 +392,10 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
     gpu_lock(g, true);
     t = g->gpu->ops->fence(g->gpu->b);
     if (!t) {
-        /* everything queued is in memory */
-        g->npend = 0;
+        /* everything queued is in memory, or kept by the backend */
+        if (!g->gpu->kept) {
+            g->npend = 0;
+        }
         g->nvpend = 0;
         g->ram_vpend = false;
         g->ram_pend = false;
