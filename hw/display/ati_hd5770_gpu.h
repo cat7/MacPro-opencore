@@ -464,7 +464,7 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
  * comparison and units with slices go through a function per unit that
  * reads the fetch words at run time. NULL: not expressible.
  */
-#define HD5770_NAT_LEVELS       80      /* textures after the units' first */
+#define HD5770_NAT_LEVELS       112     /* textures after the units' first */
 typedef struct HD5770NatKey {
     uint8_t ninputs;
     int8_t pos_gpr;
