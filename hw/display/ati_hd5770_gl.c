@@ -2745,6 +2745,7 @@ static const HD5770GpuOps gl_ops = {
     .mipmaps = true,
     .resinfo = true,
     .full = true,
+    .vf_pages = true,
     .wrote = gl_wrote,
     .vs_records = gl_vs_records,
 };

@@ -387,6 +387,12 @@ typedef struct HD5770GpuOps {
      * register 0x8e30 busy while the engine has work.
      */
     bool native;
+    /*
+     * added 2026-11-19: the device's vertex fetches read a page of a
+     * vertex buffer through one mapping per instance, checked once
+     * against the draws queued
+     */
+    bool vf_pages;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
