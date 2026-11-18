@@ -265,6 +265,7 @@ typedef struct HD5770Mtlr {
     bool bc_ok;                 /* BC formats are textures */
     bool pk_ok;                 /* 4_4_4_4 is a format */
     bool zlazy;                 /* planes drawn stay out of a fence */
+    bool ztex;                  /* a plane of floats is read as it is */
     GPtrArray *surfs;
     NatSurf *hb[NAT_HASH];      /* the entries by where they start */
     GPtrArray *act;             /* the entries newer than memory or in flight */
@@ -2522,7 +2523,15 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
 
                 sv.s.base += sl * t->slice_bytes[c];
                 sv.voff += sl * t->slice_bytes[c];
-                e = (c || sl) && ls->space ? NULL : nat_surf(m, &sv, hf[i]);
+                e = NULL;
+                if (m->ztex && hf[i] == NF_R32F && tn[i] <= 1 && !sv.space) {
+                    /* a depth plane of floats: its own texture is read */
+                    e = nat_find(m, &sv, NF_D32);
+                }
+                if (!e) {
+                    e = (c || sl) && ls->space ? NULL
+                                               : nat_surf(m, &sv, hf[i]);
+                }
                 if (!e || lw > e->s.pitch * bk || lh > e->s.height * bk) {
                     return nat_decline(m, ND_TEX_SURF, HD5770_WHY_BK_SURF);
                 }
@@ -3372,6 +3381,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->bc_ok = m->dev.supportsBCTextureCompression;
         m->pk_ok = m->sep_ds;
         m->zlazy = !g_strcmp0(g_getenv("HD5770_NAT_ZLAZY") ?: "1", "1");
+        m->ztex = !g_strcmp0(g_getenv("HD5770_NAT_ZTEX") ?: "1", "1");
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
     m->act = g_ptr_array_new();
