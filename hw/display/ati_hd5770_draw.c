@@ -3724,6 +3724,11 @@ static void gpu_req_free(HD5770GpuDraw *q)
  * each) cost more in round trips and barriers than on the CPU.
  */
 #define HD5770_DB_MIN_PIXELS    16384
+/*
+ * a draw without depth whose program is being built goes to the CPU up
+ * to this size, and is left out above it
+ */
+#define HD5770_BUILD_CPU_PIXELS (4u << 20)
 
 /*
  * The CPU's work per pixel of a program, in units of the desktop's
@@ -4635,6 +4640,13 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     if ((q->ntri || q->vs) && !g->gpu->ops->draw(g->gpu->b, q)) {
         for (i = 0; i < nr; i++) {
             g_free(pre[i]);
+        }
+        if (g->gpu->building && g->gpu_mode == HD5770_GPU_ON &&
+            !d->gvs && !d->db &&
+            area * ps_cost(d, ir) < HD5770_BUILD_CPU_PIXELS) {
+            /* the desktop's draws: nothing draws them again */
+            GPU_FB(d, GFB_BACKEND, HD5770_WHY_BK_BUILD_SLOW);
+            goto out;
         }
         if (g->gpu->building && g->gpu_mode == HD5770_GPU_ON) {
             /*
