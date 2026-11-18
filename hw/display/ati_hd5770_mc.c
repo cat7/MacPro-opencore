@@ -163,7 +163,8 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
             }
         } else {
             if (mode != MC_POST &&
-                (write ? s->gfx3d.ram_pend : s->gfx3d.ram_wpend)) {
+                (write ? s->gfx3d.ram_pend || s->gfx3d.ram_vpend
+                       : s->gfx3d.ram_wpend)) {
                 /* queued draws use (a write) or write (a read) guest RAM */
                 ati_hd5770_gpu_sync(s);
             }

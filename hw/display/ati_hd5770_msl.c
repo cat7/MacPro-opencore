@@ -2367,33 +2367,11 @@ static const char msl_vs_lib[] =
 "    return true;\n"
 "}\n";
 
-char *hd5770_msl_vs_program(const HD5770IR *ir)
+/* the operations of a vertex shader: R0, kv, the fetches, rec[] */
+static void vs_body(GString *o, const HD5770IR *ir)
 {
-    GString *o = msl_head();
-    unsigned i, j, k, ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+    unsigned i, j, k;
 
-    g_string_append(o, msl_vs_lib);
-    g_string_append_printf(o,
-        "kernel void hd_vs(device const uchar *vram [[buffer(0)]],\n"
-        "    device const uchar *st [[buffer(1)]], device uint *out [[buffer(2)]],\n"
-        "    device const uchar *ram [[buffer(3)]], device const GVsDraw &v [[buffer(4)]],\n"
-        "    uint gid [[thread_position_in_grid]])\n"
-        "{\n"
-        "    if (gid >= v.nslot * v.ninst) {\n        return;\n    }\n"
-        "    device const uint *kv = (device const uint *)(st + v.kv_off);\n"
-        "    uint inst = gid / v.nslot, index = 0, pm = 0, fl = 0;\n"
-        "    device uint *rec = out + (ulong)gid * %u;\n"
-        "    for (uint i = 0; i < %u; i++) {\n        rec[i] = 0;\n    }\n"
-        "    if (!hd_vsindex(v, vram, ram, st, gid %% v.nslot, index)) {\n"
-        "        rec[%u] = %uu;\n        return;\n    }\n"
-        "    bool killed = false;\n"
-        "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
-        "    for (uint i = 0; i < %u; i++) {\n"
-        "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
-        "    }\n"
-        "    R0[%u][0] = index;\n    R0[%u][3] = inst;\n",
-        HD5770_VS_REC(np), HD5770_VS_REC(np), HD5770_VS_REC(np) - 1,
-        HD5770_VSF_RESTART, ng, ng, ir->map[0], ir->map[0]);
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
 
@@ -2454,6 +2432,36 @@ char *hd5770_msl_vs_program(const HD5770IR *ir)
             break;
         }
     }
+}
+
+char *hd5770_msl_vs_program(const HD5770IR *ir)
+{
+    GString *o = msl_head();
+    unsigned ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+
+    g_string_append(o, msl_vs_lib);
+    g_string_append_printf(o,
+        "kernel void hd_vs(device const uchar *vram [[buffer(0)]],\n"
+        "    device const uchar *st [[buffer(1)]], device uint *out [[buffer(2)]],\n"
+        "    device const uchar *ram [[buffer(3)]], device const GVsDraw &v [[buffer(4)]],\n"
+        "    uint gid [[thread_position_in_grid]])\n"
+        "{\n"
+        "    if (gid >= v.nslot * v.ninst) {\n        return;\n    }\n"
+        "    device const uint *kv = (device const uint *)(st + v.kv_off);\n"
+        "    uint inst = gid / v.nslot, index = 0, pm = 0, fl = 0;\n"
+        "    device uint *rec = out + (ulong)gid * %u;\n"
+        "    for (uint i = 0; i < %u; i++) {\n        rec[i] = 0;\n    }\n"
+        "    if (!hd_vsindex(v, vram, ram, st, gid %% v.nslot, index)) {\n"
+        "        rec[%u] = %uu;\n        return;\n    }\n"
+        "    bool killed = false;\n"
+        "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
+        "    for (uint i = 0; i < %u; i++) {\n"
+        "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
+        "    }\n"
+        "    R0[%u][0] = index;\n    R0[%u][3] = inst;\n",
+        HD5770_VS_REC(np), HD5770_VS_REC(np), HD5770_VS_REC(np) - 1,
+        HD5770_VSF_RESTART, ng, ng, ir->map[0], ir->map[0]);
+    vs_body(o, ir);
     g_string_append_printf(o, "    rec[%u] = pm;\n    rec[%u] = fl;\n}\n",
                            HD5770_VS_REC(np) - 2, HD5770_VS_REC(np) - 1);
     return g_string_free(o, false);
@@ -3180,6 +3188,129 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
     }
     g_string_append(o, "    }\n");
     return true;
+}
+
+uint32_t hd5770_msl_native_flat(const HD5770IR *ir, const HD5770NatKey *k)
+{
+    uint32_t iflat = 0;
+    unsigned i;
+
+    for (i = 0; i < ir->ninsts; i++) {
+        const HD5770IRInst *in = &ir->insts[i];
+
+        if (in->interp && in->needed && in->prm < k->ninputs && in->flat) {
+            iflat |= 1u << in->prm;
+        }
+    }
+    return k->flat | iflat;
+}
+
+char *hd5770_msl_native_vs(const HD5770IR *ir, unsigned ninputs,
+                           uint32_t flat, const int32_t *src)
+{
+    const char *a = strstr(hd5770_msl_lib, "/* layouts shared");
+    const char *f0 = strstr(hd5770_msl_lib, "/* ---- formats ---- */");
+    const char *f1 = strstr(hd5770_msl_lib, "/* ---- surfaces ---- */");
+    const char *b = strstr(hd5770_msl_lib, "/* exp2f() rounded");
+    const char *c = strstr(hd5770_msl_lib, "/* ---- fetches ---- */");
+    unsigned i, k, ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+    GString *o;
+
+    if (!ir->vs || ninputs > 32) {
+        return NULL;
+    }
+    for (i = 0; i < ir->nfetches; i++) {
+        if (ir->fetches[i].kind != HD5770_IRF_VTX) {
+            return NULL;
+        }
+    }
+    o = g_string_new_len(hd5770_msl_lib, a - hd5770_msl_lib);
+    g_string_append_len(o, f0, f1 - f0);
+    g_string_append_len(o, b, c - b);
+    g_string_append(o,
+        "static float hd_mulieee(float a, float b) { return a * b; }\n");
+    g_string_append(o, msl_vs_lib);
+    g_string_append(o,
+        "struct BVs {\n"
+        "    GVsDraw v;\n"
+        "    uint vte, sc_mode, wofs, clip;\n"
+        "    float vport[6];\n"
+        "    float vpx, vpy;\n"
+        "    float pc, zoff, pad1, pad2;\n"
+        "    float def[32][4];\n"
+        "};\n"
+        "struct BV {\n    float4 pos [[position, invariant]];\n"
+        "    float cd [[clip_distance]] [2];\n");
+    for (i = 0; i < ninputs; i++) {
+        bool fl = (flat >> i) & 1;
+
+        g_string_append_printf(o, "    %s p%u [[user(p%u)%s]];\n",
+                               fl ? "uint4" : "float4", i, i, fl ? ", flat" : "");
+    }
+    g_string_append_printf(o,
+        "};\n"
+        "vertex BV hd_bvs(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
+        "    device const uchar *vram [[buffer(0)]], device const BVs &b [[buffer(1)]],\n"
+        "    device const uchar *ram [[buffer(2)]])\n"
+        "{\n"
+        "    device const uchar *st = (device const uchar *)&b;\n"
+        "    device const GVsDraw &v = b.v;\n"
+        "    device const uint *kv = (device const uint *)(st + v.kv_off);\n"
+        "    uint inst = iid, index = vid, pm = 0, fl = 0;\n"
+        "    uint rec[%u];\n"
+        "    for (uint i = 0; i < %u; i++) {\n        rec[i] = 0;\n    }\n"
+        "    bool killed = false;\n"
+        "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
+        "    for (uint i = 0; i < %u; i++) {\n"
+        "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
+        "    }\n"
+        "    R0[%u][0] = index;\n    R0[%u][3] = inst;\n",
+        HD5770_VS_REC(np), HD5770_VS_REC(np), ng, ng, ir->map[0], ir->map[0]);
+    vs_body(o, ir);
+    /* clip_dist(), vtx_window(), then the host's clip space */
+    g_string_append(o,
+        "    (void)pm;\n    (void)fl;\n    (void)killed;\n    (void)P0;\n"
+        "    float x = F(rec[0]), y = F(rec[1]), z = F(rec[2]), w = F(rec[3]);\n"
+        "    float dn = (b.clip & 2) ? z : z + w, df = w - z;\n"
+        "    if ((b.clip & 5) != 5) {\n        dn = 0.0f;\n    }\n"
+        "    if ((b.clip & 9) != 9) {\n        df = 0.0f;\n    }\n"
+        "    x /= w;\n    y /= w;\n    z /= w;\n"
+        "    if (b.vte & 1) {\n        x *= b.vport[0];\n    }\n"
+        "    if (b.vte & 2) {\n        x += b.vport[1];\n    }\n"
+        "    if (b.vte & 4) {\n        y *= b.vport[2];\n    }\n"
+        "    if (b.vte & 8) {\n        y += b.vport[3];\n    }\n"
+        "    if (b.vte & 16) {\n        z *= b.vport[4];\n    }\n"
+        "    if (b.vte & 32) {\n        z += b.vport[5];\n    }\n"
+        "    z += b.zoff;\n"
+        "    if (b.sc_mode & (1u << 16)) {\n"
+        "        x += (float)(short)(b.wofs & 0xffff);\n"
+        "        y += (float)(short)(b.wofs >> 16);\n"
+        "    }\n"
+        "    BV r;\n"
+        "    r.pos = float4(((x - b.pc + 0.5f) * b.vpx - 1.0f) * w,\n"
+        "                   (1.0f - (y - b.pc + 0.5f) * b.vpy) * w, z * w, w);\n"
+        "    r.cd[0] = dn;\n    r.cd[1] = df;\n");
+    for (i = 0; i < ninputs; i++) {
+        bool fl = (flat >> i) & 1;
+
+        g_string_append_printf(o, "    r.p%u = %s(", i, fl ? "uint4" : "float4");
+        for (k = 0; k < 4; k++) {
+            if (src[i] < 0) {
+                g_string_append_printf(o, "%s%sb.def[%u][%u]%s", k ? ", " : "",
+                                       fl ? "U(" : "", i, k, fl ? ")" : "");
+            } else if (src[i] >= (int)np) {
+                g_string_append_printf(o, "%s%s", k ? ", " : "",
+                                       fl ? "0u" : "0.0f");
+            } else {
+                g_string_append_printf(o, "%s%srec[%u]%s", k ? ", " : "",
+                                       fl ? "" : "F(", 4 + 4 * src[i] + k,
+                                       fl ? "" : ")");
+            }
+        }
+        g_string_append(o, ");\n");
+    }
+    g_string_append(o, "    return r;\n}\n");
+    return g_string_free(o, false);
 }
 
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)

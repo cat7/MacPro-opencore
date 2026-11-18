@@ -289,6 +289,7 @@ typedef struct Draw {
     int lx[HD5770_LANES], ly[HD5770_LANES];
     /* the triangles of a draw for the host GPU */
     GArray *gtri, *gprm;
+    const HD5770GpuVs *gvs;     /* the request goes with its vertex stage */
     unsigned gnin;
     /* textures set up so far in this draw, by resource and sampler */
     Tex tex[TEX_CACHE];
@@ -367,9 +368,11 @@ void hd5770_gfx_sync(HD5770Gfx *g)
         return;
     }
     gpu_lock(g, true);
-    if (g->npend || g->ram_pend) {
+    if (g->npend || g->ram_pend || g->nvpend || g->ram_vpend) {
         g->gpu->ops->sync(g->gpu->b);
         g->npend = 0;
+        g->nvpend = 0;
+        g->ram_vpend = false;
         g->ram_pend = false;
         g->ram_wpend = false;
         g->gst.syncs++;
@@ -379,7 +382,7 @@ void hd5770_gfx_sync(HD5770Gfx *g)
 
 bool hd5770_gfx_busy(HD5770Gfx *g)
 {
-    return g->gpu && (g->npend || g->ram_pend);
+    return g->gpu && (g->npend || g->ram_pend || g->nvpend || g->ram_vpend);
 }
 
 uint64_t hd5770_gfx_fence(HD5770Gfx *g)
@@ -391,6 +394,8 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
     if (!t) {
         /* everything queued is in memory */
         g->npend = 0;
+        g->nvpend = 0;
+        g->ram_vpend = false;
         g->ram_pend = false;
         g->ram_wpend = false;
     }
@@ -398,42 +403,55 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
     return t;
 }
 
+/* queued draws use VRAM [off, off + len); vb: or read it in place */
+static bool pend_hit(const HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
+{
+    unsigned i;
+
+    for (i = 0; i < g->npend; i++) {
+        if (off < g->pend[i][1] && g->pend[i][0] < off + len) {
+            return true;
+        }
+    }
+    for (i = 0; vb && i < g->nvpend; i++) {
+        if (off < g->vpend[i][1] && g->vpend[i][0] < off + len) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len)
 {
     bool hit = false;
-    unsigned i;
 
     if (!g->gpu) {
         return false;
     }
     gpu_lock(g, true);
-    for (i = 0; i < g->npend; i++) {
-        if (off < g->pend[i][1] && g->pend[i][0] < off + len) {
-            g->gst.touch_syncs++;
-            hit = true;
-            break;
-        }
-    }
+    hit = pend_hit(g, off, len, true);
+    g->gst.touch_syncs += hit;
     gpu_lock(g, false);
     return hit;
 }
 
-void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
+/* vb false: before a read, which the vertex buffers queued do not mind */
+static void pend_touch(HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
 {
-    unsigned i;
-
     if (!g->gpu) {
         return;
     }
     gpu_lock(g, true);
-    for (i = 0; i < g->npend; i++) {
-        if (off < g->pend[i][1] && g->pend[i][0] < off + len) {
-            g->gst.touch_syncs++;
-            hd5770_gfx_sync(g);
-            break;
-        }
+    if (pend_hit(g, off, len, vb)) {
+        g->gst.touch_syncs++;
+        hd5770_gfx_sync(g);
     }
     gpu_lock(g, false);
+}
+
+void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
+{
+    pend_touch(g, off, len, true);
 }
 
 /* the CPU wrote memory at mc: a backend with a copy of it checks it again */
@@ -461,14 +479,39 @@ static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
         return;
     }
     if (vram_off(g, mc, len, &off)) {
-        hd5770_gfx_touch(g, off, len);
+        pend_touch(g, off, len, false);
         return;
     }
     p = g->vram ? g->mem.map(g->mem.opaque, mc, &n, false) : NULL;
     if (p && p >= g->vram && p < g->vram + g->vram_size && n >= len) {
         /* VRAM through a GART page */
-        hd5770_gfx_touch(g, p - g->vram, len);
+        pend_touch(g, p - g->vram, len, false);
     } else if (g->ram_pend || !p || (p >= g->vram && p < g->vram + g->vram_size)) {
+        hd5770_gfx_sync(g);
+    }
+}
+
+/*
+ * The host GPU will read memory at mc in place (a vertex buffer): queued
+ * draws first, if they write it
+ */
+static void pend_check_vb(HD5770Gfx *g, uint64_t mc, uint64_t len)
+{
+    uint64_t off, n;
+    uint8_t *p;
+
+    if (!g->npend && !g->ram_wpend) {
+        return;
+    }
+    if (vram_off(g, mc, len, &off)) {
+        pend_touch(g, off, len, false);
+        return;
+    }
+    p = g->vram ? g->mem.map(g->mem.opaque, mc, &n, false) : NULL;
+    if (p && p >= g->vram && p < g->vram + g->vram_size && n >= len) {
+        pend_touch(g, p - g->vram, len, false);
+    } else if (g->ram_wpend || !p ||
+               (p >= g->vram && p < g->vram + g->vram_size)) {
         hd5770_gfx_sync(g);
     }
 }
@@ -3521,7 +3564,7 @@ static bool gpu_vs(Draw *d, HD5770GpuVs *v, const IdxSrc *is,
         }
         base = r[0] | ((uint64_t)(r[2] & 0xff) << 32);
         size = r[1] + 1;
-        pend_check(g, base, size);
+        (g->gpu->vs_draw ? pend_check_vb : pend_check)(g, base, size);
         if (!gpu_buf(g, base, size, &v->vb[k].buf)) {
             return false;
         }
@@ -4157,12 +4200,19 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
             q->flat |= 1u << i;
         }
     }
-    d->gtri = g_array_new(false, false, sizeof(HD5770GpuTri));
-    d->gprm = g_array_new(false, false, sizeof(float));
-    assemble(d, vb, nv, prim, t, gpu_tri);
-    q->ntri = d->gtri->len;
-    q->tri = (const HD5770GpuTri *)d->gtri->data;
-    q->prm = (const float *)d->gprm->data;
+    if (d->gvs) {
+        /* the backend runs the vertex stage: anywhere in the scissor */
+        q->vs = d->gvs;
+        y0 = d->y0;
+        y1 = d->y1 - 1;
+    } else {
+        d->gtri = g_array_new(false, false, sizeof(HD5770GpuTri));
+        d->gprm = g_array_new(false, false, sizeof(float));
+        assemble(d, vb, nv, prim, t, gpu_tri);
+        q->ntri = d->gtri->len;
+        q->tri = (const HD5770GpuTri *)d->gtri->data;
+        q->prm = (const float *)d->gprm->data;
+    }
     for (i = 0; i < q->ntri; i++) {
         y0 = MIN(y0, q->tri[i].y0);
         y1 = MAX(y1, q->tri[i].y1);
@@ -4175,7 +4225,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
      * the copy be read back first; nor a draw on a depth plane the host
      * GPU has written
      */
-    if (g->gpu_mode == HD5770_GPU_ON &&
+    if (g->gpu_mode == HD5770_GPU_ON && !d->gvs &&
         !(g->gpu->ops->wrote && (g->npend || g->ram_pend)) &&
         (d->db ? area * ps_cost(d, ir) < HD5770_DB_MIN_PIXELS
                : area * ps_cost(d, ir) < g->gpu->ops->min_pixels &&
@@ -4200,7 +4250,9 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         if (!ws[i]) {
             continue;
         }
-        hd5770_surf_rows(&ws[i]->s, y0, y1 + 1, &lo, &hi);
+        hd5770_surf_rows(&ws[i]->s, y0,
+                         d->gvs ? MIN(y1 + 1, (int)ws[i]->s.height) : y1 + 1,
+                         &lo, &hi);
         rng[nr][0] = lo - ws[i]->s.base + ws[i]->voff;
         rng[nr][1] = MIN(hi - ws[i]->s.base + ws[i]->voff, g->vram_size);
         if (rng[nr][1] > rng[nr][0]) {
@@ -4228,7 +4280,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     }
     g->gpu->building = false;
     g->gpu->why = 0;
-    if (q->ntri && !g->gpu->ops->draw(g->gpu->b, q)) {
+    if ((q->ntri || q->vs) && !g->gpu->ops->draw(g->gpu->b, q)) {
         for (i = 0; i < nr; i++) {
             g_free(pre[i]);
         }
@@ -4247,7 +4299,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     }
     ok = true;
     d->cwhy = HD5770_WHY_GPU;
-    if (q->ntri) {
+    if (q->ntri || q->vs) {
         zown_drawn(g, d, true);
     }
     g->gst.taken++;
@@ -4261,6 +4313,34 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         g->ram_pend |= q->rs.space;
         if (!q->rs.space) {
             pend_add(g, q->rs.voff, q->rs.voff + hd5770_surf_size(&q->rs.s));
+        }
+    }
+    for (i = 0; q->vs && i < q->vs->nvb; i++) {
+        /* the vertex buffers are read in place */
+        const HD5770GpuSurf *b = &q->vs->vb[i].buf;
+
+        g->ram_vpend |= b->space;
+        if (!b->space) {
+            uint64_t lo = b->voff;
+            uint64_t hi = MIN(b->voff + b->s.pitch, g->vram_size);
+            unsigned j;
+
+            for (j = 0; j < g->nvpend; j++) {
+                if (lo <= g->vpend[j][1] && g->vpend[j][0] <= hi) {
+                    break;
+                }
+            }
+            if (j == ARRAY_SIZE(g->vpend)) {
+                j--;
+            }
+            if (j == g->nvpend) {
+                g->vpend[j][0] = lo;
+                g->vpend[j][1] = hi;
+                g->nvpend++;
+            } else {
+                g->vpend[j][0] = MIN(g->vpend[j][0], lo);
+                g->vpend[j][1] = MAX(g->vpend[j][1], hi);
+            }
         }
     }
     for (i = 0; i < q->ntex; i++) {
@@ -4336,6 +4416,131 @@ out:
     }
     gpu_req_free(q);
     return ok;
+}
+
+/*
+ * poly_offset() for a host rasteriser: the constant and the slope factor
+ * when the sides drawn have the same offset and no clamp
+ */
+static bool vsb_offset(Draw *d, float *zc, float *zsl)
+{
+    HD5770Gfx *g = d->g;
+    uint32_t sc = CTX(g, PA_SU_SC_MODE_CNTL);
+    unsigned en = (sc >> 11) & 3, vis = ~d->cull & 3, side;
+    float scale[2], units[2], clamp, r;
+
+    if (!(en & vis)) {
+        return true;
+    }
+    if ((en & vis) != vis) {
+        return false;
+    }
+    for (side = 0; side < 2; side++) {
+        memcpy(&scale[side],
+               &g->ctx[(PA_SU_POLY_OFFSET_FRONT_SCALE + side * 8 - 0x28000) / 4],
+               4);
+        memcpy(&units[side],
+               &g->ctx[(PA_SU_POLY_OFFSET_FRONT_SCALE + side * 8 + 4 - 0x28000)
+                       / 4], 4);
+    }
+    memcpy(&clamp, &g->ctx[(PA_SU_POLY_OFFSET_CLAMP - 0x28000) / 4], 4);
+    if (clamp != 0.0f ||
+        (vis == 3 && (scale[0] != scale[1] || units[0] != units[1]))) {
+        return false;
+    }
+    side = vis == 2 ? 1 : 0;
+    r = d->zfmt == 1 ? 0.25f : d->zfmt == 2 ? 0.5f : 1.0f;
+    *zsl = scale[side] / 16.0f;
+    *zc = units[side] *
+          ldexpf(r, (int8_t)(CTX(g, PA_SU_POLY_OFFSET_DB_FMT_CNTL) & 0xff));
+    return *zc == *zc && *zsl == *zsl;
+}
+
+/*
+ * The draw with its vertex stage on the host GPU (HD5770Gpu.vs_draw):
+ * all instances and runs in one request. false: not taken, the stage
+ * runs here.
+ */
+static bool vsb_draw(Draw *d, const IdxSrc *is, const uint32_t *idx,
+                     const uint32_t *slot, const uint32_t *vid, unsigned nv,
+                     unsigned nu, unsigned count, unsigned prim,
+                     unsigned ninst, HD5770Thread *t)
+{
+    HD5770Gfx *g = d->g;
+    HD5770GpuVs v, v1;
+    HD5770Val *kv = NULL;
+    uint32_t *em = NULL, *tidx = NULL;
+    unsigned why = HD5770_VSB_N, n, i, j;
+    float zc = 0.0f, zsl = 0.0f;
+    bool taken = false;
+
+    if (!g->gpu || g->gpu_mode != HD5770_GPU_ON) {
+        return false;
+    }
+    if (!g->gpu->vs_draw) {
+        why = HD5770_VSB_OFF;
+    } else if (!hd5770_vs_ir((HD5770Prog *)d->vs, d->fs)) {
+        why = HD5770_VSB_NO_IR;
+    } else if (prim == PRIM_RECTLIST) {
+        why = HD5770_VSB_PRIM;
+    } else if (d->resolve || (d->db && (d->rctl & 1))) {
+        why = HD5770_VSB_CLEAR;
+    } else if (!d->persp) {
+        why = HD5770_VSB_INTERP;
+    } else if (CTX(g, PA_CL_VTE_CNTL) & (1u << 8)) {
+        why = HD5770_VSB_VTE;
+    } else if (!vsb_offset(d, &zc, &zsl)) {
+        why = HD5770_VSB_OFFSET;
+    } else if (!d->db && (uint64_t)nu * ninst < 256) {
+        why = HD5770_VSB_FEW;
+    } else if (count > MAX_VERTS) {
+        why = HD5770_VSB_COUNT;
+    } else if (!gpu_vs(d, &v, is, idx, slot, nv, prim, ninst, &kv)) {
+        gpu_vs_free(&v);
+        why = HD5770_VSB_BUFFER;
+    }
+    if (why != HD5770_VSB_N) {
+        g->gst.vsb_why[why]++;
+        return false;
+    }
+    v.zoff_const = zc;
+    v.zoff_slope = zsl;
+    /* the triangles of an instance, by vertex index */
+    v1 = v;
+    v1.ninst = 1;
+    n = hd5770_vs_emits(&v1, NULL);
+    em = g_new(uint32_t, MAX(n, 1u) * 5);
+    tidx = g_new(uint32_t, MAX(n, 1u) * 3);
+    hd5770_vs_emits(&v1, em);
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < 3; j++) {
+            tidx[i * 3 + j] = vid[slot[em[i * 5 + j]]];
+        }
+    }
+    v.tidx = tidx;
+    v.ntidx = n * 3;
+    d->gvs = &v;
+    d->gfb = GFB_NONE;
+    d->cwhy = HD5770_WHY_N;
+    gpu_lock(g, true);
+    taken = gpu_draw(d, NULL, 0, prim, t);
+    gpu_lock(g, false);
+    d->gvs = NULL;
+    if (taken) {
+        g->gst.vsb_taken++;
+        d->why = HD5770_WHY_GPU;
+    } else {
+        g->gst.vsb_why[HD5770_VSB_DRAW]++;
+        g->gst.offered--;
+        if (d->gfb < GFB_NONE) {
+            g->gst.fallback[d->gfb]--;
+        }
+    }
+    gpu_vs_free(&v);
+    g_free(kv);
+    g_free(em);
+    g_free(tidx);
+    return taken;
 }
 
 /* the pixel shader samples a mipmapped texture: it needs derivatives */
@@ -4976,8 +5181,13 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         vm = g_new(uint64_t, MAX(nu, 1));
         g->gst.vs_draws++;
     }
+    if (vsb_draw(d, &isrc, idx, slot, vid, nv, nu, count, prim, ninst, t)) {
+        st->drawn++;
+        goto out;
+    }
     for (inst = 0; inst < ninst && d->ok; inst++) {
         unsigned s0 = 0, k = 0;
+        int64_t tv = get_clock();
 
         kcache_drop(d);
         for (i = 0; i < nu; i++) {
@@ -4989,6 +5199,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
                 vm[i] = t->param_mask | (uint64_t)t->pos_written << 32;
             }
         }
+        g->gst.vs_ns += get_clock() - tv;
         if (vc.rec) {
             vs_check(d, vc.rec, vc.np, slot, nv, inst, vb, vm);
             if (vc.ctri) {
@@ -5284,6 +5495,23 @@ void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out)
         t->fb_ns[GFB_VB] / 1000000, t->fb_px[GFB_VB] / 1000,
         t->fb_ns[GFB_BACKEND] / 1000000, t->fb_px[GFB_BACKEND] / 1000,
         t->fb_ns[GFB_DB] / 1000000, t->fb_px[GFB_DB] / 1000);
+    g_string_append_printf(out, "gpu: vertex stage: on the host GPU %" PRIu64
+                           " draws; on the CPU ms %" PRIu64 ", draws:",
+                           t->vsb_taken, t->vs_ns / 1000000);
+    for (unsigned i = 0; i < HD5770_VSB_N; i++) {
+        static const char *const nm[HD5770_VSB_N] = {
+            "backend takes none", "no IR", "rectangle list", "clear",
+            "inputs not perspective", "positions not in clip space",
+            "polygon offset", "few vertices without depth",
+            "vertex count", "vertex buffer", "draw not taken",
+        };
+
+        if (t->vsb_why[i]) {
+            g_string_append_printf(out, " %s %" PRIu64 ",", nm[i],
+                                   t->vsb_why[i]);
+        }
+    }
+    g_string_append(out, "\n");
     hd5770_gfx_why_stats(g, out);
     g->gpu->ops->stats(g->gpu->b, out);
 }

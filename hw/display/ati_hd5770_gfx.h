@@ -275,6 +275,22 @@ enum {
 
 const char *hd5770_why_name(unsigned why);
 
+/* why a draw's vertex stage ran on the CPU */
+enum {
+    HD5770_VSB_OFF,             /* the backend takes none */
+    HD5770_VSB_NO_IR,
+    HD5770_VSB_PRIM,            /* rectangle list */
+    HD5770_VSB_CLEAR,           /* depth clear, resolve */
+    HD5770_VSB_INTERP,          /* inputs not perspective correct */
+    HD5770_VSB_VTE,             /* positions not in clip space */
+    HD5770_VSB_OFFSET,          /* polygon offset */
+    HD5770_VSB_FEW,             /* few vertices, no depth */
+    HD5770_VSB_COUNT,           /* more vertices than one run takes */
+    HD5770_VSB_BUFFER,          /* a vertex buffer not reachable */
+    HD5770_VSB_DRAW,            /* the draw was not taken */
+    HD5770_VSB_N
+};
+
 typedef struct HD5770GpuStats {
     uint64_t offered, taken, fallback[8], taken_db;
     uint64_t verified, vdiff_draws, vdiff_bytes, vdiff_big, vmax;
@@ -305,6 +321,11 @@ typedef struct HD5770GpuStats {
     uint64_t mixed_gpu;
     /* draws with depth kept from the small-draw policy */
     uint64_t mixed_kept;
+    /*
+     * the vertex stage: draws whose stage the host GPU ran, the others
+     * by reason (HD5770_VSB_*), the CPU's time in vertex shaders
+     */
+    uint64_t vsb_taken, vsb_why[HD5770_VSB_N], vs_ns;
     /* draws whose vertex shader has no host IR, by reason */
     uint64_t vs_why[HD5770_WHY_N];
 } HD5770GpuStats;
@@ -330,6 +351,10 @@ typedef struct HD5770Gfx {
     /* VRAM ranges queued draws read or write, [lo, hi) */
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;
+    /* VRAM ranges queued draws read in place: vertex buffers */
+    uint64_t vpend[8][2];
+    unsigned nvpend;
+    bool ram_vpend;             /* the same in guest RAM */
     /*
      * depth planes and who has written depth into them since their last
      * clear; ext: the scissors of those draws, x0 y0 x1 y1

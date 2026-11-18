@@ -75,7 +75,7 @@ enum {
     ND_PROG_INPUTS, ND_PROG_VTX, ND_PROG_EMIT, ND_PROG_BUILD,
     ND_TEX_KIND, ND_TEX_FMT, ND_TEX_SURF, ND_TEX_TARGET, ND_W, ND_ROOM,
     ND_MRT, ND_RESOLVE, ND_ZEXPORT, ND_RT_WIDE, ND_FETCH_OP, ND_TEX_BC,
-    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY, ND_TEX_MANY,
+    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY, ND_TEX_MANY, ND_VS,
     ND_N
 };
 
@@ -89,7 +89,38 @@ static const char *const nd_names[ND_N] = {
     "more render targets", "resolve", "depth export",
     "target over 8 bytes", "fetch operation", "BC texture", "3D texture",
     "cube texture", "array texture", "texture levels and slices",
+    "vertex stage",
 };
+
+/* the layouts of hd5770_msl_native_vs() */
+typedef struct GBuf {
+    uint32_t voff, space, pt_off, pg0;
+} GBuf;
+
+typedef struct GVsVb {
+    uint32_t id, pad0, pad1, pad2;
+    uint32_t res[8];
+    GBuf b;
+} GVsVb;
+
+typedef struct GVsDraw {
+    uint32_t nslot, ninst, rec_words, np;
+    uint32_t kv_off, cfile_off, nvb, base_vtx;
+    uint32_t start_inst, idx_kind, ib_i32, ib_swap;
+    uint32_t ib_max, ioff, lo, hi;
+    uint32_t restart, reset, imm_off, pad;
+    GBuf ib;
+    GVsVb vb[8];
+} GVsDraw;
+
+typedef struct NatVs {
+    GVsDraw v;
+    uint32_t vte, sc_mode, wofs, clip;
+    float vport[6];
+    float vpx, vpy;
+    float pc, zoff, pad[2];
+    float def[32][4];
+} NatVs;
 
 /* the uniforms of hd5770_msl_native_fs() */
 typedef struct NatU {
@@ -170,6 +201,8 @@ typedef struct NatSurf {
     uint64_t pin;               /* the draw that uses it */
     uint64_t pass;              /* the last pass that uses it */
     uint8_t run;                /* elements of a micro tile row in a run */
+    /* a depth plane: vertex stages of its draws since its clear */
+    uint8_t vsm;                /* bit 0 the CPU's, bit 1 the host's */
     bool dirty;                 /* tex is newer than memory */
     int nr, r[NAT_RECTS][4];    /* where: x0, y0, x1, y1 */
     size_t ro[NAT_RECTS];       /* their pixels in the read buffer */
@@ -205,7 +238,11 @@ typedef struct HD5770Mtlr {
     uint8_t *vram, *ram;
     uint64_t vram_size, ram_size;
     id<MTLBuffer> ring, rbuf;
+    id<MTLBuffer> bvram, bram;  /* memory in place, for vertex stages */
     size_t ring_at;
+    GHashTable *vprogs;
+    uint64_t vs_draws, vs_tris, vs_builds, vs_build_ns;
+    uint64_t vs_mixed[2];       /* CPU stage after host's, host's after CPU */
     id<MTLSamplerState> samp[2];
     GHashTable *progs, *psos, *dss;
     id<MTLDepthStencilState> ds_off;
@@ -1498,6 +1535,48 @@ static void nat_blend(unsigned fn, unsigned sf, unsigned df,
 
 /* hf, zf, sf: the formats of the pass's attachments, NF_N: none */
 /* a colour buffer of a draw */
+/* the vertex function of vertex stage v for a program's inputs */
+static id<MTLFunction> nat_vprog(HD5770Mtlr *m, const HD5770GpuVs *v,
+                                 unsigned ninputs, uint32_t flat,
+                                 const char *key)
+{
+    id<MTLFunction> fn = nil;
+    gpointer p;
+    char *src;
+    int64_t t0;
+
+    if (g_hash_table_lookup_extended(m->vprogs, key, NULL, &p)) {
+        return p;
+    }
+    src = hd5770_msl_native_vs(v->ir, ninputs, flat, v->src);
+    if (src) {
+        MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
+        NSError *e = nil;
+        id<MTLLibrary> lib;
+
+        nat_exact_math(o);
+        o.preserveInvariance = YES;
+        t0 = get_clock();
+        lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                                   options:o error:&e];
+        m->vs_build_ns += get_clock() - t0;
+        nat_built(m, t0);
+        m->vs_builds++;
+        [o release];
+        if (lib) {
+            fn = [lib newFunctionWithName:@"hd_bvs"];
+            [lib release];
+        } else {
+            fprintf(stderr, "ati-hd5770: native vertex program %016" PRIx64
+                    " not built: %s\n", v->ir->hash,
+                    e.localizedDescription.UTF8String);
+        }
+        g_free(src);
+    }
+    g_hash_table_insert(m->vprogs, g_strdup(key), fn);
+    return fn;
+}
+
 typedef struct NatTg {
     const HD5770GpuSurf *surf;
     NatSurf *e;
@@ -1506,6 +1585,7 @@ typedef struct NatTg {
 } NatTg;
 
 static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
+                                          id<MTLFunction> vfn,
                                           const char *pkey, const NatTg *tg,
                                           unsigned nt, unsigned zf,
                                           unsigned sf)
@@ -1529,7 +1609,7 @@ static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
         return v;
     }
     d = [[MTLRenderPipelineDescriptor alloc] init];
-    d.vertexFunction = pr->vfn;
+    d.vertexFunction = vfn ? vfn : pr->vfn;
     d.fragmentFunction = pr->ffn;
     if (zf < NF_N) {
         d.depthAttachmentPixelFormat = nf_fmt[zf];
@@ -1801,6 +1881,10 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     int x0, y0, x1, y1, bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
     int sc[4] = { d->sc[0], d->sc[1], d->sc[2], d->sc[3] };
     GString *pkey;
+    const HD5770GpuVs *v = d->vs;
+    id<MTLFunction> vfn = nil;
+    NatVs *nv = NULL;
+    size_t o_n = 0, o_i = 0, vneed = 0;
 
     m->seq++;
     if (d->resolve) {
@@ -1995,6 +2079,21 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         bx1 = MAX(bx1, t->x1 + 1);
         by1 = MAX(by1, t->y1 + 1);
     }
+    if (v) {
+        /* no triangles here: the scissor */
+        bx0 = sc[0];
+        by0 = sc[1];
+        bx1 = sc[2];
+        by1 = sc[3];
+        if (!m->bvram || (d->rctl & 1 && d->db)) {
+            return nat_decline(m, ND_VS, HD5770_WHY_BK_NATIVE_STATE);
+        }
+        for (i = 0; i < v->nvb; i++) {
+            if (v->vb[i].buf.space && !m->bram) {
+                return nat_decline(m, ND_VS, HD5770_WHY_BK_NATIVE_STATE);
+            }
+        }
+    }
     vw = vh = hh = UINT32_MAX;
     for (i = 0; i < nt; i++) {
         tg[i].e = tg[i].surf->space && !m->pub.done_ram ? NULL :
@@ -2041,7 +2140,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     y0 = MAX(MAX(sc[1], by0), 0);
     x1 = MIN(MIN(sc[2], bx1), (int)vw);
     y1 = MIN(MIN(sc[3], by1), (int)hh);
-    if (!d->ntri || !nat || x0 >= x1 || y0 >= y1 || (!mask && !d->db)) {
+    if ((!d->ntri && !(v && v->ntidx && v->cull != 3)) || !nat || x0 >= x1 ||
+        y0 >= y1 || (!mask && !d->db)) {
         m->nd[ND_EMPTY]++;
         return true;
     }
@@ -2122,8 +2222,31 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         g_string_free(pkey, true);
         return nat_decline(m, ND_PROG_EMIT, HD5770_WHY_BK_PROG);
     }
+    if (v) {
+        uint32_t fl = hd5770_msl_native_flat(ir, &k);
+        GString *vk = g_string_new(NULL);
+
+        g_string_printf(vk, "%016" PRIx64 "/%u/%u/%08x", v->ir->hash,
+                        v->ir->ninsts, k.ninputs, fl);
+        for (i = 0; i < k.ninputs; i++) {
+            g_string_append_printf(vk, ".%d", v->src[i]);
+        }
+        vfn = nat_vprog(m, v, k.ninputs, fl, vk->str);
+        g_string_append_printf(pkey, "|%s", vk->str);
+        g_string_free(vk, true);
+        if (!vfn) {
+            g_string_free(pkey, true);
+            return nat_decline(m, ND_VS, HD5770_WHY_BK_PROG);
+        }
+        vneed = ROUND_UP(sizeof(NatVs), 16) +
+                ROUND_UP((v->ir->nconsts + 1) * 4, 16) + 4096;
+        for (i = 0; i < v->nvb; i++) {
+            vneed += v->vb[i].buf.npages * 4;
+        }
+    }
     need = sizeof(NatU) + (size_t)d->ntri * 3 * vstride * sizeof(float) +
-           MAX(ir->nconsts, 1u) * sizeof(uint32_t) + 3 * 256;
+           MAX(ir->nconsts, 1u) * sizeof(uint32_t) + 3 * 256 + vneed + 256 +
+           (v ? (size_t)v->ntidx * 4 + 256 : 0);
     for (i = 0; i < d->nvb; i++) {
         need += d->vb[i].len + 4 + 256;
     }
@@ -2155,7 +2278,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     }
     pz = reuse ? m->cur_z : zs;
     ps = reuse ? m->cur_s : ss;
-    pso = nat_pso(m, pr, pkey->str, tg, nt, pz ? pz->hf : NF_N,
+    pso = nat_pso(m, pr, vfn, pkey->str, tg, nt, pz ? pz->hf : NF_N,
                   ps ? ps->hf : NF_N);
     g_string_free(pkey, true);
     if (!pso) {
@@ -2171,6 +2294,52 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     vb = nat_ring(m, (size_t)d->ntri * 3 * vstride * sizeof(float), &o_v);
     kv = nat_ring(m, MAX(ir->nconsts, 1u) * sizeof(uint32_t), &o_k);
     memset(u, 0, sizeof(*u));
+    if (v) {
+        uint8_t *st = nat_ring(m, vneed, &o_n);
+        uint32_t *ix = nat_ring(m, (size_t)v->ntidx * 4, &o_i);
+        size_t o = ROUND_UP(sizeof(NatVs), 16);
+
+        nv = (NatVs *)st;
+        memset(nv, 0, sizeof(*nv));
+        memcpy(ix, v->tidx, (size_t)v->ntidx * 4);
+        nv->v.nslot = v->nslot;
+        nv->v.ninst = v->ninst;
+        nv->v.np = v->np;
+        nv->v.kv_off = o;
+        memcpy(st + o, v->kv, v->ir->nconsts * 4);
+        o += ROUND_UP((v->ir->nconsts + 1) * 4, 16);
+        nv->v.cfile_off = o;
+        memcpy(st + o, v->cfile, 4096);
+        o += 4096;
+        nv->v.nvb = v->nvb;
+        nv->v.base_vtx = v->base_vtx;
+        nv->v.start_inst = v->start_inst;
+        for (i = 0; i < v->nvb; i++) {
+            const HD5770GpuSurf *b = &v->vb[i].buf;
+
+            nv->v.vb[i].id = v->vb[i].id;
+            memcpy(nv->v.vb[i].res, v->vb[i].res, sizeof(nv->v.vb[i].res));
+            nv->v.vb[i].b.voff = b->voff;
+            if (b->space) {
+                nv->v.vb[i].b.space = 1;
+                nv->v.vb[i].b.pt_off = o;
+                nv->v.vb[i].b.pg0 = b->pg0;
+                memcpy(st + o, b->pages, b->npages * 4);
+                o += b->npages * 4;
+            }
+        }
+        nv->vte = v->vte;
+        nv->sc_mode = v->sc_mode;
+        nv->wofs = v->window_offset;
+        nv->clip = (v->clip_on ? 1 : 0) | (v->clip_dx ? 2 : 0) |
+                   (v->clip_near ? 4 : 0) | (v->clip_far ? 8 : 0);
+        memcpy(nv->vport, v->vport, sizeof(nv->vport));
+        nv->vpx = 2.0f / vw;
+        nv->vpy = 2.0f / vh;
+        nv->pc = v->pix_center;
+        nv->zoff = v->zoff_const;
+        memcpy(nv->def, v->def, sizeof(nv->def));
+    }
     for (i = 0; i < d->nvb; i++) {
         vd[i] = nat_ring(m, d->vb[i].len + 4, &o_d[i]);
         memcpy(vd[i], d->vb[i].data, d->vb[i].len);
@@ -2341,7 +2510,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     for (i = 0; i < nex; i++) {
         [m->enc setFragmentTexture:ex[i]->tex atIndex:16 + i];
     }
-    if (ss && (d->dctl & DC_BACKFACE)) {
+    if (!v && ss && (d->dctl & DC_BACKFACE)) {
         /*
          * two-sided stencil: the triangles come clockwise; the ones that
          * face back are drawn with the winding turned
@@ -2358,9 +2527,38 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
                        vertexCount:(j - i) * 3];
         }
         [m->enc setFrontFacingWinding:MTLWindingClockwise];
+    } else if (v) {
+        [m->enc setVertexBuffer:m->bvram offset:0 atIndex:0];
+        [m->enc setVertexBuffer:m->ring offset:o_n atIndex:1];
+        [m->enc setVertexBuffer:m->bram ? m->bram : m->bvram offset:0
+                        atIndex:2];
+        [m->enc setCullMode:v->cull == 1 ? MTLCullModeFront :
+                            v->cull == 2 ? MTLCullModeBack : MTLCullModeNone];
+        [m->enc setFrontFacingWinding:v->face_cw ? MTLWindingClockwise
+                                                 : MTLWindingCounterClockwise];
+        [m->enc setDepthBias:0.0f slopeScale:v->zoff_slope clamp:0.0f];
+        [m->enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                           indexCount:v->ntidx
+                            indexType:MTLIndexTypeUInt32
+                          indexBuffer:m->ring
+                    indexBufferOffset:o_i
+                        instanceCount:v->ninst];
+        [m->enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+        [m->enc setCullMode:MTLCullModeNone];
+        [m->enc setFrontFacingWinding:MTLWindingClockwise];
+        m->vs_draws++;
+        m->vs_tris += (uint64_t)v->ntidx / 3 * v->ninst;
     } else {
         [m->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
                    vertexCount:d->ntri * 3];
+    }
+    if (zs && zclear) {
+        zs->vsm = 0;
+    } else if (zs && (d->dctl & DC_Z)) {
+        unsigned bit = v ? 2 : 1;
+
+        m->vs_mixed[v != NULL] += (zs->vsm & ~bit) != 0;
+        zs->vsm |= bit;
     }
     for (i = 0; i < nt; i++) {
         nat_drew(tg[i].e, x0, y0, x1, y1);
@@ -2577,6 +2775,16 @@ static bool nat_ram(void *opaque, uint8_t *host, uint64_t size)
 
     m->ram = host;
     m->ram_size = size;
+    if (m->bvram && !m->bram &&
+        !((uintptr_t)host % qemu_real_host_page_size()) &&
+        !(size % qemu_real_host_page_size()) &&
+        size <= m->dev.maxBufferLength) {
+        @autoreleasepool {
+            m->bram = [m->dev newBufferWithBytesNoCopy:host length:size
+                                  options:MTLResourceStorageModeShared
+                                  deallocator:nil];
+        }
+    }
     return true;
 }
 
@@ -2639,6 +2847,14 @@ static void nat_stats(void *opaque, GString *out)
                            m->build_ns / 1000000,
                            s->len ? g_array_index(s, float, s->len / 2) : 0.0f,
                            s->len ? g_array_index(s, float, s->len - 1) : 0.0f);
+    g_string_append_printf(out, "native: vertex stage on the host: draws %"
+                           PRIu64 " triangles %" PRIu64 " programs %" PRIu64
+                           " (ms %" PRIu64 "); mixed vertex stage on a depth"
+                           " plane since its clear: CPU stage after host's %"
+                           PRIu64 ", host's after CPU %" PRIu64 "\n",
+                           m->vs_draws, m->vs_tris, m->vs_builds,
+                           m->vs_build_ns / 1000000, m->vs_mixed[0],
+                           m->vs_mixed[1]);
     if (m->audit) {
         g_string_append_printf(out, "native: audit: bands compared %" PRIu64
                                " (%" PRIu64 " MB; depth and stencil %" PRIu64
@@ -2679,6 +2895,9 @@ static void nat_close(void *opaque)
     [m->ds_off release];
     g_hash_table_destroy(m->psos);
     g_hash_table_destroy(m->progs);
+    g_hash_table_destroy(m->vprogs);
+    [m->bvram release];
+    [m->bram release];
     g_array_free(m->ranges, true);
     g_array_free(m->build_ms, true);
     g_free(m->tmp);
@@ -2769,6 +2988,8 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
     }
     m->progs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                      nat_prog_free);
+    m->vprogs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                      nat_pso_free);
     m->psos = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                     nat_pso_free);
     m->dss = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
@@ -2793,6 +3014,18 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
     m->stamp[0] = m->stamp[1] = 1;
     m->build_ms = g_array_new(false, false, sizeof(float));
     m->audit = getenv("HD5770_NAT_AUDIT") != NULL;
+    if (!getenv("HD5770_NAT_VSA") &&
+        !((uintptr_t)vram % qemu_real_host_page_size()) &&
+        !(vram_size % qemu_real_host_page_size()) &&
+        vram_size <= m->dev.maxBufferLength) {
+        /* HD5770_NAT_VSA: every vertex stage on the CPU */
+        @autoreleasepool {
+            m->bvram = [m->dev newBufferWithBytesNoCopy:vram length:vram_size
+                                   options:MTLResourceStorageModeShared
+                                   deallocator:nil];
+        }
+        m->pub.vs_draw = m->bvram != nil;
+    }
     m->pub.ops = &nat_ops;
     m->pub.b = m;
     return &m->pub;

@@ -149,6 +149,7 @@ typedef struct HD5770GpuTri {
     uint32_t front;             /* the triangle faces front */
 } HD5770GpuTri;
 
+struct HD5770GpuVs;
 typedef struct HD5770GpuDraw {
     const HD5770IR *ir;
     const uint32_t *kv;         /* ir->nconsts bound constants, raw */
@@ -231,6 +232,12 @@ typedef struct HD5770GpuDraw {
     uint32_t rs_fmt, rs_num, rs_comps, rs_src[4];
     /* added 2026-11-17: the scissor, x0, y0, x1, y1 (x1, y1 exclusive) */
     int32_t sc[4];
+    /*
+     * added 2026-11-18, only for backends with HD5770Gpu.vs_draw: the
+     * draw before its vertex stage. ntri is 0; the backend runs vertex
+     * stage vs (below) itself and rasterises its triangles vs->tidx.
+     */
+    const struct HD5770GpuVs *vs;
 } HD5770GpuDraw;
 
 /*
@@ -296,6 +303,18 @@ typedef struct HD5770GpuVs {
     uint32_t zfmt;
     int32_t src[32];
     float def[32][4];
+    /*
+     * added 2026-11-18 (HD5770GpuDraw.vs): the triangles of one instance
+     * as vertex indices (the index the shader runs with), three each,
+     * the vertex whose flat inputs count first
+     */
+    const uint32_t *tidx;
+    unsigned ntidx;
+    /*
+     * the polygon offset of the sides not culled (alike, not clamped):
+     * zoff_const + zoff_slope * the steeper of the depth's slopes
+     */
+    float zoff_const, zoff_slope;
 } HD5770GpuVs;
 
 /* the parameters a vertex shader's records hold (HD5770GpuVs.np) */
@@ -378,6 +397,8 @@ typedef struct HD5770Gpu {
      * log, every page may have been written.
      */
     uint64_t (*written)(void *opaque, uint64_t off);
+    /* added 2026-11-18: takes draws with HD5770GpuDraw.vs */
+    bool vs_draw;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */
@@ -475,6 +496,18 @@ typedef struct HD5770NatKey {
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);
+/* the inputs of hd_nfs that are not interpolated */
+uint32_t hd5770_msl_native_flat(const HD5770IR *ir, const HD5770NatKey *k);
+/*
+ * A vertex shader's IR as vertex function hd_bvs for the fragment
+ * functions above (HD5770GpuDraw.vs): the vertex index is the vertex id,
+ * the instance the instance id; buffers 0 VRAM, 1 the draw (NatVs of
+ * ati_hd5770_mtlr.m, offsets from its start), 2 guest RAM. Input p of
+ * ninputs is parameter src[p] (-1: the draw's default), as bits when bit
+ * p of flat is set. NULL: not expressible.
+ */
+char *hd5770_msl_native_vs(const HD5770IR *ir, unsigned ninputs,
+                           uint32_t flat, const int32_t *src);
 HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
                             const char **err);
 
