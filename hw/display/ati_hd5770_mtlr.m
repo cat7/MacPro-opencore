@@ -75,7 +75,7 @@ enum {
     ND_PROG_INPUTS, ND_PROG_VTX, ND_PROG_EMIT, ND_PROG_BUILD,
     ND_TEX_KIND, ND_TEX_FMT, ND_TEX_SURF, ND_TEX_TARGET, ND_W, ND_ROOM,
     ND_MRT, ND_RESOLVE, ND_ZEXPORT, ND_RT_WIDE, ND_FETCH_OP, ND_TEX_BC,
-    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY,
+    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY, ND_TEX_MANY,
     ND_N
 };
 
@@ -88,7 +88,7 @@ static const char *const nd_names[ND_N] = {
     "texture surface", "texture is the target", "1/w", "room",
     "more render targets", "resolve", "depth export",
     "target over 8 bytes", "fetch operation", "BC texture", "3D texture",
-    "cube texture", "array texture",
+    "cube texture", "array texture", "texture levels and slices",
 };
 
 /* the uniforms of hd5770_msl_native_fs() */
@@ -111,11 +111,16 @@ typedef struct NatU {
     uint32_t tres[16][4];       /* base level, levels, depth */
     float lsize[HD5770_NAT_LEVELS][4];
     float zr[4];                /* the depth range */
+    uint32_t tcmp[16][4];       /* comparison + 1, UNORM steps, Z linear, Z clamp */
+    uint32_t lconst[32];
+    uint32_t bconst, zero, pad3[2];
 } NatU;
 
 /* host formats: the element's bytes */
 enum {
     NF_RGBA8, NF_R8, NF_R16, NF_D16, NF_D24, NF_D32, NF_S8, NF_RGBA16F, NF_RG8,
+    NF_RGBA32F, NF_R32F, NF_RGBA16,
+    NF_BC1, NF_BC2, NF_BC3, NF_BC4, NF_BC4S, NF_BC5, NF_BC5S,
     NF_N
 };
 
@@ -124,8 +129,17 @@ static const MTLPixelFormat nf_fmt[NF_N] = {
     MTLPixelFormatDepth16Unorm, MTLPixelFormatDepth32Float,
     MTLPixelFormatDepth32Float, MTLPixelFormatStencil8,
     MTLPixelFormatRGBA16Float, MTLPixelFormatRG8Unorm,
+    MTLPixelFormatRGBA32Float, MTLPixelFormatR32Float,
+    MTLPixelFormatRGBA16Unorm,
+    MTLPixelFormatBC1_RGBA, MTLPixelFormatBC2_RGBA, MTLPixelFormatBC3_RGBA,
+    MTLPixelFormatBC4_RUnorm, MTLPixelFormatBC4_RSnorm,
+    MTLPixelFormatBC5_RGUnorm, MTLPixelFormatBC5_RGSnorm,
 };
-static const uint8_t nf_bpe[NF_N] = { 4, 1, 2, 2, 4, 4, 1, 8, 2 };
+static const uint8_t nf_bpe[NF_N] = {
+    4, 1, 2, 2, 4, 4, 1, 8, 2, 16, 4, 8, 8, 16, 16, 8, 8, 16, 16,
+};
+/* texels along an element: the BC formats' elements are 4x4 blocks */
+#define NF_BLK(hf)      ((hf) >= NF_BC1 ? 4u : 1u)
 
 #define NAT_BAND        32      /* rows compared and uploaded together */
 #define NAT_RECTS       4
@@ -196,12 +210,15 @@ typedef struct HD5770Mtlr {
     GHashTable *progs, *psos, *dss;
     id<MTLDepthStencilState> ds_off;
     bool sep_ds;                /* depth and stencil attach separately */
+    bool bc_ok;                 /* BC formats are textures */
     GPtrArray *surfs;
     GArray *ranges;
     id<MTLCommandBuffer> last;
     id<MTLCommandBuffer> cb;
     id<MTLRenderCommandEncoder> enc;
     NatSurf *cur, *cur_z, *cur_s;   /* the pass's attachments */
+    NatSurf *curm[7];           /* its colour buffers after the first */
+    unsigned ncurm;
     bool pass_on;
     uint32_t vw, vh;            /* its size */
     uint64_t epoch;
@@ -302,6 +319,7 @@ static void nat_end_pass(HD5770Mtlr *m)
         m->cb = nil;
     }
     m->cur = m->cur_z = m->cur_s = NULL;
+    m->ncurm = 0;
     m->pass_on = false;
 }
 
@@ -404,6 +422,19 @@ static void nat_row(HD5770Mtlr *m, const NatSurf *e, uint32_t x0, uint32_t y,
     uint32_t x = x0, end = x0 + n, bpe = s->bpe;
     uint8_t *mem = m->vram + e->voff, *sh = e->shadow;
 
+    if (!s->fast) {
+        /* tiles in split pieces: element by element */
+        for (; x < end; x++, buf += bpe) {
+            uint64_t o = hd5770_surf_offset(s, x, y);
+
+            if (put) {
+                nat_put(m, e, o, buf, bpe);
+            } else {
+                nat_get(m, e, o, buf, bpe);
+            }
+        }
+        return;
+    }
     if (s->mode < HD5770_ARRAY_1D_TILED_THIN1) {
         uint64_t o = (uint64_t)y * s->row_bytes + (uint64_t)x * bpe;
 
@@ -452,7 +483,7 @@ static void nat_band(const NatSurf *e, uint32_t b, uint64_t *a, uint64_t *z)
 /* rows y0..y1-1 of memory to the host texture */
 static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
 {
-    uint32_t w = e->s.pitch, bpe = e->s.bpe, y;
+    uint32_t w = e->s.pitch, bpe = e->s.bpe, y, bk = NF_BLK(e->hf);
     int64_t t0;
 
     if (e->pass > m->pass_done) {
@@ -460,9 +491,11 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
         nat_wait(m);
     }
     t0 = get_clock();
-    if (!e->space && e->s.mode < HD5770_ARRAY_1D_TILED_THIN1 &&
+    if (!e->space && e->s.fast && e->s.mode < HD5770_ARRAY_1D_TILED_THIN1 &&
         e->hf != NF_D24) {
-        [e->tex replaceRegion:MTLRegionMake2D(0, y0, w, y1 - y0) mipmapLevel:0
+        [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
+                                              (y1 - y0) * bk)
+                  mipmapLevel:0
                     withBytes:m->vram + e->voff +
                               (uint64_t)y0 * e->s.row_bytes
                   bytesPerRow:e->s.row_bytes];
@@ -481,8 +514,9 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
                 memcpy(px + i * 4, &z, 4);
             }
         }
-        [e->tex replaceRegion:MTLRegionMake2D(0, y0, w, y1 - y0) mipmapLevel:0
-                    withBytes:px bytesPerRow:w * bpe];
+        [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
+                                              (y1 - y0) * bk)
+                  mipmapLevel:0 withBytes:px bytesPerRow:w * bpe];
     }
     m->uploads++;
     m->upload_bytes += (uint64_t)w * (y1 - y0) * bpe;
@@ -940,6 +974,7 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
                     [m->enc release];
                     m->enc = nil;
                     m->cur = m->cur_z = m->cur_s = NULL;
+                    m->ncurm = 0;
                     m->pass_on = false;
                     cb = m->cb;
                     m->cb = nil;
@@ -1177,7 +1212,7 @@ static void nat_evict(HD5770Mtlr *m, uint64_t before)
             if (e->dirty) {
                 nat_writeback(m, e);
             }
-            if (m->cur == e || m->cur_z == e || m->cur_s == e) {
+            if (m->cur == e || m->cur_z == e || m->cur_s == e || m->ncurm) {
                 nat_end_pass(m);
             }
             m->bytes -= nat_bytes(e);
@@ -1197,7 +1232,8 @@ static bool nat_same(const NatSurf *e, const HD5770GpuSurf *s, unsigned hf)
         a->bankh != b->bankh || a->mtilea != b->mtilea ||
         a->tile_split != b->tile_split || a->pipes != b->pipes ||
         a->pipe_interleave != b->pipe_interleave ||
-        a->nondisp != b->nondisp) {
+        a->nondisp != b->nondisp || a->fast != b->fast ||
+        (!a->fast && a->height != b->height)) {
         return false;
     }
     if (!s->space) {
@@ -1215,13 +1251,32 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     uint64_t cov, lo, hi;
     unsigned i;
 
-    if (s->s.bpe != nf_bpe[hf] || !s->s.fast || !s->s.pitch ||
+    if (s->s.bpe != nf_bpe[hf] || !(s->s.fast || s->s.split) || !s->s.pitch ||
         !s->s.height || s->s.pitch > 16384 || s->s.height > 16384 ||
         !hd5770_surf_mode_ok(s->s.mode)) {
         return NULL;
     }
+    for (i = 0; i < m->surfs->len; i++) {
+        e = g_ptr_array_index(m->surfs, i);
+        if (nat_same(e, s, hf)) {
+            e->used = m->epoch;
+            e->pin = m->seq;
+            return e;
+        }
+    }
     hd5770_surf_rows(&s->s, 0, s->s.height, &lo, &hi);
     cov = MAX(hd5770_surf_size(&s->s), hi - s->s.base);
+    if (!s->s.fast) {
+        /* tiles in split pieces: the bytes its elements reach */
+        uint32_t x, y;
+
+        cov = 0;
+        for (y = 0; y < s->s.height; y++) {
+            for (x = 0; x < s->s.pitch; x++) {
+                cov = MAX(cov, hd5770_surf_offset(&s->s, x, y) + s->s.bpe);
+            }
+        }
+    }
     if (s->space) {
         if (!m->ram || (s->pg0 & (s->s.bpe - 1)) ||
             (cov + s->pg0 + 4095) / 4096 > s->npages) {
@@ -1234,14 +1289,6 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
         }
     } else if (s->voff > m->vram_size || cov > m->vram_size - s->voff) {
         return NULL;
-    }
-    for (i = 0; i < m->surfs->len; i++) {
-        e = g_ptr_array_index(m->surfs, i);
-        if (nat_same(e, s, hf)) {
-            e->used = m->epoch;
-            e->pin = m->seq;
-            return e;
-        }
     }
     if (m->bytes + (uint64_t)s->s.pitch * s->s.height * s->s.bpe + cov >
         NAT_CACHE_MAX) {
@@ -1267,7 +1314,9 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
         }
     }
     e->bh = NAT_BAND;
-    if (s->s.mode == HD5770_ARRAY_2D_TILED_THIN1) {
+    if (!s->s.fast) {
+        e->bh = s->s.height;
+    } else if (s->s.mode == HD5770_ARRAY_2D_TILED_THIN1) {
         e->bh = ROUND_UP(NAT_BAND, 1u << s->s.mt_h_sh);
     }
     e->nb = DIV_ROUND_UP(s->s.height, e->bh);
@@ -1288,7 +1337,7 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     e->amiss = g_new0(uint8_t, e->nb);
     e->fly = g_new0(uint16_t, e->nb);
     e->fstamp = g_new0(uint64_t, e->nb);
-    for (e->run = 8; e->run > 1; e->run >>= 1) {
+    for (e->run = s->s.fast ? 8 : 1; e->run > 1; e->run >>= 1) {
         for (i = 0; i < 64; i++) {
             if ((i & (e->run - 1)) &&
                 s->s.eoff[i] != s->s.eoff[i - 1] + s->s.bpe) {
@@ -1301,9 +1350,11 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     }
     td = [MTLTextureDescriptor
           texture2DDescriptorWithPixelFormat:nf_fmt[hf]
-                                       width:s->s.pitch height:s->s.height
+                                       width:s->s.pitch * NF_BLK(hf)
+                                      height:s->s.height * NF_BLK(hf)
                                    mipmapped:NO];
-    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.usage = MTLTextureUsageShaderRead |
+               (hf >= NF_BC1 ? 0 : MTLTextureUsageRenderTarget);
     td.storageMode = MTLStorageModeShared;
     e->tex = [m->dev newTextureWithDescriptor:td];
     e->shadow = g_try_malloc(cov);
@@ -1442,40 +1493,60 @@ static void nat_blend(unsigned fn, unsigned sf, unsigned df,
 }
 
 /* hf, zf, sf: the formats of the pass's attachments, NF_N: none */
+/* a colour buffer of a draw */
+typedef struct NatTg {
+    const HD5770GpuSurf *surf;
+    NatSurf *e;
+    unsigned hf, out, mask, cb, comps;
+    uint32_t blend, src[4];
+} NatTg;
+
 static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
-                                          const char *pkey, unsigned hf,
-                                          uint32_t blend, unsigned mask,
-                                          unsigned zf, unsigned sf)
+                                          const char *pkey, const NatTg *tg,
+                                          unsigned nt, unsigned zf,
+                                          unsigned sf)
 {
     MTLRenderPipelineDescriptor *d;
     MTLRenderPipelineColorAttachmentDescriptor *c;
     id<MTLRenderPipelineState> p;
     NSError *e = nil;
-    char key[320];
+    GString *key = g_string_new(pkey);
     gpointer v;
     int64_t t0;
+    unsigned i;
 
-    snprintf(key, sizeof(key), "%s/%u/%08x/%x/%u/%u", pkey, hf, blend, mask,
-             zf, sf);
-    if (g_hash_table_lookup_extended(m->psos, key, NULL, &v)) {
+    for (i = 0; i < nt; i++) {
+        g_string_append_printf(key, "/%u/%08x/%x", tg[i].hf, tg[i].blend,
+                               tg[i].mask);
+    }
+    g_string_append_printf(key, "/%u/%u/%u", nt, zf, sf);
+    if (g_hash_table_lookup_extended(m->psos, key->str, NULL, &v)) {
+        g_string_free(key, true);
         return v;
     }
     d = [[MTLRenderPipelineDescriptor alloc] init];
     d.vertexFunction = pr->vfn;
     d.fragmentFunction = pr->ffn;
-    c = d.colorAttachments[0];
-    c.pixelFormat = hf < NF_N ? nf_fmt[hf] : MTLPixelFormatInvalid;
     if (zf < NF_N) {
         d.depthAttachmentPixelFormat = nf_fmt[zf];
     }
     if (sf < NF_N) {
         d.stencilAttachmentPixelFormat = nf_fmt[sf];
     }
-    c.writeMask = (mask & 1 ? MTLColorWriteMaskRed : 0) |
-                  (mask & 2 ? MTLColorWriteMaskGreen : 0) |
-                  (mask & 4 ? MTLColorWriteMaskBlue : 0) |
-                  (mask & 8 ? MTLColorWriteMaskAlpha : 0);
-    if (hf < NF_N && (blend & (1u << 30))) {
+    for (i = 0; i < nt; i++) {
+        uint32_t blend = tg[i].blend;
+        unsigned mask = tg[i].mask;
+
+        c = d.colorAttachments[i];
+        c.pixelFormat = nf_fmt[tg[i].hf];
+        c.writeMask = (mask & 1 ? MTLColorWriteMaskRed : 0) |
+                      (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                      (mask & 4 ? MTLColorWriteMaskBlue : 0) |
+                      (mask & 8 ? MTLColorWriteMaskAlpha : 0);
+        if (!(blend & (1u << 30))) {
+            continue;
+        }
+        {
         unsigned csrc = blend & 0x1f, cfn = (blend >> 5) & 7;
         unsigned cdst = (blend >> 8) & 0x1f;
         unsigned asrc = csrc, afn = cfn, adst = cdst;
@@ -1496,6 +1567,7 @@ static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
         c.alphaBlendOperation = op;
         c.sourceAlphaBlendFactor = sf;
         c.destinationAlphaBlendFactor = df;
+        }
     }
     t0 = get_clock();
     p = [m->dev newRenderPipelineStateWithDescriptor:d error:&e];
@@ -1506,7 +1578,7 @@ static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
         fprintf(stderr, "ati-hd5770: native pipeline not built: %s\n",
                 e.localizedDescription.UTF8String);
     }
-    g_hash_table_insert(m->psos, g_strdup(key), p);
+    g_hash_table_insert(m->psos, g_string_free(key, false), p);
     return p;
 }
 
@@ -1593,14 +1665,39 @@ static void *nat_ring(HD5770Mtlr *m, size_t n, size_t *at)
 }
 
 /* the host format of a texture, NF_N: none */
-static unsigned nat_tex_fmt(const HD5770GpuTex *t)
+static unsigned nat_tex_fmt(const HD5770Mtlr *m, const HD5770GpuTex *t)
 {
+    if (t->bc) {
+        /* the host decodes the blocks */
+        unsigned sg = t->sgn & (t->bc == 5 ? 3 : 1);
+
+        if (!m->bc_ok || (t->bc == 5 && (sg == 1 || sg == 2))) {
+            return NF_N;
+        }
+        return t->bc == 1 ? NF_BC1 : t->bc == 2 ? NF_BC2 :
+               t->bc == 3 ? NF_BC3 :
+               t->bc == 4 ? (sg ? NF_BC4S : NF_BC4) :
+               sg ? NF_BC5S : NF_BC5;
+    }
     if (t->unorm8) {
         return NF_RGBA8;
     }
     if (t->fmt == HD5770_FMT_16_16_16_16_FLOAT && t->is_float &&
         t->comps == 4) {
         return NF_RGBA16F;
+    }
+    if (t->fmt == HD5770_FMT_32_FLOAT && t->is_float && t->comps == 1) {
+        return NF_R32F;
+    }
+    if (t->comps == 4 &&
+        ((t->fmt == HD5770_FMT_32_32_32_32_FLOAT && t->is_float) ||
+         (t->fmt == HD5770_FMT_32_32_32_32 && t->num == HD5770_NUM_INT))) {
+        /* floats, or their bits as integers */
+        return NF_RGBA32F;
+    }
+    if (t->fmt == HD5770_FMT_16_16_16_16 && t->num == HD5770_NUM_NORM &&
+        !t->sgn && !t->is_float && t->comps == 4) {
+        return NF_RGBA16;
     }
     if (t->num == HD5770_NUM_NORM && !t->sgn && t->comps == 2 &&
         t->fmt == HD5770_FMT_8_8) {
@@ -1613,13 +1710,79 @@ static unsigned nat_tex_fmt(const HD5770GpuTex *t)
            t->fmt == HD5770_FMT_16 ? NF_R16 : NF_N;
 }
 
+/*
+ * A colour buffer: its host format, the class of the function's output
+ * for it (HD5770NatKey), its write mask in the host's channels; the
+ * blend is dropped where it cannot apply. ND_TAKEN, else why not.
+ */
+static unsigned nat_rt(const HD5770Surf *s, uint32_t fmt, uint32_t num,
+                       uint32_t comps, bool is_float, bool unorm8,
+                       const uint32_t *src, uint32_t wmask, uint32_t *blend,
+                       unsigned *rhf, unsigned *out, unsigned *mask)
+{
+    unsigned i, perm = 0;
+
+    *out = 0;
+    *mask = 0;
+    if (num == 4 && comps == 1 &&
+        (fmt == HD5770_FMT_8 || fmt == HD5770_FMT_32)) {
+        /* an integer: the bits of its channel */
+        *out = 1;
+        *blend = 0;
+        *mask = (wmask >> src[0]) & 1 ? 0xf : 0;
+        *rhf = fmt == HD5770_FMT_8 ? NF_R8 : NF_RGBA8;
+        return ND_TAKEN;
+    }
+    if (num == 0 && !is_float && comps == 1 && fmt == HD5770_FMT_8) {
+        *mask = (wmask >> src[0]) & 1 ? 0xf : 0;
+        *rhf = NF_R8;
+        return *blend ? ND_BLEND_ORDER : ND_TAKEN;
+    }
+    if (num == 0 && !is_float && comps == 2 && fmt == HD5770_FMT_8_8 &&
+        src[0] < 4 && src[1] < 4) {
+        /* channel i is component src[i] */
+        *mask = ((wmask >> src[0]) & 1) | ((wmask >> src[1]) & 1) << 1;
+        *rhf = NF_RG8;
+        return *blend ? ND_BLEND_ORDER : ND_TAKEN;
+    }
+    for (i = 0; i < 4; i++) {
+        perm |= src[i] < 4 ? 1u << src[i] : 0x10;
+    }
+    *rhf = NF_RGBA8;
+    if ((fmt == HD5770_FMT_16_16_16_16_FLOAT ||
+         fmt == HD5770_FMT_32_32_32_32 ||
+         fmt == HD5770_FMT_32_32_32_32_FLOAT) && is_float && comps == 4 &&
+        perm == 0xf) {
+        /* floats as they are */
+        *out = 2;
+        *rhf = s->bpe == 16 ? NF_RGBA32F : NF_RGBA16F;
+    } else if (fmt == HD5770_FMT_16_16_16_16 && num == 0 && !is_float &&
+               comps == 4 && perm == 0xf) {
+        *rhf = NF_RGBA16;
+    } else if (!unorm8 || comps != 4 || is_float || perm != 0xf) {
+        return s->bpe > 8 ? ND_RT_WIDE : ND_RT_FMT;
+    }
+    if (*blend && src[3] != 3) {
+        return ND_BLEND_ORDER;
+    }
+    for (i = 0; i < 4; i++) {
+        *mask |= ((wmask >> src[i]) & 1) << i;
+    }
+    return ND_TAKEN;
+}
+
 static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
 {
     const HD5770IR *ir = d->ir;
     HD5770NatKey k = { 0 };
     NatSurf *rt = NULL, *zs = NULL, *ss = NULL, *ts[HD5770_GPU_TEX];
-    NatSurf *lv[HD5770_NAT_LEVELS], *at[3], *pz, *ps;
-    unsigned nlv = 0, nat = 0, vw, vh, hh;
+    NatSurf *lv[HD5770_NAT_LEVELS], *ex[HD5770_NAT_LEVELS], *at[10], *pz, *ps;
+    NatTg tg[8];
+    unsigned nrt, nt = 0;
+    unsigned nlv = 0, nex = 0, nat = 0, vw, vh, hh;
+    uint32_t exr[HD5770_NAT_LEVELS];
+    uint8_t tn[HD5770_GPU_TEX];
+    bool ufn = false;
     bool color, reuse, zclear, zwrite;
     id<MTLDepthStencilState> ds = nil;
     NatProg *pr;
@@ -1630,8 +1793,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     uint8_t *vd[HD5770_GPU_VB];
     size_t o_u, o_v, o_k, o_d[HD5770_GPU_VB];
     size_t vstride = 4 + 4 * (size_t)d->ninputs, need;
-    uint32_t blend, perm = 0;
-    unsigned i, j, c, mask = 0, hf[HD5770_GPU_TEX], rhf;
+    unsigned i, j, c, mask = 0, hf[HD5770_GPU_TEX];
     int x0, y0, x1, y1, bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
     int sc[4] = { d->sc[0], d->sc[1], d->sc[2], d->sc[3] };
     GString *pkey;
@@ -1640,25 +1802,15 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     if (d->resolve) {
         return nat_decline(m, ND_RESOLVE, HD5770_WHY_BK_NATIVE_STATE);
     }
-    if (d->nmrt) {
-        return nat_decline(m, ND_MRT, HD5770_WHY_BK_NATIVE_STATE);
-    }
-    if (d->sexport) {
-        return nat_decline(m, ND_STATE_DB, HD5770_WHY_BK_NATIVE_STATE);
-    }
-    if (d->zexport) {
-        return nat_decline(m, ND_ZEXPORT, HD5770_WHY_BK_NATIVE_STATE);
-    }
     /* no colour is written: the target is not needed */
-    color = !(d->db && !d->wmask);
-    if (!ir || ir->cf || ir->vs) {
+    color = d->nmrt || !(d->db && !d->wmask);
+    if (!ir || ir->vs) {
         return nat_decline(m, ND_PROG_FORM, HD5770_WHY_BK_PROG);
     }
-    if (ir->zexport) {
-        return nat_decline(m, ND_ZEXPORT, HD5770_WHY_BK_PROG);
-    }
-    if (ir->cmask != 1) {
-        return nat_decline(m, ND_PROG_EXPORTS, HD5770_WHY_BK_PROG);
+    ufn = ir->cf;
+    if (ir->zexport && d->sexport && d->db && d->has_s) {
+        /* the stencil reference from the program */
+        return nat_decline(m, ND_STATE_DB, HD5770_WHY_BK_NATIVE_STATE);
     }
     if (d->ninputs > 32 || ir->nres != d->ntex) {
         return nat_decline(m, ND_PROG_INPUTS, HD5770_WHY_BK_PROG);
@@ -1668,8 +1820,13 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         const HD5770IRFetch *f = &ir->fetches[i];
         unsigned bid = (f->w[0] >> 8) & 0xff, fmt;
 
-        if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) >= 0x18) {
+        if (f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) >= 0x1c) {
             return nat_decline(m, ND_FETCH_OP, HD5770_WHY_BK_PROG);
+        }
+        ufn |= f->kind == HD5770_IRF_TEX && (f->w[0] & 0x1f) >= 0x18;
+        if (ir->cf && f->kind != HD5770_IRF_TEX) {
+            /* the CF form: texture fetches only */
+            return nat_decline(m, ND_PROG_FORM, HD5770_WHY_BK_PROG);
         }
         if (f->kind != HD5770_IRF_VTX) {
             continue;
@@ -1694,63 +1851,70 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         k.vb[i].num = (d->vb[i].res[2] >> 26) & 3;
         k.vb[i].sgn = (d->vb[i].res[2] >> 28) & 1;
     }
-    blend = (d->blend & (1u << 30)) && d->rt_blend ? d->blend : 0;
-    if (!color) {
-        rhf = NF_RGBA8;
-    } else if (d->rt.s.bpe > 8) {
-        return nat_decline(m, ND_RT_WIDE, HD5770_WHY_BK_SURF);
-    } else if (d->rt_num == 4 && d->rt_comps == 1 &&
-        (d->rt_fmt == HD5770_FMT_8 || d->rt_fmt == HD5770_FMT_32)) {
-        /* an integer: the bits of its channel */
-        k.out = 1;
-        blend = 0;
-        mask = (d->wmask >> d->rt_src[0]) & 1 ? 0xf : 0;
-        rhf = d->rt_fmt == HD5770_FMT_8 ? NF_R8 : NF_RGBA8;
-    } else if (d->rt_num == 0 && !d->rt_float && d->rt_comps == 1 &&
-               d->rt_fmt == HD5770_FMT_8) {
-        if (blend) {
-            return nat_decline(m, ND_BLEND_ORDER, HD5770_WHY_BK_NATIVE_STATE);
+    nrt = d->nmrt ? d->nmrt : 1;
+    for (i = 0; i < nrt && color; i++) {
+        const HD5770GpuRt *r = &d->mrt[i];
+        unsigned why;
+
+        if (d->nmrt) {
+            tg[nt].surf = &r->surf;
+            tg[nt].cb = r->cb;
+            memcpy(tg[nt].src, r->src, sizeof(tg[nt].src));
+            tg[nt].comps = r->comps;
+            tg[nt].blend = (r->blend & (1u << 30)) && r->blend_ok ? r->blend
+                                                                  : 0;
+            why = nat_rt(&r->surf.s, r->fmt, r->num, r->comps, r->is_float,
+                         r->unorm8, r->src,
+                         (ir->cmask >> r->cb) & 1 ? r->wmask : 0,
+                         &tg[nt].blend, &tg[nt].hf, &tg[nt].out,
+                         &tg[nt].mask);
+        } else {
+            tg[nt].surf = &d->rt;
+            tg[nt].cb = 0;
+            memcpy(tg[nt].src, d->rt_src, sizeof(tg[nt].src));
+            tg[nt].comps = d->rt_comps;
+            tg[nt].blend = (d->blend & (1u << 30)) && d->rt_blend ? d->blend
+                                                                  : 0;
+            why = nat_rt(&d->rt.s, d->rt_fmt, d->rt_num, d->rt_comps,
+                         d->rt_float, d->rt_unorm8, d->rt_src, d->wmask,
+                         &tg[nt].blend, &tg[nt].hf, &tg[nt].out,
+                         &tg[nt].mask);
         }
-        mask = (d->wmask >> d->rt_src[0]) & 1 ? 0xf : 0;
-        rhf = NF_R8;
-    } else if (d->rt_num == 0 && !d->rt_float && d->rt_comps == 2 &&
-               d->rt_fmt == HD5770_FMT_8_8 && d->rt_src[0] < 4 &&
-               d->rt_src[1] < 4) {
-        /* channel i is component rt_src[i] */
-        if (blend) {
-            return nat_decline(m, ND_BLEND_ORDER, HD5770_WHY_BK_NATIVE_STATE);
+        if (why != ND_TAKEN) {
+            return nat_decline(m, why, why == ND_BLEND_ORDER
+                                       ? HD5770_WHY_BK_NATIVE_STATE
+                                       : HD5770_WHY_BK_SURF);
         }
-        mask = ((d->wmask >> d->rt_src[0]) & 1) |
-               ((d->wmask >> d->rt_src[1]) & 1) << 1;
-        rhf = NF_RG8;
-    } else {
-        for (i = 0; i < 4; i++) {
-            perm |= d->rt_src[i] < 4 ? 1u << d->rt_src[i] : 0x10;
-        }
-        if (d->rt_fmt == HD5770_FMT_16_16_16_16_FLOAT && d->rt_float &&
-            d->rt_comps == 4 && perm == 0xf) {
-            /* floats as they are */
-            k.out = 2;
-        } else if (!d->rt_unorm8 || d->rt_comps != 4 || d->rt_float ||
-                   perm != 0xf) {
-            return nat_decline(m, ND_RT_FMT, HD5770_WHY_BK_SURF);
-        }
-        if (blend && d->rt_src[3] != 3) {
-            return nat_decline(m, ND_BLEND_ORDER, HD5770_WHY_BK_NATIVE_STATE);
-        }
-        for (i = 0; i < 4; i++) {
-            mask |= ((d->wmask >> d->rt_src[i]) & 1) << i;
-        }
-        rhf = k.out == 2 ? NF_RGBA16F : NF_RGBA8;
+        mask |= tg[nt].mask;
+        /* a buffer nothing is written to is left out */
+        nt += tg[nt].mask != 0;
     }
     if (!mask && d->db) {
         color = false;
-        k.out = 0;
-        blend = 0;
-        rhf = NF_RGBA8;
+        nt = 0;
     }
-    k.rt_comps = color ? d->rt_comps : 4;
-    k.rt_bytes = nf_bpe[rhf];
+    if (!nt) {
+        tg[0].hf = NF_RGBA8;
+        tg[0].out = 0;
+        tg[0].comps = 4;
+        tg[0].blend = 0;
+        tg[0].cb = 0;
+        for (i = 0; i < 4; i++) {
+            tg[0].src[i] = i;
+        }
+    }
+    k.out = tg[0].out;
+    k.rt_comps = tg[0].comps;
+    k.rt_bytes = nf_bpe[tg[0].hf];
+    k.ncol = d->nmrt ? nt : 0;
+    for (i = 0; i < k.ncol; i++) {
+        k.col[i].cb = tg[i].cb;
+        k.col[i].out = tg[i].out;
+        k.col[i].comps = tg[i].comps;
+        for (j = 0; j < 4; j++) {
+            k.col[i].src[j] = tg[i].src[j];
+        }
+    }
     if (d->cliprule != 0xffff) {
         static const uint16_t one[4] = { 0xaaaa, 0xcccc, 0xf0f0, 0xff00 };
 
@@ -1770,25 +1934,41 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     for (i = 0; i < d->ntex; i++) {
         const HD5770GpuTex *t = &d->tex[i];
 
-        if (t->bc) {
-            return nat_decline(m, ND_TEX_BC, HD5770_WHY_BK_SURF);
-        }
-        if (t->dim >= 2) {
-            return nat_decline(m, t->dim == 2 ? ND_TEX_3D :
-                                  t->dim == 3 ? ND_TEX_CUBE : ND_TEX_ARRAY,
-                               HD5770_WHY_BK_SURF);
-        }
-        if (t->dim != 1 || t->bc || t->slices > 1 ||
-            (t->mip && (nlv + t->last_lv > HD5770_NAT_LEVELS ||
-                        d->ntex > 14))) {
+        if (t->dim == 0 || t->dim == 4 || t->dim > 5) {
+            /* 1D */
             return nat_decline(m, ND_TEX_KIND, HD5770_WHY_BK_SURF);
+        }
+        k.dim[i] = t->dim;
+        k.nsl[i] = 1;
+        if (t->dim != 1 && t->slices > 1) {
+            /* each slice a texture, in VRAM */
+            if (t->slices > 64 || t->surf.space) {
+                return nat_decline(m, t->dim == 2 ? ND_TEX_3D :
+                                      t->dim == 3 ? ND_TEX_CUBE : ND_TEX_ARRAY,
+                                   HD5770_WHY_BK_SURF);
+            }
+            k.nsl[i] = t->slices;
+            ufn = true;
         }
         k.mip[i] = t->mip ? t->last_lv : 0;
         nlv += k.mip[i];
-        hf[i] = nat_tex_fmt(t);
-        if (hf[i] == NF_N) {
-            return nat_decline(m, ND_TEX_FMT, HD5770_WHY_BK_SURF);
+        /* a unit with levels or slices: all its textures, in an array */
+        tn[i] = 0;
+        for (c = 0; c <= k.mip[i]; c++) {
+            tn[i] += t->dim == 2 ? MAX(k.nsl[i] >> c, 1u) : k.nsl[i];
         }
+        nex += tn[i] > 1 ? tn[i] : 0;
+        if (nex > HD5770_NAT_LEVELS) {
+            return nat_decline(m, ND_TEX_MANY, HD5770_WHY_BK_SURF);
+        }
+        hf[i] = nat_tex_fmt(m, t);
+        if (hf[i] == NF_N) {
+            return nat_decline(m, t->bc ? ND_TEX_BC : ND_TEX_FMT,
+                               HD5770_WHY_BK_SURF);
+        }
+    }
+    if (d->ntex > 14 && (nlv || ufn)) {
+        return nat_decline(m, ND_TEX_MANY, HD5770_WHY_BK_SURF);
     }
     for (i = 0; i < d->ntri; i++) {
         const HD5770GpuTri *t = &d->tri[i];
@@ -1803,18 +1983,17 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         bx1 = MAX(bx1, t->x1 + 1);
         by1 = MAX(by1, t->y1 + 1);
     }
-    if (color && d->rt.space && !m->pub.done_ram) {
-        return nat_decline(m, ND_RT_SURF, HD5770_WHY_BK_SURF);
-    }
     vw = vh = hh = UINT32_MAX;
-    if (color) {
-        rt = nat_surf(m, &d->rt, rhf);
-        if (!rt) {
+    for (i = 0; i < nt; i++) {
+        tg[i].e = tg[i].surf->space && !m->pub.done_ram ? NULL :
+                  nat_surf(m, tg[i].surf, tg[i].hf);
+        if (!tg[i].e) {
             return nat_decline(m, ND_RT_SURF, HD5770_WHY_BK_SURF);
         }
-        at[nat++] = rt;
-        hh = d->rt.s.height;
+        at[nat++] = tg[i].e;
+        hh = MIN(hh, tg[i].surf->s.height);
     }
+    rt = nt ? tg[0].e : NULL;
     if (d->db && d->zfmt) {
         zs = d->zs.space ? NULL :
              nat_surf(m, &d->zs, d->zfmt == 1 ? NF_D16 :
@@ -1854,26 +2033,40 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         m->nd[ND_EMPTY]++;
         return true;
     }
-    for (i = 0, nlv = 0; i < d->ntex; i++) {
+    for (i = 0, nlv = 0, nex = 0; i < d->ntex; i++) {
         const HD5770GpuTex *t = &d->tex[i];
+        unsigned bk = NF_BLK(hf[i]), sl, ns;
 
-        ts[i] = nat_surf(m, &t->surf, hf[i]);
-        if (!ts[i] || t->w > ts[i]->s.pitch || t->h > ts[i]->s.height) {
-            return nat_decline(m, ND_TEX_SURF, HD5770_WHY_BK_SURF);
-        }
         for (c = 0; c <= k.mip[i]; c++) {
-            NatSurf *e = ts[i];
+            const HD5770GpuSurf *ls = c ? &t->lv[c] : &t->surf;
+            uint32_t lw = c ? t->lw[c] : t->w, lh = c ? t->lh[c] : t->h;
 
-            if (c) {
-                e = t->lv[c].space ? NULL : nat_surf(m, &t->lv[c], hf[i]);
-                if (!e || t->lw[c] > e->s.pitch || t->lh[c] > e->s.height) {
+            ns = t->dim == 2 ? MAX(k.nsl[i] >> c, 1u) : k.nsl[i];
+            for (sl = 0; sl < ns; sl++) {
+                HD5770GpuSurf sv = *ls;
+                NatSurf *e;
+
+                sv.s.base += sl * t->slice_bytes[c];
+                sv.voff += sl * t->slice_bytes[c];
+                e = (c || sl) && ls->space ? NULL : nat_surf(m, &sv, hf[i]);
+                if (!e || lw > e->s.pitch * bk || lh > e->s.height * bk) {
                     return nat_decline(m, ND_TEX_SURF, HD5770_WHY_BK_SURF);
                 }
-                lv[nlv++] = e;
-            }
-            for (j = 0; j < nat; j++) {
-                if (e == at[j] || nat_alias(e, at[j])) {
-                    return nat_decline(m, ND_TEX_TARGET, HD5770_WHY_BK_SURF);
+                for (j = 0; j < nat; j++) {
+                    if (e == at[j] || nat_alias(e, at[j])) {
+                        return nat_decline(m, ND_TEX_TARGET,
+                                           HD5770_WHY_BK_SURF);
+                    }
+                }
+                if (!c && !sl) {
+                    ts[i] = e;
+                }
+                if (tn[i] > 1) {
+                    exr[nex] = ls->s.height;
+                    ex[nex++] = e;
+                }
+                if (c && !sl) {
+                    lv[nlv++] = e;
                 }
             }
         }
@@ -1881,12 +2074,14 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     zclear = zs && (d->rctl & 1);
     zwrite = zs && (d->dctl & DC_Z) && (d->dctl & DC_Z_WRITE);
     /* a depth range other than 0..1: clamped in the function */
-    k.zout = zs && !zclear && !(d->zmin <= 0.0f && d->zmax >= 1.0f);
+    k.zexp = zs && !zclear && d->zexport && ir->zexport;
+    k.zout = zs && !zclear && (k.zexp ||
+                               !(d->zmin <= 0.0f && d->zmax >= 1.0f));
     k.ninputs = d->ninputs;
     k.pos_gpr = d->pos_gpr >= 0 && d->pos_gpr < 127 ? d->pos_gpr : -1;
     k.flat = d->flat;
     for (i = 0; i < 4; i++) {
-        k.rt_src[i] = color ? d->rt_src[i] : i;
+        k.rt_src[i] = tg[0].src[i];
     }
     pkey = g_string_new(NULL);
     g_string_printf(pkey, "%016" PRIx64 "/%u/%d/%08x/%u%u%u%u/%u/%u%u%u%u",
@@ -1897,9 +2092,18 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         g_string_append_printf(pkey, "/%u.%u.%u.%u", k.vb[i].id, k.vb[i].fmt,
                                k.vb[i].num, k.vb[i].sgn);
     }
-    g_string_append_printf(pkey, "/%u", k.zout);
+    g_string_append_printf(pkey, "/%u%u", k.zout, k.zexp);
+    for (i = 0; i < k.ncol; i++) {
+        g_string_append_printf(pkey, "/%u.%u.%u.%u%u%u%u", k.col[i].cb,
+                               k.col[i].out, k.col[i].comps, k.col[i].src[0],
+                               k.col[i].src[1], k.col[i].src[2],
+                               k.col[i].src[3]);
+    }
     for (i = 0; i < d->ntex && nlv; i++) {
         g_string_append_printf(pkey, ".%u", k.mip[i]);
+    }
+    for (i = 0; i < d->ntex && ufn; i++) {
+        g_string_append_printf(pkey, "/%u.%u", k.dim[i], k.nsl[i]);
     }
     pr = nat_prog(m, ir, &k, pkey->str);
     if (!pr) {
@@ -1916,11 +2120,13 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         return nat_decline(m, ND_ROOM, HD5770_WHY_BK_ROOM);
     }
     /* uploads and write-backs wait for the GPU and empty the ring */
-    for (i = 0, nlv = 0; i < d->ntex; i++) {
-        nat_ready(m, ts[i], 0, d->tex[i].surf.s.height);
-        for (c = 1; c <= k.mip[i]; c++, nlv++) {
-            nat_ready(m, lv[nlv], 0, d->tex[i].lv[c].s.height);
+    for (i = 0; i < d->ntex; i++) {
+        if (tn[i] <= 1) {
+            nat_ready(m, ts[i], 0, d->tex[i].surf.s.height);
         }
+    }
+    for (i = 0; i < nex; i++) {
+        nat_ready(m, ex[i], 0, exr[i]);
     }
     for (i = 0; i < nat; i++) {
         nat_ready(m, at[i], y0, y1);
@@ -1930,11 +2136,15 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     }
     /* the pass goes on if it has what the draw needs, at the same size */
     reuse = m->pass_on && m->cur == rt && (!zs || m->cur_z == zs) &&
-            (!ss || m->cur_s == ss) && m->vw == vw && m->vh == vh;
+            (!ss || m->cur_s == ss) && m->vw == vw && m->vh == vh &&
+            m->ncurm == (nt ? nt - 1 : 0);
+    for (i = 1; i < nt && reuse; i++) {
+        reuse = m->curm[i - 1] == tg[i].e;
+    }
     pz = reuse ? m->cur_z : zs;
     ps = reuse ? m->cur_s : ss;
-    pso = nat_pso(m, pr, pkey->str, color ? rhf : NF_N, blend, mask,
-                  pz ? pz->hf : NF_N, ps ? ps->hf : NF_N);
+    pso = nat_pso(m, pr, pkey->str, tg, nt, pz ? pz->hf : NF_N,
+                  ps ? ps->hf : NF_N);
     g_string_free(pkey, true);
     if (!pso) {
         return nat_decline(m, ND_PROG_BUILD, HD5770_WHY_BK_PROG);
@@ -1960,10 +2170,17 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
 
         u->tsize[i][0] = t->w;
         u->tsize[i][1] = t->h;
-        u->tsize[i][2] = ts[i]->s.pitch;
-        u->tsize[i][3] = ts[i]->s.height;
+        u->tsize[i][2] = ts[i]->s.pitch * NF_BLK(hf[i]);
+        u->tsize[i][3] = ts[i]->s.height * NF_BLK(hf[i]);
         u->twrap[i][0] = t->samp[0] & 7;
         u->twrap[i][1] = (t->samp[0] >> 3) & 7;
+        u->twrap[i][2] = ((t->samp[0] >> 9) & 1) || ((t->samp[0] >> 11) & 1);
+        u->tcmp[i][0] = ((t->samp[0] >> 22) & 7) + 1;
+        u->tcmp[i][1] = !t->is_float && t->num == HD5770_NUM_NORM &&
+                        !(t->sgn & 1) && !t->bc && t->bits[0] &&
+                        t->bits[0] < 32 ? (1u << t->bits[0]) - 1 : 0;
+        u->tcmp[i][2] = ((t->samp[0] >> 13) & 3) == 2;
+        u->tcmp[i][3] = (t->samp[0] >> 6) & 7;
         for (c = 0; c < 4; c++) {
             u->tsel[i][c] = t->dst_sel[c];
             u->tborder[i][c] = t->border[c];
@@ -1983,8 +2200,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         for (c = 1; c <= k.mip[i]; c++, nlv++) {
             u->lsize[nlv][0] = t->lw[c];
             u->lsize[nlv][1] = t->lh[c];
-            u->lsize[nlv][2] = lv[nlv]->s.pitch;
-            u->lsize[nlv][3] = lv[nlv]->s.height;
+            u->lsize[nlv][2] = lv[nlv]->s.pitch * NF_BLK(hf[i]);
+            u->lsize[nlv][3] = lv[nlv]->s.height * NF_BLK(hf[i]);
         }
     }
     u->vp[0] = 2.0f / vw;
@@ -1997,6 +2214,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     u->persp = d->persp;
     u->cliprule = d->cliprule;
     memcpy(u->cr, d->cr, sizeof(u->cr));
+    u->bconst = d->bool_const;
+    memcpy(u->lconst, d->loop_const, sizeof(u->lconst));
     for (i = 0; i < d->ntri; i++) {
         const HD5770GpuTri *t = &d->tri[i];
         const float *prm = d->prm + (size_t)i * d->ninputs * 12;
@@ -2025,10 +2244,10 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
 
         nat_end_pass(m);
         rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        if (rt) {
-            rp.colorAttachments[0].texture = rt->tex;
-            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        for (i = 0; i < nt; i++) {
+            rp.colorAttachments[i].texture = tg[i].e->tex;
+            rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
+            rp.colorAttachments[i].storeAction = MTLStoreActionStore;
         }
         if (zs) {
             rp.depthAttachment.texture = zs->tex;
@@ -2046,6 +2265,10 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         [m->enc setDepthClipMode:MTLDepthClipModeClamp];
         [m->enc setViewport:(MTLViewport){ 0.0, 0.0, vw, vh, 0.0, 1.0 }];
         m->cur = rt;
+        m->ncurm = nt ? nt - 1 : 0;
+        for (i = 1; i < nt; i++) {
+            m->curm[i - 1] = tg[i].e;
+        }
         m->cur_z = zs;
         m->cur_s = ss;
         m->pass_on = true;
@@ -2056,6 +2279,9 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     if (m->cur) {
         m->cur->pass = m->passes;
     }
+    for (i = 0; i < m->ncurm; i++) {
+        m->curm[i]->pass = m->passes;
+    }
     if (m->cur_z) {
         m->cur_z->pass = m->passes;
     }
@@ -2065,8 +2291,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     for (i = 0; i < d->ntex; i++) {
         ts[i]->pass = m->passes;
     }
-    for (i = 0; i < nlv; i++) {
-        lv[i]->pass = m->passes;
+    for (i = 0; i < nex; i++) {
+        ex[i]->pass = m->passes;
     }
     [m->enc setRenderPipelineState:pso];
     if (ds) {
@@ -2082,10 +2308,10 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
                                                   : d->srm[two] & 0xff];
     }
     [m->enc setScissorRect:(MTLScissorRect){ x0, y0, x1 - x0, y1 - y0 }];
-    [m->enc setBlendColorRed:d->blend_const[d->rt_src[0] & 3]
-                       green:d->blend_const[d->rt_src[1] & 3]
-                        blue:d->blend_const[d->rt_src[2] & 3]
-                       alpha:d->blend_const[d->rt_src[3] & 3]];
+    [m->enc setBlendColorRed:d->blend_const[tg[0].src[0] & 3]
+                       green:d->blend_const[tg[0].src[1] & 3]
+                        blue:d->blend_const[tg[0].src[2] & 3]
+                       alpha:d->blend_const[tg[0].src[3] & 3]];
     [m->enc setVertexBuffer:m->ring offset:o_v atIndex:0];
     [m->enc setVertexBuffer:m->ring offset:o_u atIndex:1];
     [m->enc setFragmentBuffer:m->ring offset:o_u atIndex:0];
@@ -2100,8 +2326,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         [m->enc setFragmentSamplerState:
                     m->samp[((s0 >> 9) & 1) || ((s0 >> 11) & 1)] atIndex:i];
     }
-    for (i = 0; i < nlv; i++) {
-        [m->enc setFragmentTexture:lv[i]->tex atIndex:16 + i];
+    for (i = 0; i < nex; i++) {
+        [m->enc setFragmentTexture:ex[i]->tex atIndex:16 + i];
     }
     if (ss && (d->dctl & DC_BACKFACE)) {
         /*
@@ -2124,8 +2350,8 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         [m->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0
                    vertexCount:d->ntri * 3];
     }
-    if (rt) {
-        nat_drew(rt, x0, y0, x1, y1);
+    for (i = 0; i < nt; i++) {
+        nat_drew(tg[i].e, x0, y0, x1, y1);
     }
     if (zwrite) {
         nat_drew(zs, x0, y0, x1, y1);
@@ -2543,6 +2769,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         [dd release];
         /* Apple GPUs; others want one packed texture for both */
         m->sep_ds = [m->dev supportsFamily:MTLGPUFamilyApple1];
+        m->bc_ok = m->dev.supportsBCTextureCompression;
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
     m->ranges = g_array_new(false, false, sizeof(uint64_t));

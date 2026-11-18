@@ -435,9 +435,15 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
  * that many levels after the first, each a texture of its own; the
  * levels of all units count from texture index 16 on, in unit order.
  * zout: the function writes the depth, the rasteriser's clamped to the
- * depth range. NULL: not expressible.
+ * depth range. dim[i], nsl[i]: unit i's SQ_TEX_DIM and its slices (cube
+ * faces, array layers, the depth of a 3D texture, which halves with the
+ * levels), each slice of each level a texture of its own: after the
+ * units' first textures, from index 16 on, come unit by unit, level by
+ * level, the slices in order. Programs in the CF form, fetches with a
+ * comparison and units with slices go through a function per unit that
+ * reads the fetch words at run time. NULL: not expressible.
  */
-#define HD5770_NAT_LEVELS       32      /* levels after the first, all units */
+#define HD5770_NAT_LEVELS       80      /* textures after the units' first */
 typedef struct HD5770NatKey {
     uint8_t ninputs;
     int8_t pos_gpr;
@@ -451,6 +457,16 @@ typedef struct HD5770NatKey {
     } vb[HD5770_GPU_VB];
     uint8_t mip[HD5770_GPU_TEX];
     bool zout;
+    uint8_t dim[HD5770_GPU_TEX], nsl[HD5770_GPU_TEX];
+    bool zexp;                  /* the depth written is the program's */
+    /*
+     * ncol > 0: more render targets; output i is export col[i].cb, of the
+     * class out with comps and src as rt_comps and rt_src
+     */
+    uint8_t ncol;
+    struct {
+        uint8_t cb, out, comps, src[4];
+    } col[8];
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);

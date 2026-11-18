@@ -2698,6 +2698,261 @@ const char *hd5770_msl_alu(void)
     return alu;
 }
 
+/* slices of level l of a unit */
+static unsigned nat_slices(const HD5770NatKey *k, unsigned unit, unsigned l)
+{
+    unsigned n = MAX(k->nsl[unit], 1u);
+
+    return k->dim[unit] == 2 ? MAX(n >> l, 1u) : n;
+}
+
+/* the textures of a unit: all levels and slices; 1: its own alone */
+static unsigned nat_ntex(const HD5770NatKey *k, unsigned unit)
+{
+    unsigned l, n = 0;
+
+    for (l = 0; l <= k->mip[unit]; l++) {
+        n += nat_slices(k, unit, l);
+    }
+    return n;
+}
+
+/* the textures of a unit as a parameter or as an argument */
+static void nat_tlist(GString *o, const HD5770NatKey *k, unsigned unit,
+                      bool decl)
+{
+    unsigned n = nat_ntex(k, unit);
+
+    if (n > 1) {
+        if (decl) {
+            g_string_append_printf(o, ", array<texture2d<float>, %u> a%u", n,
+                                   unit);
+        } else {
+            g_string_append_printf(o, ", a%u", unit);
+        }
+    } else {
+        g_string_append_printf(o, ", %st%u", decl ? "texture2d<float> " : "",
+                               unit);
+    }
+}
+
+/* a sample of level lv at tc of a unit, in its function hd_nt */
+static void nat_call(GString *o, const HD5770NatKey *k, unsigned unit,
+                     const char *lv, const char *tc, const char *lin)
+{
+    g_string_append_printf(o, "%s%u(u", k->dim[unit] == 2 ? "hd_nz" : "hd_ns",
+                           unit);
+    nat_tlist(o, k, unit, false);
+    g_string_append_printf(o, ", %s, %s, %s, %s, cmp, ref)", lv,
+                           k->dim[unit] == 2 ? "zn, zl" : "sl", tc, lin);
+}
+
+/*
+ * The functions of a unit: hd_ns, a level and slice sampled at a place
+ * in its texels; hd_nt, a fetch by its words as tfetch_stage() in
+ * ati_hd5770_draw.c does it. slot: the unit's first entry in u.lsize.
+ */
+static void nat_unit(GString *o, const HD5770NatKey *k, unsigned unit,
+                     unsigned slot)
+{
+    unsigned l, ns, dim = k->dim[unit], n0 = MAX(k->nsl[unit], 1u);
+    char tn[32], ls[40];
+
+    g_string_append_printf(o, "static float4 hd_ns%u(constant NU &u", unit);
+    nat_tlist(o, k, unit, true);
+    g_string_append_printf(o,
+        ", uint lv, uint sl, float2 tc, bool lin, uint cmp, float ref)\n"
+        "{\n"
+        "    float4 ls = u.tsize[%u];\n", unit);
+    if (nat_ntex(k, unit) > 1) {
+        g_string_append(o, "    uint ix = sl;\n");
+        if (k->mip[unit]) {
+            g_string_append_printf(o,
+                "    lv = min(lv, %uu);\n"
+                "    if (lv != 0u) {\n"
+                "        ls = u.lsize[%u + lv - 1u];\n"
+                "    }\n", k->mip[unit], slot);
+            if (dim == 2) {
+                g_string_append(o, "    switch (lv) {\n");
+                for (l = 1, ns = 0; l <= k->mip[unit]; l++) {
+                    ns += nat_slices(k, unit, l - 1);
+                    g_string_append_printf(o, "    case %u: ix += %uu; break;\n",
+                                           l, ns);
+                }
+                g_string_append(o, "    default: break;\n    }\n");
+            } else {
+                g_string_append_printf(o, "    ix += lv * %uu;\n", n0);
+            }
+        }
+        g_string_append_printf(o, "    ix = min(ix, %uu);\n",
+                               nat_ntex(k, unit) - 1);
+        snprintf(tn, sizeof(tn), "a%u[ix]", unit);
+    } else {
+        snprintf(tn, sizeof(tn), "t%u", unit);
+    }
+    g_string_append_printf(o,
+        "    return hd_nsamp(%s, ls, tc, u.twrap[%u], lin, u.tborder[%u],"
+        " u.tsel[%u], cmp, ref, u.tcmp[%u].y);\n}\n", tn, unit, unit, unit,
+        unit);
+    if (dim == 2) {
+        /* texel(): the nearest slice of the level, or between two */
+        g_string_append_printf(o, "static float4 hd_nz%u(constant NU &u", unit);
+        nat_tlist(o, k, unit, true);
+        g_string_append_printf(o,
+            ", uint lv, float zn, bool zl, float2 tc, bool lin, uint cmp, float ref)\n"
+            "{\n"
+            "    uint ns = max(%uu >> lv, 1u);\n"
+            "    if (zl && ns > 1u) {\n"
+            "        float zf = zn * float(ns) - 0.5f;\n"
+            "        int z0 = int(floor(zf)), z1 = z0 + 1;\n"
+            "        float a = zf - float(z0);\n"
+            "        if (u.tcmp[%u].w == 0u) {\n"
+            "            z0 = (z0 + int(ns)) %% int(ns);\n"
+            "            z1 = z1 %% int(ns);\n"
+            "        } else {\n"
+            "            z0 = max(z0, 0);\n"
+            "            z1 = min(z1, int(ns) - 1);\n"
+            "        }\n", n0, unit);
+        g_string_append_printf(o, "        float4 va = hd_ns%u(u", unit);
+        nat_tlist(o, k, unit, false);
+        g_string_append_printf(o, ", lv, uint(z0), tc, lin, cmp, ref);\n"
+                                  "        float4 vb = hd_ns%u(u", unit);
+        nat_tlist(o, k, unit, false);
+        g_string_append_printf(o, ", lv, uint(z1), tc, lin, cmp, ref);\n"
+                                  "        return va + (vb - va) * a;\n"
+                                  "    }\n"
+                                  "    return hd_ns%u(u", unit);
+        nat_tlist(o, k, unit, false);
+        g_string_append(o, ", lv, min(uint(zn * float(ns)), ns - 1u), tc, lin, cmp, ref);\n}\n");
+    }
+    g_string_append_printf(o, "static void hd_nt%u(constant NU &u", unit);
+    nat_tlist(o, k, unit, true);
+    g_string_append_printf(o,
+        ", uint w0, uint w1, uint w2, thread uint (&c)[4], float4 dv,\n"
+        "    thread uint (&o)[4])\n"
+        "{\n"
+        "    uint op = w0 & 0x1fu, cmp = 0u, sl = 0u;\n"
+        "    int ox = int(w2 << 27u) >> 27, oy = int(w2 << 22u) >> 27;\n"
+        "    float4 ts = u.tsize[%u], v = float4(0.0f);\n"
+        "    float ref = 0.0f, c0 = F(c[0]), c1 = F(c[1]), zn = 0.0f;\n"
+        "    bool zl = false;\n"
+        "    o[0] = 0u;\n    o[1] = 0u;\n    o[2] = 0u;\n    o[3] = 0u;\n"
+        "    if (op >= 0x18u && op <= 0x1bu) {\n"
+        "        cmp = u.tcmp[%u].x;\n"
+        "        ref = op == 0x19u || op == 0x1au ? F(c[2]) : F(c[3]);\n"
+        "        op -= 8u;\n"
+        "    }\n"
+        "    if (op == 4u) {\n"
+        "        uint lv = min(c[0] + u.tres[%u].x, 31u);\n"
+        "        o[0] = max(uint(ts.x) >> lv, 1u);\n"
+        "        o[1] = max(uint(ts.y) >> lv, 1u);\n"
+        "        o[2] = u.tres[%u].z;\n"
+        "        o[3] = u.tres[%u].y;\n"
+        "        return;\n"
+        "    }\n", unit, unit, unit, unit, unit);
+    /* tex_slice() */
+    if (dim == 3) {
+        g_string_append(o,
+            "    {\n        float f = F(c[2]);\n"
+            "        sl = f > 0.0f ? min(uint(f), 5u) : 0u;\n"
+            "        c0 -= 1.0f;\n        c1 -= 1.0f;\n    }\n");
+    } else if (dim == 5) {
+        g_string_append_printf(o,
+            "    {\n        int ly = op == 3u ? I(c[2]) : int(rint(F(c[2])));\n"
+            "        sl = uint(clamp(ly, 0, %d));\n    }\n", (int)n0 - 1);
+    } else if (dim == 2) {
+        g_string_append_printf(o,
+            "    zn = op == 3u ? (float(I(c[2])) + 0.5f) / %u.0f :\n"
+            "         ((w1 >> 30u) & 1u) != 0u ? F(c[2]) : F(c[2]) / %u.0f;\n"
+            "    if (u.tcmp[%u].w == 0u) {\n        zn -= floor(zn);\n    }\n"
+            "    zn = zn > 0.0f ? min(zn, 1.0f) : 0.0f;\n"
+            "    zl = u.tcmp[%u].z != 0u && op != 3u;\n", n0, n0, unit, unit);
+    }
+    g_string_append(o,
+        "    if (op == 3u) {\n"
+        "        int2 xy = int2(I(c[0]) + ox / 2, I(c[1]) + oy / 2);\n"
+        "        if (xy.x >= 0 && xy.y >= 0 && xy.x < int(ts.x) && xy.y < int(ts.y)) {\n"
+        "            v = ");
+    nat_call(o, k, unit, "0u", "float2(xy) + 0.5f", "false");
+    g_string_append(o, ";\n        }\n    } else {\n"
+        "        bool nx = ((w1 >> 28u) & 1u) != 0u, ny = ((w1 >> 29u) & 1u) != 0u;\n"
+        "        float2 of = float2(float(ox), float(oy)) * 0.5f;\n");
+    if (k->mip[unit]) {
+        g_string_append_printf(o,
+            "        if (nx && ny) {\n"
+            "            float lod = 0.0f;\n"
+            "            float2 cn = float2(c0, c1);\n"
+            "            if (op == 0x11u) {\n"
+            "                lod = F(c[3]);\n"
+            "            } else if (op != 0x13u) {\n"
+            "                float2 da = dv.xy * ts.xy, db = dv.zw * ts.xy;\n"
+            "                lod = 0.5f * hd_nlog2(max(dot(da, da), dot(db, db)));\n"
+            "                if (op == 0x12u) {\n"
+            "                    lod += F(c[3]);\n"
+            "                }\n"
+            "                lod += float(int(w1 << 4u) >> 25) / 16.0f;\n"
+            "            }\n"
+            "            lod = min(max(lod + u.tlod[%u].x, u.tlod[%u].y), u.tlod[%u].z);\n"
+            "            if (!(lod > 0.0f)) {\n"
+            "                v = ", unit, unit, unit);
+        snprintf(ls, sizeof(ls), "u.tmip[%u].z != 0u", unit);
+        nat_call(o, k, unit, "0u", "cn * ts.xy + of", ls);
+        g_string_append_printf(o, ";\n"
+            "            } else {\n"
+            "                bool lin = u.tmip[%u].w != 0u;\n"
+            "                uint last = u.tmip[%u].y;\n"
+            "                float l0 = u.tmip[%u].x == 1u ? floor(lod + 0.5f) : floor(lod);\n"
+            "                uint lv = min(uint(l0), last);\n"
+            "                float4 ls = ts;\n"
+            "                if (lv != 0u) {\n"
+            "                    ls = u.lsize[%u + lv - 1u];\n"
+            "                }\n"
+            "                v = ", unit, unit, unit, slot);
+        nat_call(o, k, unit, "lv", "cn * ls.xy + of", "lin");
+        g_string_append_printf(o, ";\n"
+            "                if (u.tmip[%u].x != 1u && lv < last) {\n"
+            "                    ls = u.lsize[%u + lv];\n"
+            "                    float4 v1 = ", unit, slot);
+        nat_call(o, k, unit, "lv + 1u", "cn * ls.xy + of", "lin");
+        g_string_append(o, ";\n"
+            "                    v = v + (v1 - v) * (lod - l0);\n"
+            "                }\n"
+            "            }\n"
+            "        } else\n");
+    }
+    g_string_append(o,
+        "        {\n"
+        "            float2 tc = float2(nx ? c0 * ts.x : c0, ny ? c1 * ts.y : c1) + of;\n"
+        "            v = ");
+    snprintf(ls, sizeof(ls), "u.twrap[%u].z != 0u", unit);
+    nat_call(o, k, unit, "0u", "tc", ls);
+    g_string_append(o, ";\n        }\n    }\n"
+        "    o[0] = U(v.x);\n    o[1] = U(v.y);\n    o[2] = U(v.z);\n    o[3] = U(v.w);\n}\n");
+}
+
+/* the TEX operations taken: LD, RESINFO, SAMPLE*, SAMPLE_C* */
+static bool nat_tex_op(unsigned op)
+{
+    return op == 0x03 || op == 0x04 || (op >= 0x10 && op <= 0x13) ||
+           (op >= 0x18 && op <= 0x1b);
+}
+
+/* the fetch goes through its unit's function */
+static bool nat_unit_fn(const HD5770IR *ir, const HD5770NatKey *k,
+                        const HD5770IRFetch *f)
+{
+    unsigned unit, op = f->w[0] & 0x1f;
+
+    if (f->kind != HD5770_IRF_TEX) {
+        return false;
+    }
+    for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+        /* search */
+    }
+    return ir->cf || op >= 0x18 ||
+           (unit < HD5770_GPU_TEX && k->nsl[unit] > 1);
+}
+
 /*
  * a TEX fetch as a sample of the unit's host texture; a VTX fetch as
  * vfetch_stage() in ati_hd5770_draw.c reads an 8 or 32 bit element
@@ -2777,9 +3032,30 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
             g_string_append(o, "            o[0] = U(float(c) / 255.0f);\n");
         }
         g_string_append(o, "        }\n");
-    } else if (f->kind != HD5770_IRF_TEX ||
-               !(op == 0x03 || op == 0x04 || (op >= 0x10 && op <= 0x13))) {
+    } else if (f->kind != HD5770_IRF_TEX || !nat_tex_op(op)) {
         return false;
+    } else if (nat_unit_fn(ir, key, f)) {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        g_string_append(o, "        uint c[4] = {");
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, " R0[%u][%u]", f->src, sel);
+            } else {
+                g_string_append(o, sel == 5 ? " U(1.0f)" : " U(0.0f)");
+            }
+            g_string_append(o, k < 3 ? "," : " };\n");
+        }
+        g_string_append_printf(o,
+            "        float2 cn = float2(F(c[0]), F(c[1]));\n"
+            "        hd_nt%u(u", unit);
+        nat_tlist(o, key, unit, false);
+        g_string_append_printf(o, ", 0x%08xu, 0x%08xu, 0x%08xu, c,"
+                               " float4(dfdx(cn), dfdy(cn)), o);\n",
+                               f->w[0], f->w[1], f->w[2]);
     } else if (op == 0x04) {
         /* GET_TEXTURE_RESINFO, as tfetch_stage() */
         unsigned sel = (f->w[2] >> 20) & 7;
@@ -2826,8 +3102,6 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
                 "        }\n", ox / 2, oy / 2, unit, unit);
         } else if (key->mip[unit] && ((f->w[1] >> 28) & 3) == 3) {
             /* the level of detail and the levels, as tfetch_stage() */
-            unsigned l;
-
             g_string_append(o, "        float2 cn = float2(F(c[0]), F(c[1]));\n"
                                "        float lod = 0.0f;\n");
             if (op == 0x11) {
@@ -2864,28 +3138,18 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
                 "        float2 of = float2(%d.0f, %d.0f) * 0.5f;\n",
                 unit, unit, unit, unit, unit, unit, unit, ox, oy);
             for (k = 0; k < 2; k++) {
-                const char *lvs = k ? "lv + 1u" : "lv", *dst = k ? "v1" : "v";
-
-                g_string_append_printf(o, "        %sswitch (%s) {\n",
-                                       k ? "if (two) " : "", lvs);
-                for (l = 0; l <= key->mip[unit]; l++) {
-                    char tn[24], ls[40], cs[24];
-
-                    snprintf(cs, sizeof(cs), "case %u:", l);
-                    if (l) {
-                        snprintf(tn, sizeof(tn), "t%u_%u", unit, l);
-                        snprintf(ls, sizeof(ls), "u.lsize[%u]", slot + l - 1);
-                    } else {
-                        snprintf(tn, sizeof(tn), "t%u", unit);
-                        snprintf(ls, sizeof(ls), "ts");
-                    }
-                    g_string_append_printf(o,
-                        "        %s %s = hd_nlv(%s, %s, cn, of, u.twrap[%u], lin,"
-                        " u.tborder[%u], u.tsel[%u]); break;\n",
-                        l == key->mip[unit] ? "default:" : cs, dst, tn, ls, unit, unit,
-                        unit);
-                }
-                g_string_append(o, "        }\n");
+                g_string_append_printf(o,
+                    "        %s{\n"
+                    "            uint l_ = min(lv%s, %uu);\n"
+                    "            float4 ls_ = ts;\n"
+                    "            if (l_ != 0u) {\n"
+                    "                ls_ = u.lsize[%u + l_ - 1u];\n"
+                    "            }\n"
+                    "            %s = hd_nlv(a%u[l_], ls_, cn, of, u.twrap[%u], lin,"
+                    " u.tborder[%u], u.tsel[%u]);\n"
+                    "        }\n", k ? "if (two) " : "", k ? " + 1u" : "",
+                    key->mip[unit], slot, k ? "v1" : "v", unit, unit, unit,
+                    unit);
             }
             g_string_append(o, "        if (two) {\n            v = v + (v1 - v) * fr;\n        }\n");
         } else {
@@ -2921,19 +3185,47 @@ static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
 {
     GString *o;
-    unsigned i, j, ng = MAX(ir->ngpr, 1u), nlv = 0;
-    uint32_t iflat = 0, ivar = 0;
+    unsigned i, j, ng = MAX(ir->ngpr, 1u), nlv = 0, ntx = 0;
+    unsigned slot[HD5770_GPU_TEX];
+    uint32_t iflat = 0, ivar = 0, ufn = 0;
     bool mips = false;
 
-    if (ir->cf || ir->vs || ir->zexport || ir->cmask != 1 || k->ninputs > 32 ||
-        k->nvb > HD5770_GPU_VB) {
+    if (ir->vs || k->ninputs > 32 || k->nvb > HD5770_GPU_VB ||
+        ir->nres > HD5770_GPU_TEX) {
         return NULL;
     }
-    for (i = 0; i < ir->nres && i < HD5770_GPU_TEX; i++) {
+    for (i = 0; i < ir->nres; i++) {
+        slot[i] = nlv;
         nlv += k->mip[i];
         mips |= k->mip[i] != 0;
+        ntx += nat_ntex(k, i) > 1 ? nat_ntex(k, i) : 0;
     }
-    if (nlv > HD5770_NAT_LEVELS || (mips && ir->nres > 14)) {
+    for (i = 0; i < ir->nfetches; i++) {
+        const HD5770IRFetch *f = &ir->fetches[i];
+
+        if (ir->cf && (f->kind != HD5770_IRF_TEX ||
+                       !nat_tex_op(f->w[0] & 0x1f))) {
+            /* the CF form: texture fetches only, no gradients */
+            return NULL;
+        }
+        if (nat_unit_fn(ir, k, f)) {
+            for (j = 0; j < ir->nres && ir->res[j] != f->res; j++) {
+                /* search */
+            }
+            if (j == ir->nres) {
+                return NULL;
+            }
+            ufn |= 1u << j;
+        }
+    }
+    for (i = 0; i < ir->nres; i++) {
+        if (k->nsl[i] > 1 && !((ufn >> i) & 1)) {
+            /* slices are reached through the unit's function only */
+            ufn |= 1u << i;
+        }
+    }
+    if (nlv > HD5770_NAT_LEVELS || ntx > HD5770_NAT_LEVELS ||
+        ((mips || ufn) && ir->nres > 14)) {
         return NULL;
     }
     for (i = 0; i < ir->ninsts; i++) {
@@ -2947,7 +3239,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         return NULL;
     }
     o = g_string_new(hd5770_msl_alu());
-    g_string_append(o,
+    g_string_append_printf(o,
         "struct NU {\n"
         "    float4 tsize[16];\n"
         "    uint4 tsel[16];\n"
@@ -2965,10 +3257,13 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    float4 tlod[16];\n"
         "    uint4 tmip[16];\n"
         "    uint4 tres[16];\n"
-        "    float4 lsize[32];\n"
+        "    float4 lsize[%u];\n"
         "    float4 zr;\n"
+        "    uint4 tcmp[16];\n"
+        "    uint lconst[32];\n"
+        "    uint bconst, zero, pad3, pad4;\n"
         "};\n"
-        "struct NV {\n    float4 pos [[position]];\n");
+        "struct NV {\n    float4 pos [[position]];\n", HD5770_NAT_LEVELS);
     for (i = 0; i < k->ninputs; i++) {
         bool fl = ((k->flat | iflat) >> i) & 1;
 
@@ -3039,6 +3334,28 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    }\n"
         "    return clamp(t, 0.5f, w - 0.5f);\n"
         "}\n"
+        "/* wrap() in ati_hd5770_draw.c */\n"
+        "static __attribute__((always_inline)) int hd_niwrap(int v, int size, uint m, thread bool &out)\n"
+        "{\n"
+        "    switch (m) {\n"
+        "    case 0:\n"
+        "        v %= size;\n"
+        "        if (v < 0) {\n            v += size;\n        }\n"
+        "        break;\n"
+        "    case 1: {\n"
+        "        int p = v % (2 * size);\n"
+        "        if (p < 0) {\n            p += 2 * size;\n        }\n"
+        "        v = p < size ? p : 2 * size - 1 - p;\n"
+        "        break;\n"
+        "    }\n"
+        "    case 2: v = clamp(v, 0, size - 1); break;\n"
+        "    case 3: case 5: case 7: v = clamp(v < 0 ? -v - 1 : v, 0, size - 1); break;\n"
+        "    default:\n"
+        "        if (v < 0 || v >= size) {\n            out = true;\n            v = 0;\n        }\n"
+        "        break;\n"
+        "    }\n"
+        "    return v;\n"
+        "}\n"
         "static __attribute__((always_inline)) bool hd_nalpha(uint fn, float r, float a)\n"
         "{\n"
         "    switch (fn) {\n"
@@ -3061,7 +3378,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         "    uint b = as_type<uint>(x);\n"
         "    return float(int((b >> 23) & 0xffu) - 127) + float(b & 0x7fffffu) * (1.0f / 8388608.0f);\n"
         "}\n");
-    if (mips) {
+    if (mips || ufn) {
         g_string_append(o,
             "constexpr sampler hd_sn(coord::normalized, address::clamp_to_edge, filter::nearest);\n"
             "constexpr sampler hd_sl(coord::normalized, address::clamp_to_edge, filter::linear);\n"
@@ -3082,46 +3399,186 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             "    return bo ? border : hd_nsel(v, sel);\n"
             "}\n");
     }
-    if (k->zout) {
-        g_string_append(o, "struct NO {\n    float4 c [[color(0)]];\n    float z [[depth(any)]];\n};\n");
+    if (ufn) {
+        g_string_append(o,
+            "/* a texel compared with the reference, as texel_z() */\n"
+            "static float4 hd_ncmp1(texture2d<float> t, float4 ls, int2 p, uint4 wrap, float4 border,\n"
+            "                       uint4 sel, uint cmp, float ref)\n"
+            "{\n"
+            "    bool bo = false, pass = false;\n"
+            "    int x = hd_niwrap(p.x, int(ls.x), wrap.x, bo);\n"
+            "    int y = hd_niwrap(p.y, int(ls.y), wrap.y, bo);\n"
+            "    if (bo) {\n        return border;\n    }\n"
+            "    float f = t.read(uint2(uint(x), uint(y))).x;\n"
+            "    switch (cmp - 1u) {\n"
+            "    case 1: pass = ref < f; break;\n"
+            "    case 2: pass = ref == f; break;\n"
+            "    case 3: pass = ref <= f; break;\n"
+            "    case 4: pass = ref > f; break;\n"
+            "    case 5: pass = ref != f; break;\n"
+            "    case 6: pass = ref >= f; break;\n"
+            "    case 7: pass = true; break;\n"
+            "    default: break;\n"
+            "    }\n"
+            "    return hd_nsel(float4(pass ? 1.0f : 0.0f), sel);\n"
+            "}\n"
+            "/* sample_lv(): a level's texture at tc in its texels; ls its size and its texture's */\n"
+            "static float4 hd_nsamp(texture2d<float> t, float4 ls, float2 tc, uint4 wrap, bool lin,\n"
+            "                       float4 border, uint4 sel, uint cmp, float ref, uint mx)\n"
+            "{\n"
+            "    if (cmp == 0u) {\n"
+            "        bool bo = false;\n"
+            "        float4 v;\n"
+            "        tc.x = hd_nwrap(tc.x, ls.x, wrap.x, bo);\n"
+            "        tc.y = hd_nwrap(tc.y, ls.y, wrap.y, bo);\n"
+            "        if (lin) {\n"
+            "            v = t.sample(hd_sl, tc / ls.zw, level(0.0f));\n"
+            "        } else {\n"
+            "            v = t.sample(hd_sn, tc / ls.zw, level(0.0f));\n"
+            "        }\n"
+            "        return bo ? border : hd_nsel(v, sel);\n"
+            "    }\n"
+            "    if (mx != 0u) {\n"
+            "        ref = floor(clamp(ref, 0.0f, 1.0f) * float(mx) + 0.5f) / float(mx);\n"
+            "    }\n"
+            "    if (!lin) {\n"
+            "        return hd_ncmp1(t, ls, int2(floor(tc)), wrap, border, sel, cmp, ref);\n"
+            "    }\n"
+            "    float2 f = tc - 0.5f, fl = floor(f), a = f - fl;\n"
+            "    int2 p = int2(fl);\n"
+            "    float4 t00 = hd_ncmp1(t, ls, p, wrap, border, sel, cmp, ref);\n"
+            "    float4 t10 = hd_ncmp1(t, ls, p + int2(1, 0), wrap, border, sel, cmp, ref);\n"
+            "    float4 t01 = hd_ncmp1(t, ls, p + int2(0, 1), wrap, border, sel, cmp, ref);\n"
+            "    float4 t11 = hd_ncmp1(t, ls, p + int2(1, 1), wrap, border, sel, cmp, ref);\n"
+            "    float4 top = t00 + (t10 - t00) * a.x, bot = t01 + (t11 - t01) * a.x;\n"
+            "    return top + (bot - top) * a.y;\n"
+            "}\n");
+        for (i = 0; i < ir->nres; i++) {
+            if ((ufn >> i) & 1) {
+                nat_unit(o, k, i, slot[i]);
+            }
+        }
+    }
+    if (ir->cf) {
+        /* the program's functions (ati_hd5770_emit.c) */
+        for (i = 0; i < 32; i++) {
+            bool fl = ((k->flat | iflat) >> i) & 1;
+
+            if (i >= k->ninputs) {
+                g_string_append_printf(o, "#define HD_NI_%uu(ch) 0.0f\n", i);
+            } else {
+                g_string_append_printf(o, "#define HD_NI_%uu(ch) %s(in.p%u[ch])\n",
+                                       i, fl ? "F" : "", i);
+            }
+        }
+        g_string_append(o, "#define HD_CTX_PARAMS NF in, constant NU &u, constant uint *kv");
+        for (i = 0; i < ir->nres; i++) {
+            if ((ufn >> i) & 1) {
+                nat_tlist(o, k, i, true);
+            }
+        }
+        g_string_append(o, "\n#define HD_CTX_ARGS in, u, kv");
+        for (i = 0; i < ir->nres; i++) {
+            if ((ufn >> i) & 1) {
+                nat_tlist(o, k, i, false);
+            }
+        }
+        g_string_append(o,
+            "\nstatic void hd_ntex(HD_CTX_PARAMS, uint fu, uint w0, uint w1, uint w2,\n"
+            "                    thread uint (&c)[4], float4 dv, thread uint (&o)[4])\n"
+            "{\n"
+            "    switch (fu) {\n");
+        for (i = 0; i < ir->nres; i++) {
+            if ((ufn >> i) & 1) {
+                g_string_append_printf(o, "    case %u: hd_nt%u(u", i, i);
+                nat_tlist(o, k, i, false);
+                g_string_append(o, ", w0, w1, w2, c, dv, o); break;\n");
+            }
+        }
+        g_string_append_printf(o,
+            "    default: o[0] = 0u; o[1] = 0u; o[2] = 0u; o[3] = 0u; break;\n"
+            "    }\n"
+            "}\n"
+            "#define HD_K(k) kv[k]\n"
+            "#define HD_BCONST u.bconst\n"
+            "#define HD_LCONST(i) u.lconst[i]\n"
+            "#define HD_POSGPR %d\n"
+            "#define HD_TEX(fu, w0, w1, w2, c, dv, o) { \\\n"
+            "    float2 cn_ = float2(F(c[0]), F(c[1])); \\\n"
+            "    hd_ntex(HD_CTX_ARGS, fu, w0, w1, w2, c, float4(dfdx(cn_), dfdy(cn_)), o); }\n"
+            "#define HD_ZERO int(u.zero)\n"
+            "#define HD_VTX(w0, w1, w2, i, o)\n"
+            "#define HD_INTERP(p, ch, fl, b0, b1, b2, pw) HD_NI_##p(ch)\n"
+            "#define HD_OUTA(n, a, b) thread uint (&n)[a][b]\n"
+            "#define HD_OUTBA(n, a) thread bool (&n)[a]\n"
+            "#define HD_OUTB(n) thread bool &n\n"
+            "#define HD_OUTU(n) thread uint &n\n"
+            "#define HD_OUTC(n) thread uint (&n)[8][4]\n",
+            k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr ? k->pos_gpr : -1);
+        hd5770_emit_cf(o, ir, 0, true);
+    }
+    if (k->zout || k->ncol) {
+        g_string_append(o, "struct NO {\n");
+        for (i = 0; i < MAX(k->ncol, 1u); i++) {
+            g_string_append_printf(o, "    float4 c%u [[color(%u)]];\n", i, i);
+        }
+        if (k->zout) {
+            g_string_append(o, "    float z [[depth(any)]];\n");
+        }
+        g_string_append(o, "};\n");
     }
     g_string_append_printf(o,
         "fragment %s hd_nfs(NF in [[stage_in]], constant NU &u [[buffer(0)]],\n"
-        "                       constant uint *kv [[buffer(1)]]", k->zout ? "NO" : "float4");
+        "                       constant uint *kv [[buffer(1)]]",
+        k->zout || k->ncol ? "NO" : "float4");
     for (i = 0; i < k->nvb; i++) {
         g_string_append_printf(o, ",\n    const device uchar *vb%u [[buffer(%u)]]",
                                i, 2 + i);
     }
-    for (i = 0, nlv = 0; i < ir->nres; i++) {
+    for (i = 0, ntx = 0; i < ir->nres; i++) {
+        unsigned n = nat_ntex(k, i);
+
         g_string_append_printf(o, ",\n    texture2d<float> t%u [[texture(%u)]], "
                                "sampler s%u [[sampler(%u)]]", i, i, i, i);
-        for (j = 1; j <= k->mip[i]; j++) {
-            g_string_append_printf(o, ",\n    texture2d<float> t%u_%u [[texture(%u)]]",
-                                   i, j, 16 + nlv++);
+        if (n > 1) {
+            g_string_append_printf(o, ",\n    array<texture2d<float>, %u> a%u"
+                                   " [[texture(%u)]]", n, i, 16 + ntx);
+            ntx += n;
         }
     }
-    g_string_append_printf(o,
+    g_string_append(o,
         ")\n{\n"
         "    uint C[8][4];\n"
         "    for (uint i = 0; i < 8; i++) {\n"
         "        C[i][0] = C[i][1] = C[i][2] = C[i][3] = 0;\n"
         "    }\n"
-        "    uint cm = 0;\n"
-        "    bool killed = false;\n"
-        "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
-        "    for (uint i = 0; i < %u; i++) {\n"
-        "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
-        "    }\n", ng, ng);
-    if (k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
+        "    uint cm = 0, zd = 0, sd = 0;\n"
+        "    bool killed = false, zw = false;\n");
+    if (ir->cf) {
+        g_string_append(o,
+            "    hd_run(HD_CTX_ARGS, in.bc.x, in.bc.y, in.bc.z, 0.0f,\n"
+            "           in.pos.x - 0.5f + u.pc, in.pos.y - 0.5f + u.pc,\n"
+            "           0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,\n"
+            "           killed, C, cm, zd, sd, zw);\n");
+    } else {
+        g_string_append_printf(o,
+            "    uint R0[%u][4], P0[5] = { 0, 0, 0, 0, 0 };\n"
+            "    for (uint i = 0; i < %u; i++) {\n"
+            "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
+            "    }\n", ng, ng);
+    }
+    if (!ir->cf && k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
         g_string_append_printf(o,
             "    R0[%d][0] = U(in.pos.x - 0.5f + u.pc);\n"
             "    R0[%d][1] = U(in.pos.y - 0.5f + u.pc);\n"
             "    R0[%d][2] = U(0.0f);\n    R0[%d][3] = U(1.0f);\n",
             k->pos_gpr, k->pos_gpr, k->pos_gpr, k->pos_gpr);
     }
-    g_string_append_printf(o, "    R0[%u][0] = U(in.bc.y);\n    R0[%u][1] = U(in.bc.z);\n",
-                           ir->map[0], ir->map[0]);
-    for (i = 0; i < ir->nops; i++) {
+    if (!ir->cf) {
+        g_string_append_printf(o, "    R0[%u][0] = U(in.bc.y);\n    R0[%u][1] = U(in.bc.z);\n",
+                               ir->map[0], ir->map[0]);
+    }
+    for (i = 0; i < ir->nops && !ir->cf; i++) {
         const HD5770IROp *op = &ir->ops[i];
 
         switch (op->kind) {
@@ -3158,37 +3615,63 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             "        killed = killed || !((u.cliprule >> idx) & 1u);\n"
             "    }\n");
     }
-    g_string_append(o,
-        "    if (killed || !(cm & 1) || !hd_nalpha(u.alpha_func, u.alpha_ref, F(C[0][3]))) {\n"
-        "        discard_fragment();\n"
-        "    }\n");
-    if (k->out == 1) {
-        /* an integer target: the bytes of the channel */
-        g_string_append_printf(o,
-            "    uint v = C[0][%u];\n"
-            "    float4 r = float4(float(v & 0xffu), float((v >> 8) & 0xffu),\n"
-            "                      float((v >> 16) & 0xffu), float(v >> 24)) / 255.0f;\n",
-            k->rt_src[0] & 3);
-    } else if (k->rt_comps == 1) {
-        g_string_append_printf(o,
-            "    float4 r = float4(F(C[0][%u]), 0.0f, 0.0f, 0.0f);\n"
-            "    r = select(r, float4(0.0f), isnan(r));\n", k->rt_src[0] & 3);
-    } else {
-        /* byte i of the target is channel rt_src[i] */
-        g_string_append_printf(o,
-            "    float4 r = float4(F(C[0][%u]), F(C[0][%u]), F(C[0][%u]), F(C[0][%u]));\n"
-            "%s",
-            k->rt_src[0] & 3, k->rt_src[1] & 3, k->rt_src[2] & 3, k->rt_src[3] & 3,
-            k->out == 2 ? "" : "    r = select(r, float4(0.0f), isnan(r));\n");
-    }
-    if (k->zout) {
+    if (k->ncol) {
+        /* shade(): the alpha test reads export 0 */
         g_string_append(o,
-            "    NO no;\n"
-            "    no.c = r;\n"
-            "    no.z = min(max(in.pos.z, u.zr.x), u.zr.y);\n"
-            "    return no;\n}\n");
+            "    if (killed || cm == 0u ||\n"
+            "        ((cm & 1u) != 0u && !hd_nalpha(u.alpha_func, u.alpha_ref, F(C[0][3])))) {\n"
+            "        discard_fragment();\n"
+            "    }\n");
     } else {
-        g_string_append(o, "    return r;\n}\n");
+        g_string_append(o,
+            "    if (killed || !(cm & 1) || !hd_nalpha(u.alpha_func, u.alpha_ref, F(C[0][3]))) {\n"
+            "        discard_fragment();\n"
+            "    }\n");
+    }
+    for (i = 0; i < MAX(k->ncol, 1u); i++) {
+        unsigned cb = k->ncol ? k->col[i].cb & 7 : 0;
+        unsigned out = k->ncol ? k->col[i].out : k->out;
+        unsigned comps = k->ncol ? k->col[i].comps : k->rt_comps;
+        const uint8_t *src = k->ncol ? k->col[i].src : k->rt_src;
+
+        if (out == 1) {
+            /* an integer target: the bytes of the channel */
+            g_string_append_printf(o,
+                "    uint v%u = C[%u][%u];\n"
+                "    float4 r%u = float4(float(v%u & 0xffu), float((v%u >> 8) & 0xffu),\n"
+                "                      float((v%u >> 16) & 0xffu), float(v%u >> 24)) / 255.0f;\n",
+                i, cb, src[0] & 3, i, i, i, i, i);
+        } else if (comps == 1) {
+            g_string_append_printf(o,
+                "    float4 r%u = float4(F(C[%u][%u]), 0.0f, 0.0f, 0.0f);\n"
+                "    r%u = select(r%u, float4(0.0f), isnan(r%u));\n", i, cb,
+                src[0] & 3, i, i, i);
+        } else {
+            /* byte i of the target is channel src[i] */
+            g_string_append_printf(o,
+                "    float4 r%u = float4(F(C[%u][%u]), F(C[%u][%u]), F(C[%u][%u]), F(C[%u][%u]));\n",
+                i, cb, src[0] & 3, cb, src[1] & 3, cb, src[2] & 3, cb,
+                src[3] & 3);
+            if (out != 2) {
+                g_string_append_printf(o,
+                    "    r%u = select(r%u, float4(0.0f), isnan(r%u));\n", i, i, i);
+            }
+        }
+    }
+    if (k->zout || k->ncol) {
+        g_string_append(o, "    NO no;\n");
+        for (i = 0; i < MAX(k->ncol, 1u); i++) {
+            g_string_append_printf(o, "    no.c%u = r%u;\n", i, i);
+        }
+        if (k->zout) {
+            g_string_append_printf(o,
+                "    no.z = min(max(%s, u.zr.x), u.zr.y);\n",
+                k->zexp ? "(zw ? F(zd) : in.pos.z)" : "in.pos.z");
+
+        }
+        g_string_append(o, "    return no;\n}\n");
+    } else {
+        g_string_append(o, "    return r0;\n}\n");
     }
     return g_string_free(o, false);
 }
