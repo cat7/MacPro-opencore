@@ -372,6 +372,13 @@ typedef struct HD5770GpuOps {
      */
     bool (*vs_records)(void *b, const HD5770GpuVs *v, uint32_t *rec,
                        HD5770GpuTri *tri, float *prm, unsigned *ntri);
+    /*
+     * added 2026-11-18: build ahead. prep(b, d): the programs and
+     * pipelines draw() would build for d are noted; nothing is drawn and
+     * no surface is touched. prep(b, NULL): the ones noted are built,
+     * several at a time. NULL: draw() builds as it goes.
+     */
+    void (*prep)(void *b, const HD5770GpuDraw *d);
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
@@ -417,6 +424,8 @@ typedef struct HD5770Gpu {
      * reads: surfaces over them are in memory after every fence
      */
     uint64_t scan_lo, scan_hi;
+    /* added 2026-11-18: set by a draw() that built a program or pipeline */
+    bool built;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

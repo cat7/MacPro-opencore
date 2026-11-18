@@ -95,6 +95,7 @@ typedef struct HD5770CPStats {
     uint64_t kicks, dwords, type0, type2, type3, op[256], gap_op[256];
     uint64_t ibs, ib_overrun, eop, eop_irq, eop_masked, rb_irq;
     uint64_t scratch_wb, rptr_wb, stalls, wait_ok, sem_signal, sem_wait;
+    uint64_t ahead, ahead_draws, scan_flush;
     uint64_t draws, resets, ucode_pfp, ucode_me, ucode_rlc, skipped;
     uint64_t type0_regs, set_regs, load_regs, shadow_writes;
     uint64_t bad_header;

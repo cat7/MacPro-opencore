@@ -395,6 +395,8 @@ typedef struct HD5770Gfx {
      * selects them
      */
     uint32_t border[3][32][4];
+    /* between hd5770_gfx_ahead_begin() and _end() */
+    bool dry;
 } HD5770Gfx;
 
 /* a write to a TD_*_SAMPLER0_BORDER_* register (0xa400..0xa43c) */
@@ -405,6 +407,22 @@ void hd5770_gfx_init(HD5770Gfx *g);
 void hd5770_gfx_fini(HD5770Gfx *g);
 /* everything the backend has queued is in VRAM */
 void hd5770_gfx_sync(HD5770Gfx *g);
+/*
+ * BUILD AHEAD. After a draw for which the backend built a program or
+ * pipeline (hd5770_gfx_built(), which clears the mark), the caller walks
+ * the packets that follow in the stream between _begin() and _end() with
+ * copies of the three register files: hd5770_gfx_state_packet() and
+ * hd5770_gfx_draw() then change no state, read memory as it is and draw
+ * nothing; each draw only tells the backend what it would build. _end()
+ * restores the state and has the backend build all of it at once.
+ * _begin() returns NULL when the backend has no use for it.
+ */
+typedef struct HD5770GfxAhead HD5770GfxAhead;
+bool hd5770_gfx_built(HD5770Gfx *g);
+HD5770GfxAhead *hd5770_gfx_ahead_begin(HD5770Gfx *g, const uint32_t *ctx,
+                                       const uint32_t *cfg,
+                                       const uint32_t *alu);
+void hd5770_gfx_ahead_end(HD5770Gfx *g, HD5770GfxAhead *a);
 /* draws were queued since the last sync */
 bool hd5770_gfx_busy(HD5770Gfx *g);
 /* a fence the backend completes (FENCES in ati_hd5770_gpu.h): its ticket */

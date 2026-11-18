@@ -320,6 +320,9 @@ typedef struct Draw {
     unsigned nlanes;            /* 1, 3 with neighbours; made when rasterised */
     bool gpu_prog;              /* the program may go to the host GPU */
     unsigned gfb;               /* why the last draw stayed on the CPU */
+    /* programs first seen by a draw looked at ahead: not kept */
+    HD5770Prog *ahead_prog[3];
+    unsigned ahead_progs;
     /* HD5770_WHY_*: of the last part, and the draw's first CPU reason */
     unsigned cwhy, why;
     HD5770Val *kv;
@@ -460,9 +463,60 @@ static void gpu_lock(HD5770Gfx *g, bool on)
     }
 }
 
+bool hd5770_gfx_built(HD5770Gfx *g)
+{
+    bool r = g->gpu && g->gpu->built;
+
+    if (r) {
+        g->gpu->built = false;
+    }
+    return r;
+}
+
+struct HD5770GfxAhead {
+    HD5770Gfx g;
+    HD5770GfxStats st;
+};
+
+HD5770GfxAhead *hd5770_gfx_ahead_begin(HD5770Gfx *g, const uint32_t *ctx,
+                                       const uint32_t *cfg,
+                                       const uint32_t *alu)
+{
+    HD5770GfxAhead *a;
+
+    if (!g->gpu || g->gpu_mode != HD5770_GPU_ON || !g->gpu->ops->prep) {
+        return NULL;
+    }
+    gpu_lock(g, true);
+    a = g_new(HD5770GfxAhead, 1);
+    a->g = *g;
+    a->st = *g->st;
+    g->ctx = ctx;
+    g->cfg = cfg;
+    g->alu = alu;
+    g->dry = true;
+    return a;
+}
+
+void hd5770_gfx_ahead_end(HD5770Gfx *g, HD5770GfxAhead *a)
+{
+    uint8_t *ram = g->ram;
+    uint64_t ram_size = g->ram_size;
+
+    *g->st = a->st;
+    *g = a->g;
+    /* guest RAM attached meanwhile stays */
+    g->ram = ram;
+    g->ram_size = ram_size;
+    g_free(a);
+    gpu_lock(g, false);
+    /* the builds: other threads may use the backend meanwhile */
+    g->gpu->ops->prep(g->gpu->b, NULL);
+}
+
 void hd5770_gfx_sync(HD5770Gfx *g)
 {
-    if (!g->gpu) {
+    if (!g->gpu || g->dry) {
         return;
     }
     gpu_lock(g, true);
@@ -611,7 +665,7 @@ static void pend_sync_range(HD5770Gfx *g, uint64_t off, uint64_t len)
  */
 static void pend_touch(HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
 {
-    if (!g->gpu) {
+    if (!g->gpu || g->dry) {
         return;
     }
     gpu_lock(g, true);
@@ -824,6 +878,19 @@ static const HD5770Prog *get_prog(Draw *d, uint64_t addr, unsigned stage)
         if (e->hash == hash && e->ndw == ndw && e->addr == addr) {
             break;
         }
+    }
+    if (!e && g->dry) {
+        /* parsed again, and counted, by the draw itself */
+        HD5770Prog *p = hd5770_prog_new(buf, ndw, stage, d->st);
+
+        g_free(text);
+        g_free(buf);
+        if (d->ahead_progs == ARRAY_SIZE(d->ahead_prog)) {
+            hd5770_prog_free(p);
+            return NULL;
+        }
+        d->ahead_prog[d->ahead_progs++] = p;
+        return p;
     }
     if (!e) {
         e = g_new0(ShEntry, 1);
@@ -4488,6 +4555,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
      * GPU has written
      */
     if (g->gpu_mode == HD5770_GPU_ON && !d->gvs &&
+        !g->dry &&
         !(g->gpu->ops->wrote && (g->npend || g->ram_pend)) &&
         (d->db ? area * ps_cost(d, ir) < HD5770_DB_MIN_PIXELS
                : area * ps_cost(d, ir) < g->gpu->ops->min_pixels &&
@@ -4542,6 +4610,12 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         for (i = 0; i < nr; i++) {
             pre[i] = g_memdup2(g->vram + rng[i][0], rng[i][1] - rng[i][0]);
         }
+    }
+    if (g->dry) {
+        if (q->ntri || q->vs) {
+            g->gpu->ops->prep(g->gpu->b, q);
+        }
+        goto out;
     }
     g->gpu->building = false;
     g->gpu->why = 0;
@@ -4803,6 +4877,7 @@ static bool vsb_draw(Draw *d, const IdxSrc *is, IdxEntry *ic,
     gpu_lock(g, true);
     taken = gpu_draw(d, NULL, 0, prim, t);
     gpu_lock(g, false);
+    taken |= g->dry;
     d->gvs = NULL;
     if (taken) {
         g->gst.vsb_taken++;
@@ -5224,6 +5299,7 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
     gpu_lock(g, true);
     taken = gpu_draw(d, vp, nv, prim, t);
     gpu_lock(g, false);
+    taken |= g->dry;
     if (!taken && d->cwhy < HD5770_WHY_N && zown_gpu(g, d)) {
         /* the CPU draws over depth the host GPU wrote */
         g->gst.mixed_why[d->cwhy]++;
@@ -5622,6 +5698,10 @@ have_idx:
         st->drawn++;
         goto out;
     }
+    if (g->dry && (uint64_t)nu * ninst > 1024) {
+        /* not worth the CPU's vertex stage */
+        goto out;
+    }
     for (inst = 0; inst < ninst && d->ok; inst++) {
         unsigned s0 = 0, k = 0;
         int64_t tv = get_clock();
@@ -5683,6 +5763,9 @@ out:
     g_free(d->mrt);
     g_free(d->nt);
     g_free(d->lanes);
+    for (i = 0; i < d->ahead_progs; i++) {
+        hd5770_prog_free(d->ahead_prog[i]);
+    }
     g_free(d->kv);
     kcache_drop(d);
     g_free(d);

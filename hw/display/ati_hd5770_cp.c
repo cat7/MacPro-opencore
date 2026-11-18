@@ -817,6 +817,98 @@ static void gap(ATIHD5770State *s, unsigned op)
     trace_ati_hd5770_cp_gap(op);
 }
 
+static uint32_t pkt_len(uint32_t h);
+static void fetch(ATIHD5770State *s, uint64_t base, uint32_t idx,
+                  uint32_t mask, uint32_t n, uint32_t *buf);
+
+/*
+ * BUILD AHEAD (ati_hd5770_gfx.h): a draw of indirect buffer level built
+ * a program. The packets after it (n dwords long) to the buffer's end
+ * are walked with copies of the register files, so that what their
+ * draws need is built at once and not draw by draw. Only state and
+ * draws count; a packet whose outcome depends on memory is taken as
+ * executed. Engine thread, no reg_lock.
+ */
+static void cp_ahead(ATIHD5770State *s, unsigned level, uint32_t n)
+{
+    HD5770Stream *ib = &s->cp_ib[level - 1];
+    uint32_t *ctx, *cfg, *alu, *pkt;
+    HD5770GfxAhead *a;
+    uint32_t pos, h, i;
+
+    ctx = g_memdup2(s->gfx, EG_GFX_END - EG_GFX_FIRST);
+    cfg = g_memdup2(s->regs, sizeof(s->regs));
+    alu = g_memdup2(s->alu_const, HD5770_ALU_CONST_DWORDS * 4);
+    a = hd5770_gfx_ahead_begin(&s->gfx3d, ctx, cfg, alu);
+    if (a) {
+        pkt = g_new(uint32_t, 0x4002);
+        s->cp.ahead++;
+        for (pos = ib->pos + n; pos < ib->size; pos += n) {
+            unsigned op;
+            uint32_t reg = 0, first = 1;
+
+            fetch(s, ib->base, pos, 0, 1, &h);
+            n = pkt_len(h);
+            if (!n || pos + n > ib->size) {
+                break;
+            }
+            fetch(s, ib->base, pos, 0, n, pkt);
+            op = (h >> 8) & 0xff;
+            if (h >> 30 == 0) {
+                reg = (h & 0xffff) << 2;
+            } else if (h >> 30 != 3) {
+                continue;
+            } else if (op_is_draw(op)) {
+                hd5770_gfx_draw(&s->gfx3d, pkt, n);
+                ati_hd5770_mc_unmap_all(s);
+                s->cp.ahead_draws++;
+                continue;
+            } else if (op == OP_INDIRECT_BUFFER ||
+                       op == OP_INDIRECT_BUFFER_3F ||
+                       op == OP_INDIRECT_BUFFER_END) {
+                break;
+            } else if (op >= OP_SET_CONFIG_REG && op <= OP_SET_CTL_CONST &&
+                       n >= 2) {
+                unsigned cls = op - OP_SET_CONFIG_REG;
+
+                first = 2;
+                if (cls == 2) {
+                    for (i = 2; i < n; i++) {
+                        uint32_t idx = (pkt[1] & 0xffff) + (i - 2);
+
+                        if (idx < HD5770_ALU_CONST_DWORDS) {
+                            alu[idx] = pkt[i];
+                        }
+                    }
+                    continue;
+                }
+                if (!class_base[cls]) {
+                    continue;
+                }
+                reg = class_base[cls] + (pkt[1] & 0xffff) * 4;
+            } else {
+                hd5770_gfx_state_packet(&s->gfx3d, pkt, n);
+                continue;
+            }
+            for (i = first; i < n; i++) {
+                uint32_t off = reg + (i - first) * 4;
+
+                if (off >= EG_GFX_FIRST && off < EG_GFX_END) {
+                    ctx[(off - EG_GFX_FIRST) >> 2] = pkt[i];
+                } else if (off >= EG_CONFIG_REG_FIRST &&
+                           off < EG_CONFIG_REG_END) {
+                    cfg[off >> 2] = pkt[i];
+                }
+            }
+        }
+        hd5770_gfx_ahead_end(&s->gfx3d, a);
+        g_free(pkt);
+    }
+    g_free(ctx);
+    g_free(cfg);
+    g_free(alu);
+}
+
 /* one type-3 packet: b[0] header, n dwords in all */
 static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
                        unsigned level, uint32_t *skip)
@@ -836,6 +928,9 @@ static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
             /* register accesses go on meanwhile */
             ati_hd5770_reg_unlock(s);
             hd5770_gfx_draw(&s->gfx3d, b, n);
+            if (level && hd5770_gfx_built(&s->gfx3d)) {
+                cp_ahead(s, level, n);
+            }
             ati_hd5770_reg_lock(s);
             s->eng_draw_ns += get_clock() - t0;
         } else {
@@ -1610,6 +1705,10 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
     HD5770CPStats *c = &s->cp;
     unsigned i, n;
 
+    g_string_append_printf(out, "CP: runs for a scanout that moved %" PRIu64
+                           ", built ahead %" PRIu64 " times over %" PRIu64
+                           " draws\n", c->scan_flush, c->ahead,
+                           c->ahead_draws);
     g_string_append_printf(out,
         "CP: kicks %" PRIu64 " dwords %" PRIu64 " type0 %" PRIu64
         " type2 %" PRIu64 " type3 %" PRIu64 " ibs %" PRIu64 "\n"
