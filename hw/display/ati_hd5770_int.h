@@ -385,6 +385,7 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
 void ati_hd5770_cp_drain(ATIHD5770State *s);
+void ati_hd5770_cp_flush(ATIHD5770State *s);
 bool ati_hd5770_engine_reg(uint32_t off);
 void ati_hd5770_reg_lock(ATIHD5770State *s);
 void ati_hd5770_reg_unlock(ATIHD5770State *s);

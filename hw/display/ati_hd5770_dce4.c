@@ -22,6 +22,7 @@
 #include "ui/console.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_regs.h"
+#include "ati_hd5770_gpu.h"
 #include "trace.h"
 
 #define FRAME_HZ        60
@@ -662,6 +663,26 @@ bool ati_hd5770_dce4_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
     return true;
 }
 
+/*
+ * CRTC 0 scans out another surface: the host GPU backend learns the
+ * bytes at once, and a run of the engine ends with a fence, which
+ * brings them up to date if the backend kept them as a target
+ */
+static void scan_moved(ATIHD5770State *s)
+{
+    HD5770Gpu *gpu = s->gfx3d.gpu;
+    ATIHD5770Mode m;
+
+    if (!gpu || !ati_hd5770_dce4_scanout(s, &m) ||
+        (qatomic_read(&gpu->scan_lo) == m.fb_offset &&
+         qatomic_read(&gpu->scan_hi) == m.fb_offset + m.fb_len)) {
+        return;
+    }
+    qatomic_set(&gpu->scan_lo, m.fb_offset);
+    qatomic_set(&gpu->scan_hi, m.fb_offset + m.fb_len);
+    ati_hd5770_cp_flush(s);
+}
+
 bool ati_hd5770_dce4_write(ATIHD5770State *s, uint32_t off, uint32_t val)
 {
     uint32_t idx = off >> 2, rel;
@@ -818,6 +839,9 @@ bool ati_hd5770_dce4_write(ATIHD5770State *s, uint32_t off, uint32_t val)
         case EG_CRTC_BLANK_CONTROL:
             s->regs[idx] = val;
             trace_ati_hd5770_crtc(crtc, "mode", (rel << 16) ^ val);
+            if (crtc == 0 && rel == EG_GRPH_PRIMARY_SURFACE_ADDRESS) {
+                scan_moved(s);
+            }
             return true;
         default:
             s->regs[idx] = val;

@@ -1290,6 +1290,14 @@ static void cp_kick(ATIHD5770State *s)
     qemu_mutex_unlock(&s->eng_lock);
 }
 
+/* a run of the engine although nothing was written to the ring */
+void ati_hd5770_cp_flush(ATIHD5770State *s)
+{
+    if (s->eng_on) {
+        cp_kick(s);
+    }
+}
+
 /*
  * With the BQL, which is released while waiting; retired records are
  * applied here meanwhile (FENCES).
