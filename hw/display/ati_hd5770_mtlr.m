@@ -330,6 +330,7 @@ typedef struct HD5770Mtlr {
     int64_t draw_ns, sync_ns, wait_ns, check_ns, upload_ns, wback_ns;
     uint64_t nfences, fence_empty, fence_now, drains, fly_cmp, holds;
     uint64_t fence_wait;        /* fences that only await passes */
+    uint64_t fence_own;         /* of them with their own command buffer */
     uint64_t kept_rects, rsyncs;
     int64_t fence_ns, drain_ns, fcopy_ns;
     GArray *build_ms;
@@ -1502,7 +1503,7 @@ static id<MTLBuffer> nat_buf(HD5770Mtlr *m, size_t n)
  */
 static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
 {
-    id<MTLCommandBuffer> cb;
+    id<MTLCommandBuffer> cb, pcb = nil;
     id<MTLBlitCommandEncoder> bl;
     id<MTLBuffer> buf = nil;
     NatFence *f;
@@ -1530,11 +1531,21 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
     }
     *drew = n;
     if (!n) {
-        nat_end_pass(m);
+        if (m->enc) {
+            /* the open pass's command buffer carries the fence */
+            [m->enc endEncoding];
+            [m->enc release];
+            m->enc = nil;
+            pcb = m->cb;
+            m->cb = nil;
+        }
+        m->cur = m->cur_z = m->cur_s = NULL;
+        m->ncurm = 0;
+        m->pass_on = false;
         nat_report(m);
         /* passes in flight read vertex buffers in place */
         m->pass_done = MAX(m->pass_done, qatomic_read(&m->cb_passes));
-        busy = m->passes > m->pass_done;
+        busy = pcb || m->passes > m->pass_done;
         if (g_queue_is_empty(&m->fences) && !busy) {
             m->fence_now++;
             return 0;
@@ -1600,7 +1611,8 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
         m->last = cb;
     } else if (busy) {
         /* done when the passes before it are */
-        cb = [[m->q commandBuffer] retain];
+        cb = pcb ? pcb : [[m->q commandBuffer] retain];
+        m->fence_own += !pcb;
         f->passes = m->passes;
         f->cb = [cb retain];
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
@@ -3819,11 +3831,12 @@ static void nat_stats(void *opaque, GString *out)
                            ", plane rectangles kept %" PRIu64
                            ", syncs for a range %" PRIu64
                            ", fences for passes in flight %" PRIu64
+                           " (own command buffer %" PRIu64 ")"
                            "\n", m->nfences + m->fence_now, m->fence_now,
                            m->fence_empty, m->drains, m->fly_cmp, m->holds,
                            m->fence_ns / 1000000, m->drain_ns / 1000000,
                            m->fcopy_ns / 1000000, m->kept_rects, m->rsyncs,
-                           m->fence_wait);
+                           m->fence_wait, m->fence_own);
     g_string_append_printf(out, "native: waits for:");
     for (i = 0; i < NW_N; i++) {
         g_string_append_printf(out, " %s %" PRIu64 " (%" PRId64 " ms)",
