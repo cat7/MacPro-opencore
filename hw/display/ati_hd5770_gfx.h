@@ -215,6 +215,7 @@ enum {
 };
 
 #define HD5770_PENDING          16
+#define HD5770_WPENDING         48
 #define HD5770_ZOWN             8
 
 /*
@@ -352,7 +353,7 @@ typedef struct HD5770Gfx {
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;
     /* the ones among them they write */
-    uint64_t wpend[HD5770_PENDING][2];
+    uint64_t wpend[HD5770_WPENDING][2];
     unsigned nwpend;
     /* VRAM ranges queued draws read in place: vertex buffers */
     uint64_t vpend[8][2];

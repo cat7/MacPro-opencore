@@ -406,7 +406,7 @@ static void wpend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
             at = i;
         }
     }
-    if (best && g->nwpend < HD5770_PENDING) {
+    if (best && g->nwpend < HD5770_WPENDING) {
         g->wpend[g->nwpend][0] = lo;
         g->wpend[g->nwpend][1] = hi;
         g->nwpend++;
