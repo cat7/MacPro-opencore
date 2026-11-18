@@ -680,6 +680,7 @@ static void scan_moved(ATIHD5770State *s)
     }
     qatomic_set(&gpu->scan_lo, m.fb_offset);
     qatomic_set(&gpu->scan_hi, m.fb_offset + m.fb_len);
+    s->cp.scan_flush++;
     ati_hd5770_cp_flush(s);
 }
 

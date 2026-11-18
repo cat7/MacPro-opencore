@@ -779,8 +779,21 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
     g_free(snap);
     s->mode = *mode;
     if (s->gfx3d.gpu) {
-        qatomic_set(&s->gfx3d.gpu->scan_lo, mode->fb_offset);
-        qatomic_set(&s->gfx3d.gpu->scan_hi, mode->fb_offset + mode->fb_len);
+        HD5770Gpu *gpu = s->gfx3d.gpu;
+        bool moved = qatomic_read(&gpu->scan_lo) != mode->fb_offset ||
+                     qatomic_read(&gpu->scan_hi) != mode->fb_offset +
+                                                    mode->fb_len;
+
+        qatomic_set(&gpu->scan_lo, mode->fb_offset);
+        qatomic_set(&gpu->scan_hi, mode->fb_offset + mode->fb_len);
+        if (moved) {
+            /*
+             * by a register other than the surface address: a run of
+             * the engine ends with the fence that writes the surface
+             */
+            s->cp.scan_flush++;
+            ati_hd5770_cp_flush(s);
+        }
     }
     return true;
 }
