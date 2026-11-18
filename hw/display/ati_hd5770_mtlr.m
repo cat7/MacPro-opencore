@@ -220,6 +220,7 @@ typedef struct NatSurf {
     uint8_t vsm;                /* bit 0 the CPU's, bit 1 the host's */
     bool dirty;                 /* tex is newer than memory */
     bool recent;                /* drawn since the last fence */
+    bool kept;                  /* stays out of the fence being made */
     int64_t tdraw;              /* when it was last drawn */
     int nr, r[NAT_RECTS][4];    /* where: x0, y0, x1, y1 */
     size_t ro[NAT_RECTS];       /* their pixels in the read buffer */
@@ -1463,7 +1464,8 @@ static inline bool nat_kept(const HD5770Mtlr *m, const NatSurf *e)
         return m->zlazy;
     }
     return m->clazy && !e->space &&
-           !(e->lo < m->pub.scan_hi && m->pub.scan_lo < e->hi);
+           !(e->lo < qatomic_read(&m->pub.scan_hi) &&
+             qatomic_read(&m->pub.scan_lo) < e->hi);
 }
 
 /* the fence is made: what stays newer than memory, for the device */
@@ -1516,7 +1518,9 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
     for (i = 0; i < m->act->len; i++) {
         NatSurf *e = g_ptr_array_index(m->act, i);
 
-        for (k = 0; e->dirty && !nat_kept(m, e) && k < e->nr; k++) {
+        /* the scanout moves meanwhile: asked once */
+        e->kept = nat_kept(m, e);
+        for (k = 0; e->dirty && !e->kept && k < e->nr; k++) {
             need += ROUND_UP((size_t)(e->r[k][2] - e->r[k][0]) *
                              (e->r[k][3] - e->r[k][1]) * e->s.bpe, 16);
             n++;
@@ -1573,7 +1577,7 @@ static uint64_t nat_fence_locked(HD5770Mtlr *m, bool *drew)
         for (i = 0; i < m->act->len; i++) {
             NatSurf *e = g_ptr_array_index(m->act, i);
 
-            if (nat_kept(m, e)) {
+            if (e->kept) {
                 m->kept_rects += e->dirty ? e->nr : 0;
                 continue;
             }
