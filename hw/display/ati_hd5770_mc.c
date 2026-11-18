@@ -152,7 +152,7 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
             }
         } else if (sp.vram) {
             if (mode != MC_POST &&
-                hd5770_gfx_pending(&s->gfx3d, sp.addr, n)) {
+                hd5770_gfx_pending(&s->gfx3d, sp.addr, n, !write)) {
                 ati_hd5770_gpu_sync(s);
             }
             if (write) {
@@ -388,7 +388,7 @@ static void hdp_settle(ATIHD5770State *s, uint64_t addr)
     ati_hd5770_cp_drain(s);
     if (hdp_find(s, addr, &n) &&
         hd5770_gfx_pending(&s->gfx3d, s->hdp_lo[n],
-                           s->hdp_hi[n] - s->hdp_lo[n])) {
+                           s->hdp_hi[n] - s->hdp_lo[n], false)) {
         ati_hd5770_gpu_sync(s);
     }
 }

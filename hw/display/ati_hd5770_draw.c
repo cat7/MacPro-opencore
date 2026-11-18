@@ -355,6 +355,35 @@ static void pend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
     g->npend++;
 }
 
+/* the same for a range written; without room it joins the nearest */
+static void wpend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
+{
+    uint64_t gap, best = UINT64_MAX;
+    unsigned i, at = 0;
+
+    pend_add(g, lo, hi);
+    for (i = 0; i < g->nwpend; i++) {
+        if (lo <= g->wpend[i][1] && g->wpend[i][0] <= hi) {
+            gap = 0;
+        } else {
+            gap = lo > g->wpend[i][1] ? lo - g->wpend[i][1]
+                                      : g->wpend[i][0] - hi;
+        }
+        if (gap < best) {
+            best = gap;
+            at = i;
+        }
+    }
+    if (best && g->nwpend < HD5770_PENDING) {
+        g->wpend[g->nwpend][0] = lo;
+        g->wpend[g->nwpend][1] = hi;
+        g->nwpend++;
+        return;
+    }
+    g->wpend[at][0] = MIN(g->wpend[at][0], lo);
+    g->wpend[at][1] = MAX(g->wpend[at][1], hi);
+}
+
 static void gpu_lock(HD5770Gfx *g, bool on)
 {
     if (g->lock) {
@@ -371,6 +400,7 @@ void hd5770_gfx_sync(HD5770Gfx *g)
     if (g->npend || g->ram_pend || g->nvpend || g->ram_vpend) {
         g->gpu->ops->sync(g->gpu->b);
         g->npend = 0;
+        g->nwpend = 0;
         g->nvpend = 0;
         g->ram_vpend = false;
         g->ram_pend = false;
@@ -395,6 +425,7 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
         /* everything queued is in memory, or kept by the backend */
         if (!g->gpu->kept) {
             g->npend = 0;
+            g->nwpend = 0;
         }
         g->nvpend = 0;
         g->ram_vpend = false;
@@ -405,12 +436,21 @@ uint64_t hd5770_gfx_fence(HD5770Gfx *g)
     return t;
 }
 
-/* queued draws use VRAM [off, off + len); vb: or read it in place */
-static bool pend_hit(const HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
+/*
+ * queued draws use VRAM [off, off + len); vb: or read it in place;
+ * rd: write it
+ */
+static bool pend_hit(const HD5770Gfx *g, uint64_t off, uint64_t len, bool vb,
+                     bool rd)
 {
     unsigned i;
 
-    for (i = 0; i < g->npend; i++) {
+    for (i = 0; rd && i < g->nwpend; i++) {
+        if (off < g->wpend[i][1] && g->wpend[i][0] < off + len) {
+            return true;
+        }
+    }
+    for (i = 0; !rd && i < g->npend; i++) {
         if (off < g->pend[i][1] && g->pend[i][0] < off + len) {
             return true;
         }
@@ -423,7 +463,7 @@ static bool pend_hit(const HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
     return false;
 }
 
-bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len)
+bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len, bool rd)
 {
     bool hit = false;
 
@@ -431,20 +471,23 @@ bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len)
         return false;
     }
     gpu_lock(g, true);
-    hit = pend_hit(g, off, len, true);
+    hit = pend_hit(g, off, len, !rd, rd);
     g->gst.touch_syncs += hit;
     gpu_lock(g, false);
     return hit;
 }
 
-/* vb false: before a read, which the vertex buffers queued do not mind */
+/*
+ * vb false: before a read, which the vertex buffers queued and the
+ * ranges only read do not mind
+ */
 static void pend_touch(HD5770Gfx *g, uint64_t off, uint64_t len, bool vb)
 {
     if (!g->gpu) {
         return;
     }
     gpu_lock(g, true);
-    if (pend_hit(g, off, len, vb)) {
+    if (pend_hit(g, off, len, vb, !vb)) {
         g->gst.touch_syncs++;
         hd5770_gfx_sync(g);
     }
@@ -477,7 +520,7 @@ static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
     uint64_t off, n;
     uint8_t *p;
 
-    if (!g->npend && !g->ram_pend) {
+    if (!g->nwpend && !g->ram_wpend) {
         return;
     }
     if (vram_off(g, mc, len, &off)) {
@@ -488,7 +531,8 @@ static void pend_check(HD5770Gfx *g, uint64_t mc, uint64_t len)
     if (p && p >= g->vram && p < g->vram + g->vram_size && n >= len) {
         /* VRAM through a GART page */
         pend_touch(g, p - g->vram, len, false);
-    } else if (g->ram_pend || !p || (p >= g->vram && p < g->vram + g->vram_size)) {
+    } else if (g->ram_wpend || !p ||
+               (p >= g->vram && p < g->vram + g->vram_size)) {
         hd5770_gfx_sync(g);
     }
 }
@@ -502,7 +546,7 @@ static void pend_check_vb(HD5770Gfx *g, uint64_t mc, uint64_t len)
     uint64_t off, n;
     uint8_t *p;
 
-    if (!g->npend && !g->ram_wpend) {
+    if (!g->nwpend && !g->ram_wpend) {
         return;
     }
     if (vram_off(g, mc, len, &off)) {
@@ -4309,14 +4353,15 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     g->gst.taken++;
     g->gst.taken_db += q->db;
     for (i = 0; i < nr; i++) {
-        pend_add(g, rng[i][0], rng[i][1]);
+        wpend_add(g, rng[i][0], rng[i][1]);
     }
     g->ram_pend |= q->rt.space;
     g->ram_wpend |= q->rt.space;
     if (q->resolve) {
         g->ram_pend |= q->rs.space;
+        g->ram_wpend |= q->rs.space;
         if (!q->rs.space) {
-            pend_add(g, q->rs.voff, q->rs.voff + hd5770_surf_size(&q->rs.s));
+            wpend_add(g, q->rs.voff, q->rs.voff + hd5770_surf_size(&q->rs.s));
         }
     }
     for (i = 0; q->vs && i < q->vs->nvb; i++) {
@@ -4858,7 +4903,13 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
             }
         }
         if (d->resolve) {
-            pend_check(g, d->rs.base, hd5770_surf_size(&d->rs));
+            uint64_t off;
+
+            if (vram_off(g, d->rs.base, hd5770_surf_size(&d->rs), &off)) {
+                hd5770_gfx_touch(g, off, hd5770_surf_size(&d->rs));
+            } else if (g->ram_pend || g->npend) {
+                hd5770_gfx_sync(g);
+            }
         }
         int64_t t0 = get_clock();
         uint64_t px0 = d->st->pixels;

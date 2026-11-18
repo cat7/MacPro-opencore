@@ -351,6 +351,9 @@ typedef struct HD5770Gfx {
     /* VRAM ranges queued draws read or write, [lo, hi) */
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;
+    /* the ones among them they write */
+    uint64_t wpend[HD5770_PENDING][2];
+    unsigned nwpend;
     /* VRAM ranges queued draws read in place: vertex buffers */
     uint64_t vpend[8][2];
     unsigned nvpend;
@@ -400,8 +403,11 @@ bool hd5770_gfx_busy(HD5770Gfx *g);
 uint64_t hd5770_gfx_fence(HD5770Gfx *g);
 /* about to access VRAM bytes [off, off + len) on the CPU */
 void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len);
-/* whether queued draws may write VRAM bytes [off, off + len) */
-bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len);
+/*
+ * whether queued draws use VRAM bytes [off, off + len); rd: write them,
+ * which is what a read waits for
+ */
+bool hd5770_gfx_pending(HD5770Gfx *g, uint64_t off, uint64_t len, bool rd);
 void hd5770_gfx_gpu_stats(HD5770Gfx *g, GString *out);
 /* draws by where they ran (HD5770_WHY_*), part of hd5770_gfx_gpu_stats() */
 void hd5770_gfx_why_stats(HD5770Gfx *g, GString *out);
