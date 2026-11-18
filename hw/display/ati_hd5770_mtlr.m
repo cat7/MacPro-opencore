@@ -217,6 +217,7 @@ typedef struct NatSurf {
     uint8_t vsm;                /* bit 0 the CPU's, bit 1 the host's */
     bool dirty;                 /* tex is newer than memory */
     bool recent;                /* drawn since the last fence */
+    int64_t tdraw;              /* when it was last drawn */
     int nr, r[NAT_RECTS][4];    /* where: x0, y0, x1, y1 */
     size_t ro[NAT_RECTS];       /* their pixels in the read buffer */
     uint64_t used;
@@ -265,7 +266,10 @@ typedef struct HD5770Mtlr {
     bool bc_ok;                 /* BC formats are textures */
     bool pk_ok;                 /* 4_4_4_4 is a format */
     bool zlazy;                 /* planes drawn stay out of a fence */
+    bool clazy;                 /* colour targets drawn, but the scanout's */
     bool ztex;                  /* a plane of floats is read as it is */
+    int64_t lazy_ns;            /* a surface kept stays out this long */
+    int64_t now;                /* the draw's or the fence's time */
     GPtrArray *surfs;
     NatSurf *hb[NAT_HASH];      /* the entries by where they start */
     GPtrArray *act;             /* the entries newer than memory or in flight */
@@ -1347,12 +1351,22 @@ static void nat_writeback(HD5770Mtlr *m, NatSurf *only)
     m->wback_ns += get_clock() - t0;
 }
 
-/* a depth or stencil plane drawn since the last fence stays out of this one */
+/*
+ * a depth or stencil plane drawn since the last fence, or within
+ * lazy_ns, stays out of this one; so does a colour target in VRAM that
+ * is not scanned out
+ */
 static inline bool nat_kept(const HD5770Mtlr *m, const NatSurf *e)
 {
-    return m->zlazy && e->recent &&
-           (e->hf == NF_D16 || e->hf == NF_D24 || e->hf == NF_D32 ||
-            e->hf == NF_S8);
+    if (!e->recent && m->now - e->tdraw >= m->lazy_ns) {
+        return false;
+    }
+    if (e->hf == NF_D16 || e->hf == NF_D24 || e->hf == NF_D32 ||
+        e->hf == NF_S8) {
+        return m->zlazy;
+    }
+    return m->clazy && !e->space &&
+           !(e->lo < m->pub.scan_hi && m->pub.scan_lo < e->hi);
 }
 
 /* the fence is made: what stays newer than memory, for the device */
@@ -1499,6 +1513,7 @@ static void nat_drew(HD5770Mtlr *m, NatSurf *e, int x0, int y0, int x1,
 
     e->dirty = true;
     e->recent = true;
+    e->tdraw = m->now;
     if (!e->act) {
         e->act = true;
         g_ptr_array_add(m->act, e);
@@ -2955,6 +2970,7 @@ static bool nat_draw(void *opaque, const HD5770GpuDraw *d)
     m->draw_build_ns = 0;
     nat_hold(m);
     g_mutex_lock(&m->lk);
+    m->now = t0;
     @autoreleasepool {
         ok = nat_draw_locked(m, d);
     }
@@ -3122,6 +3138,7 @@ static uint64_t nat_fence(void *opaque)
 
     nat_hold(m);
     g_mutex_lock(&m->lk);
+    m->now = t0;
     @autoreleasepool {
         t = nat_fence_locked(m, &drew);
     }
@@ -3381,7 +3398,9 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->bc_ok = m->dev.supportsBCTextureCompression;
         m->pk_ok = m->sep_ds;
         m->zlazy = !g_strcmp0(g_getenv("HD5770_NAT_ZLAZY") ?: "1", "1");
+        m->clazy = !g_strcmp0(g_getenv("HD5770_NAT_CLAZY") ?: "1", "1");
         m->ztex = !g_strcmp0(g_getenv("HD5770_NAT_ZTEX") ?: "1", "1");
+        m->lazy_ns = 1000000ll * atoi(g_getenv("HD5770_NAT_LAZY_MS") ?: "300");
     }
     m->surfs = g_ptr_array_new_with_free_func(nat_surf_free);
     m->act = g_ptr_array_new();

@@ -405,6 +405,11 @@ typedef struct HD5770Gpu {
      * outstanding; the ranges queued stay pending
      */
     bool kept;
+    /*
+     * added 2026-11-18: the VRAM bytes [scan_lo, scan_hi) the display
+     * reads: surfaces over them are in memory after every fence
+     */
+    uint64_t scan_lo, scan_hi;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */

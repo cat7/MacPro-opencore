@@ -23,6 +23,7 @@
 #include "ui/console.h"
 #include "system/qtest.h"
 #include "ati_hd5770_int.h"
+#include "ati_hd5770_gpu.h"
 #include "ati_hd5770_regs.h"
 #include "ati_hd5770_audit.h"
 #include "trace.h"
@@ -777,6 +778,10 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
     }
     g_free(snap);
     s->mode = *mode;
+    if (s->gfx3d.gpu) {
+        qatomic_set(&s->gfx3d.gpu->scan_lo, mode->fb_offset);
+        qatomic_set(&s->gfx3d.gpu->scan_hi, mode->fb_offset + mode->fb_len);
+    }
     return true;
 }
 
