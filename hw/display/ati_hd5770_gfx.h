@@ -368,6 +368,12 @@ typedef struct HD5770Gfx {
         int ext[4];
     } zown[HD5770_ZOWN];
     unsigned zown_next;
+    /* planes with split tiles: the bytes from the base their elements reach */
+    struct {
+        HD5770Surf s;
+        uint64_t cov;
+    } scov[4];
+    unsigned scov_next;
     HD5770GpuStats gst;
     /* serialises the backend between threads; recursive, may be NULL */
     void (*lock)(struct HD5770Gfx *g, bool on);

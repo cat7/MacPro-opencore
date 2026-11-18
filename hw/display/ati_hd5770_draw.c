@@ -355,6 +355,38 @@ static void pend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
     g->npend++;
 }
 
+/* a plane with split tiles: the bytes from its base its elements reach */
+static uint64_t split_cov(HD5770Gfx *g, const HD5770Surf *s)
+{
+    uint64_t cov = 0;
+    uint32_t x, y;
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(g->scov); i++) {
+        const HD5770Surf *c = &g->scov[i].s;
+
+        if (g->scov[i].cov && c->pitch == s->pitch &&
+            c->height == s->height && c->mode == s->mode &&
+            c->bpe == s->bpe && c->banks == s->banks &&
+            c->bankw == s->bankw && c->bankh == s->bankh &&
+            c->mtilea == s->mtilea && c->tile_split == s->tile_split &&
+            c->pipes == s->pipes &&
+            c->pipe_interleave == s->pipe_interleave &&
+            c->nondisp == s->nondisp) {
+            return g->scov[i].cov;
+        }
+    }
+    for (y = 0; y < s->height; y++) {
+        for (x = 0; x < s->pitch; x++) {
+            cov = MAX(cov, hd5770_surf_offset(s, x, y) + s->bpe);
+        }
+    }
+    i = g->scov_next++ % ARRAY_SIZE(g->scov);
+    g->scov[i].s = *s;
+    g->scov[i].cov = cov;
+    return cov;
+}
+
 /* the same for a range written; without room it joins the nearest */
 static void wpend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
 {
@@ -4301,6 +4333,9 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         hd5770_surf_rows(&ws[i]->s, y0,
                          d->gvs ? MIN(y1 + 1, (int)ws[i]->s.height) : y1 + 1,
                          &lo, &hi);
+        if (!ws[i]->s.fast && ws[i]->s.split) {
+            hi = MIN(hi, ws[i]->s.base + split_cov(g, &ws[i]->s));
+        }
         rng[nr][0] = lo - ws[i]->s.base + ws[i]->voff;
         rng[nr][1] = MIN(hi - ws[i]->s.base + ws[i]->voff, g->vram_size);
         if (rng[nr][1] > rng[nr][0]) {
