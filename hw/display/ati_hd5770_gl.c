@@ -56,7 +56,7 @@
 
 #define GL_TILE         64      /* invocations per work group */
 #define GL_ACC          128     /* accesses tracked between barriers */
-#define GL_SEG_DRAWS    64      /* draws per segment */
+#define GL_SEG_DRAWS    64      /* draws per segment, at most */
 #define GL_MAX_TILES    (4 * 1024 * 1024)
 #define GL_GROUPS       65535   /* work groups per dispatch call */
 /* a draw waits this long for a program whose binary is on disk */
@@ -408,6 +408,7 @@ typedef struct HD5770Gl {
     QemuMutex lock;
     QemuCond cond;              /* a job queued or done */
     GQueue *jobs;
+    int njobs;                  /* queued or running */
     QemuSemaphore up;
     HWND win;
     HDC dc;
@@ -1300,6 +1301,7 @@ static void *gl_thread(void *opaque)
             gl_run_seg(g, j->seg);
             seg_free(j->seg);
             g_free(j);
+            qatomic_dec(&g->njobs);
             continue;
         case JOB_COMPILE:
             gl_build(g, j->prog);
@@ -1324,6 +1326,7 @@ static void *gl_thread(void *opaque)
             quit = true;
             break;
         }
+        qatomic_dec(&g->njobs);
         qemu_mutex_lock(&g->lock);
         j->done = true;
         qemu_cond_broadcast(&g->cond);
@@ -1336,6 +1339,7 @@ static void *gl_thread(void *opaque)
 /* queue a job; wait for it if it is on the stack */
 static void gl_job(HD5770Gl *g, GlJob *j, bool wait)
 {
+    qatomic_inc(&g->njobs);
     qemu_mutex_lock(&g->lock);
     g_queue_push_tail(g->jobs, j);
     qemu_cond_broadcast(&g->cond);
@@ -2402,6 +2406,10 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
     g->draws++;
     g->ram_draws += ram;
     g->seg_draws++;
+    if (!qatomic_read(&g->njobs)) {
+        /* the GL thread has nothing: the host GPU starts on these now */
+        gl_submit(g);
+    }
     g->encode_ns += get_clock() - t0;
     return true;
 }
