@@ -836,27 +836,70 @@ static void nat_band(const NatSurf *e, uint32_t b, uint64_t *a, uint64_t *z)
 }
 
 /* rows y0..y1-1 of memory to the host texture */
+static void *nat_ring(HD5770Mtlr *m, size_t n, size_t *at);
+
+/*
+ * rows y0..y1-1 of a texture a pass in flight uses, n bytes at src: a
+ * copy from the ring after that pass, counted as a pass itself (the
+ * ring and the texture are in use until it is done)
+ */
+static void nat_upload_after(HD5770Mtlr *m, NatSurf *e, uint32_t y0,
+                             uint32_t y1, const uint8_t *src, size_t row)
+{
+    uint32_t bk = NF_BLK(e->hf);
+    size_t n = row * (y1 - y0), at;
+    uint8_t *p = nat_ring(m, n, &at);
+    id<MTLCommandBuffer> cb;
+    id<MTLBlitCommandEncoder> bl;
+
+    memcpy(p, src, n);
+    nat_end_pass(m);
+    cb = [[m->q commandBuffer] retain];
+    bl = [cb blitCommandEncoder];
+    [bl copyFromBuffer:m->ring sourceOffset:at sourceBytesPerRow:row
+   sourceBytesPerImage:n
+            sourceSize:MTLSizeMake(e->s.pitch * bk, (y1 - y0) * bk, 1)
+             toTexture:e->tex destinationSlice:0 destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, y0 * bk, 0)];
+    [bl endEncoding];
+    m->passes++;
+    e->pass = m->passes;
+    nat_commit(m, cb);
+    [m->last release];
+    m->last = cb;
+    m->up_after++;
+}
+
 static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
 {
     uint32_t w = e->s.pitch, bpe = e->s.bpe, bk = NF_BLK(e->hf);
+    bool lin = !e->space && e->s.fast &&
+               e->s.mode < HD5770_ARRAY_1D_TILED_THIN1 && e->hf != NF_D24;
+    size_t row = lin ? e->s.row_bytes : (size_t)w * bpe;
+    bool fly;
     int64_t t0;
 
     if (e->pass > m->pass_done) {
         m->pass_done = MAX(m->pass_done, qatomic_read(&m->cb_passes));
     }
-    if (e->pass > m->pass_done) {
-        /* a pass not yet complete uses the texture */
+    /* a pass not yet complete uses the texture */
+    fly = e->pass > m->pass_done;
+    if (fly && ((e->hf >= NF_D16 && e->hf <= NF_S8) ||
+                ROUND_UP(m->ring_at, 256) + row * (y1 - y0) > NAT_RING)) {
         nat_wait(m, NW_UPLOAD);
+        fly = false;
     }
     t0 = get_clock();
-    if (!e->space && e->s.fast && e->s.mode < HD5770_ARRAY_1D_TILED_THIN1 &&
-        e->hf != NF_D24) {
-        [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
-                                              (y1 - y0) * bk)
-                  mipmapLevel:0
-                    withBytes:m->vram + e->voff +
-                              (uint64_t)y0 * e->s.row_bytes
-                  bytesPerRow:e->s.row_bytes];
+    if (lin) {
+        const uint8_t *src = m->vram + e->voff + (uint64_t)y0 * row;
+
+        if (fly) {
+            nat_upload_after(m, e, y0, y1, src, row);
+        } else {
+            [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
+                                                  (y1 - y0) * bk)
+                      mipmapLevel:0 withBytes:src bytesPerRow:row];
+        }
     } else {
         uint8_t *px = nat_tmp(m, (size_t)w * (y1 - y0) * bpe);
 
@@ -870,9 +913,13 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
                 memcpy(px + i * 4, &z, 4);
             }
         }
-        [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
-                                              (y1 - y0) * bk)
-                  mipmapLevel:0 withBytes:px bytesPerRow:w * bpe];
+        if (fly) {
+            nat_upload_after(m, e, y0, y1, px, row);
+        } else {
+            [e->tex replaceRegion:MTLRegionMake2D(0, y0 * bk, w * bk,
+                                                  (y1 - y0) * bk)
+                      mipmapLevel:0 withBytes:px bytesPerRow:row];
+        }
     }
     m->uploads++;
     m->upload_bytes += (uint64_t)w * (y1 - y0) * bpe;
