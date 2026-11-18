@@ -138,6 +138,7 @@ typedef struct ShEntry {
     uint64_t addr;
     uint32_t hash;
     uint32_t ndw;
+    uint8_t *text;              /* its ndw words as they lie in memory */
     HD5770Prog *prog;
     struct ShEntry *next;
 } ShEntry;
@@ -316,6 +317,7 @@ typedef struct Draw {
     bool ok;
     /* pixel shader lanes */
     HD5770Lanes *lanes, *nh, *nv;   /* nh, nv: neighbours for gradients */
+    unsigned nlanes;            /* 1, 3 with neighbours; made when rasterised */
     bool gpu_prog;              /* the program may go to the host GPU */
     unsigned gfb;               /* why the last draw stayed on the CPU */
     /* HD5770_WHY_*: of the last part, and the draw's first CPU reason */
@@ -785,11 +787,25 @@ static const HD5770Prog *get_prog(Draw *d, uint64_t addr, unsigned stage)
 {
     HD5770Gfx *g = d->g;
     uint32_t *buf, ndw, hash;
-    ShEntry *e;
+    ShEntry *e, **last;
+    uint8_t *text;
     unsigned b;
 
     if (!addr) {
         return NULL;
+    }
+    last = &g->cache->last[stage & 3][(addr >> 8) % SH_LAST];
+    e = *last;
+    if (e && e->addr == addr) {
+        /* the program last found here, if its words are still there */
+        uint64_t n = 0;
+        uint8_t *p = g->mem.map(g->mem.opaque, addr, &n, false);
+
+        if (p && e->text && n >= (uint64_t)e->ndw * 4 &&
+            !memcmp(p, e->text, (size_t)e->ndw * 4)) {
+            census(d->st, addr, e->hash, stage, e->prog);
+            return e->prog;
+        }
     }
     buf = g_new(uint32_t, MAX_PROG_DWORDS);
     hd5770_mem_read(&g->mem, addr, buf, 4096);
@@ -798,6 +814,7 @@ static const HD5770Prog *get_prog(Draw *d, uint64_t addr, unsigned stage)
         hd5770_mem_read(&g->mem, addr, buf, MAX_PROG_DWORDS * 4);
         ndw = hd5770_prog_size(buf, MAX_PROG_DWORDS);
     }
+    text = g_memdup2(buf, (size_t)ndw * 4);
     for (b = 0; b < ndw; b++) {
         buf[b] = le32_to_cpu(buf[b]);
     }
@@ -814,9 +831,13 @@ static const HD5770Prog *get_prog(Draw *d, uint64_t addr, unsigned stage)
         e->hash = hash;
         e->ndw = ndw;
         e->prog = hd5770_prog_new(buf, ndw, stage, d->st);
+        e->text = text;
+        text = NULL;
         e->next = g->cache->b[b];
         g->cache->b[b] = e;
     }
+    *last = e;
+    g_free(text);
     g_free(buf);
     census(d->st, addr, hash, stage, e->prog);
     return e->prog;
@@ -1027,7 +1048,58 @@ static void vfetch_ps(void *opaque, const uint32_t *w, uint32_t index,
 static void tex_levels(Tex *t, uint64_t mip_addr);
 static unsigned bc_kind(unsigned fmt);
 
+static bool tex_setup_regs(Draw *d, unsigned id, unsigned sid, Tex *t);
+
+/*
+ * the texture of resource id with sampler sid: as set up before with
+ * these registers, or set up in tmp; valid until the next one is asked for
+ */
+static const Tex *tex_peek(Draw *d, unsigned id, unsigned sid, Tex *tmp)
+{
+    HD5770Gfx *g = d->g;
+    const uint32_t *r = &g->ctx[(SQ_RESOURCE_0 - 0x28000) / 4 + id * 8];
+    const uint32_t *sm = &g->ctx[(SQ_SAMPLER_0 - 0x28000) / 4 + sid * 3];
+    uint64_t gaps = d->st->gap_misc[HD5770_GAP_MSAA] +
+                    d->st->gap_misc[HD5770_GAP_MIP];
+    uint32_t key[16] = { 0 }, h;
+    TexMemo *e;
+
+    memcpy(key, r, 8 * 4);
+    memcpy(key + 8, sm, 3 * 4);
+    if (((sm[0] >> 20) & 3) == 3) {
+        unsigned st = sid < SAMPLER_VS ? 0 : sid < 2 * SAMPLER_VS ? 1 : 2;
+
+        memcpy(key + 11, g->border[st][(sid - st * SAMPLER_VS) & 31], 16);
+    }
+    key[15] = addr_config(g);
+    h = hash32(key, 16);
+    e = &g->cache->tm[(h ^ h >> 16) % TEX_MEMO];
+    if (e->ok && !memcmp(e->key, key, 16 * 4)) {
+        return &e->t;
+    }
+    if (!tex_setup_regs(d, id, sid, tmp)) {
+        return NULL;
+    }
+    if (gaps == d->st->gap_misc[HD5770_GAP_MSAA] +
+                d->st->gap_misc[HD5770_GAP_MIP]) {
+        memcpy(e->key, key, 16 * 4);
+        e->t = *tmp;
+        e->ok = true;
+    }
+    return tmp;
+}
+
 static bool tex_setup(Draw *d, unsigned id, unsigned sid, Tex *t)
+{
+    const Tex *p = tex_peek(d, id, sid, t);
+
+    if (p && p != t) {
+        *t = *p;
+    }
+    return p != NULL;
+}
+
+static bool tex_setup_regs(Draw *d, unsigned id, unsigned sid, Tex *t)
 {
     HD5770Gfx *g = d->g;
     const uint32_t *r = &g->ctx[(SQ_RESOURCE_0 - 0x28000) / 4 + id * 8];
@@ -2860,6 +2932,15 @@ static void raster_tri(Draw *d, const Vtx *a, const Vtx *b, const Vtx *c,
     if (area == 0.0f || area != area) {
         return;
     }
+    if (d->nlanes && !d->lanes) {
+        d->lanes = g_new0(HD5770Lanes, d->nlanes);
+        d->lanes->pos_gpr = d->pos_ena ? (int)d->pos_gpr : -1;
+        if (d->nlanes == 3) {
+            d->nh = &d->lanes[1];
+            d->nv = &d->lanes[2];
+            d->nh->pos_gpr = d->nv->pos_gpr = d->lanes->pos_gpr;
+        }
+    }
     if (area < 0) {
         v1 = c;
         v2 = b;
@@ -3406,7 +3487,8 @@ static unsigned gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
 {
     unsigned id = ir->res[u], sid = 0, i, k;
     bool seen = false;
-    Tex t;
+    Tex tmp;
+    const Tex *tp;
 
     for (i = 0; i < ir->nfetches; i++) {
         const HD5770IRFetch *f = &ir->fetches[i];
@@ -3421,67 +3503,68 @@ static unsigned gpu_tex(Draw *d, const HD5770IR *ir, unsigned u,
         }
     }
     memset(gt, 0, sizeof(*gt));
-    if (!tex_setup(d, id, sid, &t)) {
+    tp = tex_peek(d, id, sid, &tmp);
+    if (!tp) {
         return HD5770_WHY_TEX_SETUP;
     }
-    if (!d->g->gpu->ops->full && (t.bc || (t.dim != 0 && t.dim != 1))) {
+    if (!d->g->gpu->ops->full && (tp->bc || (tp->dim != 0 && tp->dim != 1))) {
         /* compressed, 3D, cube and array textures: backends with full */
         return HD5770_WHY_TEX_KIND;
     }
-    if (!gpu_surf_n(d->g, &t.s, MAX(t.slice_bytes[0] * MAX(t.slices, 1u),
-                                    hd5770_surf_size(&t.s)), false,
+    if (!gpu_surf_n(d->g, &tp->s, MAX(tp->slice_bytes[0] * MAX(tp->slices, 1u),
+                                    hd5770_surf_size(&tp->s)), false,
                     &gt->surf)) {
         return HD5770_WHY_TEX_SURF;
     }
-    gt->bc = t.bc;
-    gt->slices = MAX(t.slices, 1u);
-    memcpy(gt->slice_bytes, t.slice_bytes, sizeof(gt->slice_bytes));
-    gt->fmt = t.fmt;
-    gt->num = t.num;
-    gt->w = t.w;
-    gt->h = t.h;
-    gt->dim = t.dim;
-    gt->sgn = t.sgn;
-    gt->comps = t.comps;
-    gt->is_float = t.is_float;
-    gt->unorm8 = t.unorm8;
-    gt->base_lv = t.base_lv;
-    gt->levels = t.levels;
-    gt->depth = t.depth;
-    memcpy(gt->samp, t.samp, sizeof(gt->samp));
-    memcpy(gt->border, t.border, sizeof(gt->border));
+    gt->bc = tp->bc;
+    gt->slices = MAX(tp->slices, 1u);
+    memcpy(gt->slice_bytes, tp->slice_bytes, sizeof(gt->slice_bytes));
+    gt->fmt = tp->fmt;
+    gt->num = tp->num;
+    gt->w = tp->w;
+    gt->h = tp->h;
+    gt->dim = tp->dim;
+    gt->sgn = tp->sgn;
+    gt->comps = tp->comps;
+    gt->is_float = tp->is_float;
+    gt->unorm8 = tp->unorm8;
+    gt->base_lv = tp->base_lv;
+    gt->levels = tp->levels;
+    gt->depth = tp->depth;
+    memcpy(gt->samp, tp->samp, sizeof(gt->samp));
+    memcpy(gt->border, tp->border, sizeof(gt->border));
     {
         uint8_t zero[16] = { 0 };
         uint32_t c[4];
 
-        hd5770_fmt_unpack(t.fmt, zero, c, gt->bits);
+        hd5770_fmt_unpack(tp->fmt, zero, c, gt->bits);
     }
     for (k = 0; k < 4; k++) {
-        gt->dst_sel[k] = t.dst_sel[k];
+        gt->dst_sel[k] = tp->dst_sel[k];
     }
-    if (t.mip) {
-        HD5770GpuSurf *lv = g_new0(HD5770GpuSurf, t.last_lv + 1);
+    if (tp->mip) {
+        HD5770GpuSurf *lv = g_new0(HD5770GpuSurf, tp->last_lv + 1);
 
         gt->lv = lv;
         lv[0] = gt->surf;
-        for (k = 1; k <= t.last_lv; k++) {
-            if (!gpu_surf_n(d->g, &t.lv[k],
-                            MAX(t.slice_bytes[k] * tex_slices(&t, k),
-                                hd5770_surf_size(&t.lv[k])),
+        for (k = 1; k <= tp->last_lv; k++) {
+            if (!gpu_surf_n(d->g, &tp->lv[k],
+                            MAX(tp->slice_bytes[k] * tex_slices(tp, k),
+                                hd5770_surf_size(&tp->lv[k])),
                             false, &lv[k]) || lv[k].space) {
                 return HD5770_WHY_TEX_MIP_SURF;
             }
-            gt->lw[k] = t.lw[k];
-            gt->lh[k] = t.lh[k];
+            gt->lw[k] = tp->lw[k];
+            gt->lh[k] = tp->lh[k];
         }
-        gt->lw[0] = t.w;
-        gt->lh[0] = t.h;
+        gt->lw[0] = tp->w;
+        gt->lh[0] = tp->h;
         gt->mip = true;
-        gt->last_lv = t.last_lv;
-        gt->mip_filter = t.mip_filter;
-        gt->min_lod = t.min_lod;
-        gt->max_lod = t.max_lod;
-        gt->lod_bias = t.lod_bias;
+        gt->last_lv = tp->last_lv;
+        gt->mip_filter = tp->mip_filter;
+        gt->min_lod = tp->min_lod;
+        gt->max_lod = tp->max_lod;
+        gt->lod_bias = tp->lod_bias;
     }
     return HD5770_WHY_GPU;
 }
@@ -3573,7 +3656,7 @@ static uint64_t ps_cost(const Draw *d, const HD5770IR *ir)
 {
     uint64_t c = ir->ninsts + 8 * ir->nfetches;
 
-    if (!d->lanes) {
+    if (!d->nlanes) {
         c *= 4;
     }
     if (d->mips || ir->grad) {
@@ -4767,19 +4850,20 @@ static bool ps_feedback(Draw *d, bool all)
 
     hd5770_prog_resources(d->ps, ids, &nres, ARRAY_SIZE(ids));
     for (i = 0; i < nres; i++) {
-        Tex t;
+        Tex tmp;
+        const Tex *t = tex_peek(d, ids[i], 0, &tmp);
         uint64_t lo, hi;
 
-        if (!tex_setup(d, ids[i], 0, &t)) {
+        if (!t) {
             return true;
         }
-        lo = t.s.base;
-        hi = lo + (all ? t.slice_bytes[0] * MAX(t.slices, 1u)
-                       : hd5770_surf_size(&t.s));
-        if (all && t.mip) {
-            for (k = 1; k <= t.last_lv; k++) {
-                lo = MIN(lo, t.lv[k].base);
-                hi = MAX(hi, t.lv[k].base + t.slice_bytes[k] * tex_slices(&t, k));
+        lo = t->s.base;
+        hi = lo + (all ? t->slice_bytes[0] * MAX(t->slices, 1u)
+                       : hd5770_surf_size(&t->s));
+        if (all && t->mip) {
+            for (k = 1; k <= t->last_lv; k++) {
+                lo = MIN(lo, t->lv[k].base);
+                hi = MAX(hi, t->lv[k].base + t->slice_bytes[k] * tex_slices(t, k));
             }
         }
         for (k = 0; k < nt; k++) {
@@ -4821,13 +4905,7 @@ static void lanes_setup(Draw *d)
     grad |= d->mips;
     d->kv = g_new(HD5770Val, MAX(nconst, 1));
     hd5770_prog_bind(d->ps, &d->ps_env, d->kv);
-    d->lanes = g_new0(HD5770Lanes, grad ? 3 : 1);
-    d->lanes->pos_gpr = d->pos_ena ? (int)d->pos_gpr : -1;
-    if (grad) {
-        d->nh = &d->lanes[1];
-        d->nv = &d->lanes[2];
-        d->nh->pos_gpr = d->nv->pos_gpr = d->lanes->pos_gpr;
-    }
+    d->nlanes = grad ? 3 : 1;
     (void)i;
 }
 
@@ -5248,7 +5326,11 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         g->gst.why_draws[HD5770_WHY_SKIPPED]++;
         return;
     }
-    d = g_new0(Draw, 1);
+    /* the textures are set up when first used */
+    d = g_malloc(sizeof(Draw));
+    memset(d, 0, offsetof(Draw, tex));
+    memset((uint8_t *)d + offsetof(Draw, tex_key), 0,
+           sizeof(Draw) - offsetof(Draw, tex_key));
     d->why = HD5770_WHY_N;
     d->g = g;
     d->st = st;
@@ -5644,6 +5726,7 @@ void hd5770_gfx_fini(HD5770Gfx *g)
             ShEntry *n = e->next;
 
             hd5770_prog_free(e->prog);
+            g_free(e->text);
             g_free(e);
             e = n;
         }
