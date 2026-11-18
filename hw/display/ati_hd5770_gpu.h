@@ -467,6 +467,11 @@ typedef struct HD5770NatKey {
     struct {
         uint8_t cb, out, comps, src[4];
     } col[8];
+    /*
+     * a pixel leaves the buffers whose export it did not make as they
+     * are: the function reads them (Apple GPUs)
+     */
+    bool keep;
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);

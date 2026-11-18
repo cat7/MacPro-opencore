@@ -1428,6 +1428,10 @@ static NatProg *nat_prog(HD5770Mtlr *m, const HD5770IR *ir,
         id<MTLLibrary> lib;
 
         nat_exact_math(o);
+        if (k->keep) {
+            /* buffers as inputs of the function */
+            o.languageVersion = MTLLanguageVersion2_3;
+        }
         t0 = get_clock();
         lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
                                    options:o error:&e];
@@ -1907,6 +1911,14 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     k.rt_comps = tg[0].comps;
     k.rt_bytes = nf_bpe[tg[0].hf];
     k.ncol = d->nmrt ? nt : 0;
+    /*
+     * only flow control can leave an export out; with blending the buffer
+     * read would be blended again
+     */
+    k.keep = ir->cf && k.ncol > 1 && m->sep_ds;
+    for (i = 0; i < k.ncol; i++) {
+        k.keep = k.keep && !tg[i].blend;
+    }
     for (i = 0; i < k.ncol; i++) {
         k.col[i].cb = tg[i].cb;
         k.col[i].out = tg[i].out;
@@ -2092,7 +2104,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         g_string_append_printf(pkey, "/%u.%u.%u.%u", k.vb[i].id, k.vb[i].fmt,
                                k.vb[i].num, k.vb[i].sgn);
     }
-    g_string_append_printf(pkey, "/%u%u", k.zout, k.zexp);
+    g_string_append_printf(pkey, "/%u%u%u", k.zout, k.zexp, k.keep);
     for (i = 0; i < k.ncol; i++) {
         g_string_append_printf(pkey, "/%u.%u.%u.%u%u%u%u", k.col[i].cb,
                                k.col[i].out, k.col[i].comps, k.col[i].src[0],

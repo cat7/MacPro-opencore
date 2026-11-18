@@ -3535,6 +3535,9 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
         g_string_append_printf(o, ",\n    const device uchar *vb%u [[buffer(%u)]]",
                                i, 2 + i);
     }
+    for (i = 0; i < k->ncol && k->keep; i++) {
+        g_string_append_printf(o, ",\n    float4 d%u [[color(%u)]]", i, i);
+    }
     for (i = 0, ntx = 0; i < ir->nres; i++) {
         unsigned n = nat_ntex(k, i);
 
@@ -3661,7 +3664,14 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
     if (k->zout || k->ncol) {
         g_string_append(o, "    NO no;\n");
         for (i = 0; i < MAX(k->ncol, 1u); i++) {
-            g_string_append_printf(o, "    no.c%u = r%u;\n", i, i);
+            if (k->ncol && k->keep) {
+                /* shade(): only the buffers of the exports made */
+                g_string_append_printf(o,
+                    "    no.c%u = ((cm >> %uu) & 1u) != 0u ? r%u : d%u;\n",
+                    i, k->col[i].cb & 7, i, i);
+            } else {
+                g_string_append_printf(o, "    no.c%u = r%u;\n", i, i);
+            }
         }
         if (k->zout) {
             g_string_append_printf(o,
