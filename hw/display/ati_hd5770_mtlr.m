@@ -80,7 +80,7 @@ enum {
     ND_PROG_INPUTS, ND_PROG_VTX, ND_PROG_EMIT, ND_PROG_BUILD,
     ND_TEX_KIND, ND_TEX_FMT, ND_TEX_SURF, ND_TEX_TARGET, ND_W, ND_ROOM,
     ND_MRT, ND_RESOLVE, ND_ZEXPORT, ND_RT_WIDE, ND_FETCH_OP, ND_TEX_BC,
-    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY, ND_TEX_MANY, ND_VS,
+    ND_TEX_3D, ND_TEX_CUBE, ND_TEX_ARRAY, ND_TEX_MANY, ND_TEX_UNITS, ND_VS,
     ND_N
 };
 
@@ -94,6 +94,7 @@ static const char *const nd_names[ND_N] = {
     "more render targets", "resolve", "depth export",
     "target over 8 bytes", "fetch operation", "BC texture", "3D texture",
     "cube texture", "array texture", "texture levels and slices",
+    "texture units with levels",
     "vertex stage",
 };
 
@@ -310,6 +311,7 @@ typedef struct HD5770Mtlr {
     uint64_t stamp[2];          /* VRAM, guest RAM */
     uint64_t bytes, seq;        /* of the entries; the draw's number */
     uint64_t cache_max, bytes_most, roomed;
+    uint64_t lv_cut;            /* levels left out: over the host's count */
     uint64_t pass_done;         /* passes up to this one are complete */
     uint64_t cb_passes;         /* the same, from the completed handlers */
     GMutex lk, rlock;
@@ -2932,9 +2934,6 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
             tn[i] += t->dim == 2 ? MAX(k.nsl[i] >> c, 1u) : k.nsl[i];
         }
         nex += tn[i] > 1 ? tn[i] : 0;
-        if (nex > HD5770_NAT_LEVELS) {
-            return nat_decline(m, ND_TEX_MANY, HD5770_WHY_BK_SURF);
-        }
         hf[i] = nat_tex_fmt(m, t);
         if (hf[i] == NF_N) {
             return nat_decline(m, t->bc ? ND_TEX_BC : ND_TEX_FMT,
@@ -2942,7 +2941,27 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
         }
     }
     if (d->ntex > 14 && (nlv || ufn)) {
-        return nat_decline(m, ND_TEX_MANY, HD5770_WHY_BK_SURF);
+        return nat_decline(m, ND_TEX_UNITS, HD5770_WHY_BK_SURF);
+    }
+    while (nex > HD5770_NAT_LEVELS) {
+        /*
+         * more textures than a function takes: the smallest level of the
+         * unit with most levels is left out, the one before it is read
+         */
+        for (i = 1, j = 0; i < d->ntex; i++) {
+            if (k.mip[i] > k.mip[j]) {
+                j = i;
+            }
+        }
+        if (!k.mip[j]) {
+            return nat_decline(m, ND_TEX_MANY, HD5770_WHY_BK_SURF);
+        }
+        c = d->tex[j].dim == 2 ? MAX(k.nsl[j] >> k.mip[j], 1u) : k.nsl[j];
+        k.mip[j]--;
+        nlv--;
+        nex -= tn[j] - c > 1 ? c : tn[j];
+        tn[j] -= c;
+        m->lv_cut++;
     }
     for (i = 0; i < d->ntri; i++) {
         const HD5770GpuTri *t = &d->tri[i];
@@ -3275,7 +3294,7 @@ keys:
             u->tlod[i][1] = t->min_lod;
             u->tlod[i][2] = t->max_lod;
             u->tmip[i][0] = t->mip_filter;
-            u->tmip[i][1] = t->last_lv;
+            u->tmip[i][1] = MIN(t->last_lv, k.mip[i]);
             u->tmip[i][2] = (t->samp[0] >> 9) & 1;
             u->tmip[i][3] = (t->samp[0] >> 11) & 1;
         }
@@ -3783,8 +3802,9 @@ static void nat_stats(void *opaque, GString *out)
                            m->cmp_bytes >> 10, m->surfs->len);
     g_string_append_printf(out, "native: entries hold %" PRIu64 " MB, at most %"
                            PRIu64 " of %" PRIu64 " MB, dropped for room %"
-                           PRIu64 "\n", m->bytes >> 20, m->bytes_most >> 20,
-                           m->cache_max >> 20, m->roomed);
+                           PRIu64 ", texture levels left out %" PRIu64 "\n",
+                           m->bytes >> 20, m->bytes_most >> 20,
+                           m->cache_max >> 20, m->roomed, m->lv_cut);
     g_string_append_printf(out, "native: ms: draw %" PRId64 " sync %" PRId64
                            ", of them wait %" PRId64 " check %" PRId64
                            " upload %" PRId64 " write-back %" PRId64 "\n",
