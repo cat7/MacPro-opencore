@@ -328,6 +328,23 @@ typedef struct HD5770Mtlr {
     uint64_t kept_rects, rsyncs;
     int64_t fence_ns, drain_ns, fcopy_ns;
     GArray *build_ms;
+    /*
+     * BUILD AHEAD (ati_hd5770_gfx.h): dry is set while draws are only
+     * looked at; jl, jp: the libraries and pipelines noted (NatJob), jk
+     * their keys; dp: the pass as it will be then
+     */
+    bool dry, dp_set;
+    struct {
+        bool on;
+        uint64_t rt, z, s;
+        unsigned zf, sf, nt;
+    } dp;
+    GPtrArray *jl, *jp;
+    GHashTable *jk;
+    int job_next, job_end;
+    GPtrArray *job_run;
+    uint64_t ahead, ahead_draws, ahead_libs, ahead_psos;
+    int64_t ahead_ns, ahead_lib_ns;
     /* HD5770_NAT_AUDIT */
     bool audit;
     uint64_t au_bands, au_bytes, au_named, au_ram, au_missed, au_pages;
@@ -360,6 +377,9 @@ static void nat_exact_math(MTLCompileOptions *o)
 
 static bool nat_decline(HD5770Mtlr *m, unsigned r, unsigned why)
 {
+    if (m->dry) {
+        return false;
+    }
     m->nd[r]++;
     m->pub.why = why;
     return false;
@@ -1887,6 +1907,59 @@ static void nat_built(HD5770Mtlr *m, int64_t t0)
 
     m->build_ns += ns;
     m->draw_build_ns += ns;
+    m->pub.built = true;
+}
+
+/* the builds touch no state of the backend: any thread, without lk */
+static NatProg *nat_prog_build(HD5770Mtlr *m, const char *src, bool keep,
+                               uint64_t hash)
+{
+    MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
+    NatProg *pr = NULL;
+    NSError *e = nil;
+    id<MTLLibrary> lib;
+
+    nat_exact_math(o);
+    if (keep) {
+        /* buffers as inputs of the function */
+        o.languageVersion = MTLLanguageVersion2_3;
+    }
+    lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                               options:o error:&e];
+    [o release];
+    if (lib) {
+        pr = g_new0(NatProg, 1);
+        pr->vfn = [lib newFunctionWithName:@"hd_nvs"];
+        pr->ffn = [lib newFunctionWithName:@"hd_nfs"];
+        [lib release];
+    } else {
+        fprintf(stderr, "ati-hd5770: native program %016" PRIx64
+                " not built: %s\n", hash, e.localizedDescription.UTF8String);
+    }
+    return pr;
+}
+
+static id<MTLFunction> nat_vprog_build(HD5770Mtlr *m, const char *src,
+                                       uint64_t hash)
+{
+    MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
+    id<MTLFunction> fn = nil;
+    NSError *e = nil;
+    id<MTLLibrary> lib;
+
+    nat_exact_math(o);
+    o.preserveInvariance = YES;
+    lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
+                               options:o error:&e];
+    [o release];
+    if (lib) {
+        fn = [lib newFunctionWithName:@"hd_bvs"];
+        [lib release];
+    } else {
+        fprintf(stderr, "ati-hd5770: native vertex program %016" PRIx64
+                " not built: %s\n", hash, e.localizedDescription.UTF8String);
+    }
+    return fn;
 }
 
 static NatProg *nat_prog(HD5770Mtlr *m, const HD5770IR *ir,
@@ -1902,31 +1975,10 @@ static NatProg *nat_prog(HD5770Mtlr *m, const HD5770IR *ir,
     }
     src = hd5770_msl_native_fs(ir, k);
     if (src) {
-        MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
-        NSError *e = nil;
-        id<MTLLibrary> lib;
-
-        nat_exact_math(o);
-        if (k->keep) {
-            /* buffers as inputs of the function */
-            o.languageVersion = MTLLanguageVersion2_3;
-        }
         t0 = get_clock();
-        lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
-                                   options:o error:&e];
+        pr = nat_prog_build(m, src, k->keep, ir->hash);
         nat_built(m, t0);
         m->builds++;
-        [o release];
-        if (lib) {
-            pr = g_new0(NatProg, 1);
-            pr->vfn = [lib newFunctionWithName:@"hd_nvs"];
-            pr->ffn = [lib newFunctionWithName:@"hd_nfs"];
-            [lib release];
-        } else {
-            fprintf(stderr, "ati-hd5770: native program %016" PRIx64
-                    " not built: %s\n", ir->hash,
-                    e.localizedDescription.UTF8String);
-        }
         g_free(src);
     }
     g_hash_table_insert(m->progs, g_strdup(key), pr);
@@ -1992,27 +2044,11 @@ static id<MTLFunction> nat_vprog(HD5770Mtlr *m, const HD5770GpuVs *v,
     }
     src = hd5770_msl_native_vs(v->ir, ninputs, flat, v->src);
     if (src) {
-        MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
-        NSError *e = nil;
-        id<MTLLibrary> lib;
-
-        nat_exact_math(o);
-        o.preserveInvariance = YES;
         t0 = get_clock();
-        lib = [m->dev newLibraryWithSource:[NSString stringWithUTF8String:src]
-                                   options:o error:&e];
+        fn = nat_vprog_build(m, src, v->ir->hash);
         m->vs_build_ns += get_clock() - t0;
         nat_built(m, t0);
         m->vs_builds++;
-        [o release];
-        if (lib) {
-            fn = [lib newFunctionWithName:@"hd_bvs"];
-            [lib release];
-        } else {
-            fprintf(stderr, "ati-hd5770: native vertex program %016" PRIx64
-                    " not built: %s\n", v->ir->hash,
-                    e.localizedDescription.UTF8String);
-        }
         g_free(src);
     }
     g_hash_table_insert(m->vprogs, g_strdup(key), fn);
@@ -2026,19 +2062,11 @@ typedef struct NatTg {
     uint32_t blend, src[4];
 } NatTg;
 
-static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
-                                          id<MTLFunction> vfn,
-                                          const char *pkey, const NatTg *tg,
-                                          unsigned nt, unsigned zf,
-                                          unsigned sf)
+/* the key of a pipeline: its programs' and its attachments */
+static char *nat_pso_key(const char *pkey, const NatTg *tg, unsigned nt,
+                         unsigned zf, unsigned sf)
 {
-    MTLRenderPipelineDescriptor *d;
-    MTLRenderPipelineColorAttachmentDescriptor *c;
-    id<MTLRenderPipelineState> p;
-    NSError *e = nil;
     GString *key = g_string_new(pkey);
-    gpointer v;
-    int64_t t0;
     unsigned i;
 
     for (i = 0; i < nt; i++) {
@@ -2046,13 +2074,18 @@ static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
                                tg[i].mask);
     }
     g_string_append_printf(key, "/%u/%u/%u", nt, zf, sf);
-    if (g_hash_table_lookup_extended(m->psos, key->str, NULL, &v)) {
-        g_string_free(key, true);
-        return v;
-    }
+    return g_string_free(key, false);
+}
+
+/* a pipeline's descriptor, without its functions */
+static MTLRenderPipelineDescriptor *nat_pso_desc(const NatTg *tg, unsigned nt,
+                                                 unsigned zf, unsigned sf)
+{
+    MTLRenderPipelineDescriptor *d;
+    MTLRenderPipelineColorAttachmentDescriptor *c;
+    unsigned i;
+
     d = [[MTLRenderPipelineDescriptor alloc] init];
-    d.vertexFunction = vfn ? vfn : pr->vfn;
-    d.fragmentFunction = pr->ffn;
     if (zf < NF_N) {
         d.depthAttachmentPixelFormat = nf_fmt[zf];
     }
@@ -2095,17 +2128,306 @@ static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
         c.destinationAlphaBlendFactor = df;
         }
     }
-    t0 = get_clock();
+    return d;
+}
+
+/* any thread, without lk; d is released */
+static id<MTLRenderPipelineState> nat_pso_build(HD5770Mtlr *m,
+                                                MTLRenderPipelineDescriptor *d,
+                                                id<MTLFunction> vfn,
+                                                id<MTLFunction> ffn)
+{
+    id<MTLRenderPipelineState> p;
+    NSError *e = nil;
+
+    d.vertexFunction = vfn;
+    d.fragmentFunction = ffn;
     p = [m->dev newRenderPipelineStateWithDescriptor:d error:&e];
-    nat_built(m, t0);
-    m->pso_builds++;
     [d release];
     if (!p) {
         fprintf(stderr, "ati-hd5770: native pipeline not built: %s\n",
                 e.localizedDescription.UTF8String);
     }
-    g_hash_table_insert(m->psos, g_string_free(key, false), p);
     return p;
+}
+
+static id<MTLRenderPipelineState> nat_pso(HD5770Mtlr *m, NatProg *pr,
+                                          id<MTLFunction> vfn,
+                                          const char *pkey, const NatTg *tg,
+                                          unsigned nt, unsigned zf,
+                                          unsigned sf)
+{
+    id<MTLRenderPipelineState> p;
+    char *key = nat_pso_key(pkey, tg, nt, zf, sf);
+    gpointer v;
+    int64_t t0;
+
+    if (g_hash_table_lookup_extended(m->psos, key, NULL, &v)) {
+        g_free(key);
+        return v;
+    }
+    t0 = get_clock();
+    p = nat_pso_build(m, nat_pso_desc(tg, nt, zf, sf), vfn ? vfn : pr->vfn,
+                      pr->ffn);
+    nat_built(m, t0);
+    m->pso_builds++;
+    g_hash_table_insert(m->psos, key, p);
+    return p;
+}
+
+/*
+ * BUILD AHEAD: a library (kind 0 a program's, 1 a vertex stage's) or a
+ * pipeline (kind 2; fkey, vkey: its libraries) to build
+ */
+typedef struct NatJob {
+    int kind;
+    char *key, *src, *fkey, *vkey;
+    bool keep;
+    uint64_t hash;
+    MTLRenderPipelineDescriptor *desc;
+    id<MTLFunction> vfn, ffn;
+    void *out;
+} NatJob;
+
+#define NAT_BUILDERS    4
+
+static void nat_job_free(gpointer p)
+{
+    NatJob *j = p;
+
+    [j->desc release];
+    g_free(j->key);
+    g_free(j->src);
+    g_free(j->fkey);
+    g_free(j->vkey);
+    g_free(j);
+}
+
+static void *nat_job_thread(void *opaque)
+{
+    HD5770Mtlr *m = opaque;
+
+    for (;;) {
+        int i = qatomic_fetch_inc(&m->job_next);
+        NatJob *j;
+
+        if (i >= m->job_end) {
+            break;
+        }
+        j = g_ptr_array_index(m->job_run, i);
+        @autoreleasepool {
+            if (j->kind == 0) {
+                j->out = nat_prog_build(m, j->src, j->keep, j->hash);
+            } else if (j->kind == 1) {
+                j->out = nat_vprog_build(m, j->src, j->hash);
+            } else if (j->ffn) {
+                MTLRenderPipelineDescriptor *d = j->desc;
+
+                j->desc = nil;
+                j->out = nat_pso_build(m, d, j->vfn, j->ffn);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* the jobs of a, NAT_BUILDERS at a time */
+static void nat_jobs_run(HD5770Mtlr *m, GPtrArray *a)
+{
+    GThread *th[NAT_BUILDERS - 1];
+    unsigned i, n = MIN(a->len, NAT_BUILDERS);
+
+    if (!n) {
+        return;
+    }
+    m->job_run = a;
+    m->job_next = 0;
+    m->job_end = a->len;
+    for (i = 0; i + 1 < n; i++) {
+        th[i] = g_thread_new("hd5770-build", nat_job_thread, m);
+    }
+    nat_job_thread(m);
+    for (i = 0; i + 1 < n; i++) {
+        g_thread_join(th[i]);
+    }
+}
+
+/*
+ * What was noted is built and entered under its keys. Only the thread
+ * that draws notes and builds; lk is not held while the builders run,
+ * so syncs and fences of other threads go on.
+ */
+static void nat_build_ahead(HD5770Mtlr *m)
+{
+    int64_t t0 = get_clock();
+    unsigned i;
+
+    if (!m->jl->len && !m->jp->len) {
+        return;
+    }
+    nat_jobs_run(m, m->jl);
+    g_mutex_lock(&m->lk);
+    m->ahead_lib_ns += get_clock() - t0;
+    for (i = 0; i < m->jl->len; i++) {
+        NatJob *j = g_ptr_array_index(m->jl, i);
+
+        if (j->kind == 0) {
+            g_hash_table_insert(m->progs, g_strdup(j->key), j->out);
+            m->builds++;
+        } else {
+            g_hash_table_insert(m->vprogs, g_strdup(j->key), j->out);
+            m->vs_builds++;
+        }
+    }
+    for (i = 0; i < m->jp->len; i++) {
+        NatJob *j = g_ptr_array_index(m->jp, i);
+        NatProg *pr = g_hash_table_lookup(m->progs, j->fkey);
+        id<MTLFunction> vfn = j->vkey ? g_hash_table_lookup(m->vprogs, j->vkey)
+                                      : nil;
+
+        if (pr && (!j->vkey || vfn)) {
+            j->vfn = vfn ? vfn : pr->vfn;
+            j->ffn = pr->ffn;
+        }
+    }
+    g_mutex_unlock(&m->lk);
+    nat_jobs_run(m, m->jp);
+    g_mutex_lock(&m->lk);
+    for (i = 0; i < m->jp->len; i++) {
+        NatJob *j = g_ptr_array_index(m->jp, i);
+
+        if (j->ffn) {
+            g_hash_table_insert(m->psos, g_strdup(j->key), j->out);
+            m->pso_builds++;
+            m->ahead_psos++;
+        }
+    }
+    m->ahead++;
+    m->ahead_libs += m->jl->len;
+    m->ahead_ns += get_clock() - t0;
+    m->build_ns += get_clock() - t0;
+    g_ptr_array_set_size(m->jl, 0);
+    g_ptr_array_set_size(m->jp, 0);
+    g_hash_table_remove_all(m->jk);
+    g_mutex_unlock(&m->lk);
+}
+
+static void nat_note_pso(HD5770Mtlr *m, const char *pkey, const char *fkey,
+                         const char *vkey, const NatTg *tg, unsigned nt,
+                         unsigned zf, unsigned sf)
+{
+    char *key = nat_pso_key(pkey, tg, nt, zf, sf);
+    NatJob *j;
+
+    if (g_hash_table_contains(m->psos, key) ||
+        g_hash_table_contains(m->jk, key)) {
+        g_free(key);
+        return;
+    }
+    j = g_new0(NatJob, 1);
+    j->kind = 2;
+    j->key = key;
+    j->fkey = g_strdup(fkey);
+    j->vkey = g_strdup(vkey);
+    j->desc = nat_pso_desc(tg, nt, zf, sf);
+    g_ptr_array_add(m->jp, j);
+    g_hash_table_add(m->jk, g_strdup(key));
+}
+
+/*
+ * A draw looked at ahead: its program fkey of key k, the vertex stage's
+ * and the pipeline over them (pkey: fkey so far) are noted unless built
+ * or noted. The pipeline's depth and stencil formats are the pass's if
+ * the draw would go on in the pass before it; both forms are noted then.
+ */
+static void nat_note(HD5770Mtlr *m, const HD5770GpuDraw *d,
+                     const HD5770NatKey *k, GString *pkey, const NatTg *tg,
+                     unsigned nt, bool hz, bool hs)
+{
+    const HD5770IR *ir = d->ir;
+    const HD5770GpuVs *v = d->vs;
+    char *fkey = g_strdup(pkey->str), *vkey = NULL, *src;
+    unsigned zf = !hz ? NF_N : d->zfmt == 1 ? NF_D16 :
+                  d->zfmt == 2 ? NF_D24 : NF_D32;
+    unsigned sf = hs ? NF_S8 : NF_N, i;
+    uint64_t rt = nt ? tg[0].surf->s.base + 1 +
+                       ((uint64_t)tg[0].surf->space << 63) : 0;
+    uint64_t z = hz ? d->zs.s.base + 1 : 0, s = hs ? d->ss.s.base + 1 : 0;
+    NatJob *j;
+    bool reuse;
+
+    m->ahead_draws++;
+    if (!g_hash_table_contains(m->progs, fkey) &&
+        !g_hash_table_contains(m->jk, fkey)) {
+        char *fs = hd5770_msl_native_fs(ir, k);
+
+        if (!fs) {
+            g_free(fkey);
+            return;
+        }
+        j = g_new0(NatJob, 1);
+        j->key = g_strdup(fkey);
+        j->src = fs;
+        j->keep = k->keep;
+        j->hash = ir->hash;
+        g_ptr_array_add(m->jl, j);
+        g_hash_table_add(m->jk, g_strdup(fkey));
+    }
+    if (v) {
+        uint32_t fl = hd5770_msl_native_flat(ir, k);
+        GString *vk = g_string_new(NULL);
+
+        g_string_printf(vk, "%016" PRIx64 "/%u/%u/%08x", v->ir->hash,
+                        v->ir->ninsts, k->ninputs, fl);
+        for (i = 0; i < k->ninputs; i++) {
+            g_string_append_printf(vk, ".%d", v->src[i]);
+        }
+        g_string_append_printf(pkey, "|%s", vk->str);
+        vkey = g_string_free(vk, false);
+        if (!g_hash_table_contains(m->vprogs, vkey) &&
+            !g_hash_table_contains(m->jk, vkey)) {
+            src = hd5770_msl_native_vs(v->ir, k->ninputs, fl, v->src);
+            if (!src) {
+                g_free(fkey);
+                g_free(vkey);
+                return;
+            }
+            j = g_new0(NatJob, 1);
+            j->kind = 1;
+            j->key = g_strdup(vkey);
+            j->src = src;
+            j->hash = v->ir->hash;
+            g_ptr_array_add(m->jl, j);
+            g_hash_table_add(m->jk, g_strdup(vkey));
+        }
+    }
+    if (!m->dp_set) {
+        m->dp_set = true;
+        m->dp.on = m->pass_on;
+        m->dp.rt = m->cur ? m->cur->s.base + 1 +
+                            ((uint64_t)m->cur->space << 63) : 0;
+        m->dp.z = m->cur_z ? m->cur_z->s.base + 1 : 0;
+        m->dp.s = m->cur_s ? m->cur_s->s.base + 1 : 0;
+        m->dp.zf = m->cur_z ? m->cur_z->hf : NF_N;
+        m->dp.sf = m->cur_s ? m->cur_s->hf : NF_N;
+        m->dp.nt = m->ncurm + 1;
+    }
+    reuse = m->dp.on && m->dp.rt == rt && (!z || m->dp.z == z) &&
+            (!s || m->dp.s == s) && m->dp.nt == MAX(nt, 1);
+    if (reuse && (m->dp.zf != zf || m->dp.sf != sf)) {
+        nat_note_pso(m, pkey->str, fkey, vkey, tg, nt, m->dp.zf, m->dp.sf);
+    } else if (!reuse) {
+        m->dp.on = true;
+        m->dp.rt = rt;
+        m->dp.z = z;
+        m->dp.s = s;
+        m->dp.zf = zf;
+        m->dp.sf = sf;
+        m->dp.nt = MAX(nt, 1);
+    }
+    nat_note_pso(m, pkey->str, fkey, vkey, tg, nt, zf, sf);
+    g_free(fkey);
+    g_free(vkey);
 }
 
 static void nat_pso_free(gpointer p)
@@ -2377,6 +2699,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     id<MTLFunction> vfn = nil;
     NatVs *nv = NULL;
     size_t o_n = 0, o_i = 0, vneed = 0;
+    bool hz = d->db && d->zfmt;
 
     m->seq++;
     if (d->resolve) {
@@ -2586,6 +2909,14 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
             }
         }
     }
+    if (m->dry) {
+        /* no surface is looked up */
+        zclear = hz && (d->rctl & 1);
+        k.zexp = hz && !zclear && d->zexport && ir->zexport;
+        k.zout = hz && !zclear && (k.zexp ||
+                                   !(d->zmin <= 0.0f && d->zmax >= 1.0f));
+        goto keys;
+    }
     vw = vh = hh = UINT32_MAX;
     for (i = 0; i < nt; i++) {
         tg[i].e = tg[i].surf->space && !m->pub.done_ram ? NULL :
@@ -2689,6 +3020,7 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     k.zexp = zs && !zclear && d->zexport && ir->zexport;
     k.zout = zs && !zclear && (k.zexp ||
                                !(d->zmin <= 0.0f && d->zmax >= 1.0f));
+keys:
     k.ninputs = d->ninputs;
     k.pos_gpr = d->pos_gpr >= 0 && d->pos_gpr < 127 ? d->pos_gpr : -1;
     k.flat = d->flat;
@@ -2716,6 +3048,11 @@ static bool nat_draw_locked(HD5770Mtlr *m, const HD5770GpuDraw *d)
     }
     for (i = 0; i < d->ntex && ufn; i++) {
         g_string_append_printf(pkey, "/%u.%u", k.dim[i], k.nsl[i]);
+    }
+    if (m->dry) {
+        nat_note(m, d, &k, pkey, tg, nt, hz, d->db && d->has_s);
+        g_string_free(pkey, true);
+        return true;
     }
     pr = nat_prog(m, ir, &k, pkey->str);
     if (!pr) {
@@ -3099,6 +3436,24 @@ static bool nat_draw(void *opaque, const HD5770GpuDraw *d)
     return ok;
 }
 
+static void nat_prep(void *opaque, const HD5770GpuDraw *d)
+{
+    HD5770Mtlr *m = opaque;
+
+    @autoreleasepool {
+        if (d) {
+            g_mutex_lock(&m->lk);
+            m->dry = true;
+            nat_draw_locked(m, d);
+            m->dry = false;
+            g_mutex_unlock(&m->lk);
+        } else {
+            m->dp_set = false;
+            nat_build_ahead(m);
+        }
+    }
+}
+
 /*
  * HD5770_NAT_AUDIT: every band held against memory, in full, after a
  * sync's write-back. A VRAM page that differs from the shadow although
@@ -3396,6 +3751,13 @@ static void nat_stats(void *opaque, GString *out)
                            m->build_ns / 1000000,
                            s->len ? g_array_index(s, float, s->len / 2) : 0.0f,
                            s->len ? g_array_index(s, float, s->len - 1) : 0.0f);
+    g_string_append_printf(out, "native: built ahead: %" PRIu64 " times, %"
+                           PRIu64 " draws looked at, %" PRIu64
+                           " libraries %" PRIu64 " pipelines in %" PRId64
+                           " ms (libraries %" PRId64 ")\n", m->ahead,
+                           m->ahead_draws, m->ahead_libs, m->ahead_psos,
+                           m->ahead_ns / 1000000,
+                           m->ahead_lib_ns / 1000000);
     g_string_append_printf(out, "native: vertex stage on the host: draws %"
                            PRIu64 " triangles %" PRIu64 " programs %" PRIu64
                            " (ms %" PRIu64 "); mixed vertex stage on a depth"
@@ -3475,6 +3837,7 @@ static const HD5770GpuOps nat_ops = {
     .wrote = nat_wrote,
     .fence = nat_fence,
     .sync_range = nat_sync_range,
+    .prep = nat_prep,
     .depth = true,
     .mipmaps = true,
     .resinfo = true,
@@ -3573,6 +3936,9 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
     m->pgen = g_new0(uint64_t, (vram_size >> 12) + 1);
     m->stamp[0] = m->stamp[1] = 1;
     m->build_ms = g_array_new(false, false, sizeof(float));
+    m->jl = g_ptr_array_new_with_free_func(nat_job_free);
+    m->jp = g_ptr_array_new_with_free_func(nat_job_free);
+    m->jk = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     m->audit = getenv("HD5770_NAT_AUDIT") != NULL;
     if (!getenv("HD5770_NAT_VSA") &&
         !((uintptr_t)vram % qemu_real_host_page_size()) &&
