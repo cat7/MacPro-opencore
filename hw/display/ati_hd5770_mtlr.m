@@ -392,13 +392,14 @@ static bool nat_decline(HD5770Mtlr *m, unsigned r, unsigned why)
     return false;
 }
 
-#define NAT_CBS_OUT     40
+#define NAT_CBS_MAX     256             /* the queue's command buffers */
+#define NAT_CBS_OUT     200
 
 /*
  * Committed and counted until complete. Metal's completed handlers run
- * one after another and a queue gives out 64 command buffers at a time:
- * a handler waiting for lk while its holder waits for a command buffer
- * would not end. nat_hold() keeps the count low before lk is taken.
+ * one after another and a queue gives out NAT_CBS_MAX command buffers at
+ * a time: a handler waiting for lk while its holder waits for a command
+ * buffer would not end. nat_hold() keeps the count low before lk is taken.
  */
 static void nat_commit(HD5770Mtlr *m, id<MTLCommandBuffer> cb)
 {
@@ -3972,7 +3973,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->vram = vram;
         m->vram_size = vram_size;
         m->cache_max = NAT_CACHE_BASE + 2 * vram_size;
-        m->q = [dev newCommandQueue];
+        m->q = [dev newCommandQueueWithMaxCommandBufferCount:NAT_CBS_MAX];
         m->ring = [dev newBufferWithLength:NAT_RING
                                    options:MTLResourceStorageModeShared];
         m->rings[0] = m->ring;
