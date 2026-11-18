@@ -3165,6 +3165,7 @@ static const char *const why_names[HD5770_WHY_N] = {
     [HD5770_WHY_BK_OTHER] = "backend: other",
     [HD5770_WHY_BK_BUILD_SLOW] = "backend: build time",
     [HD5770_WHY_BK_NATIVE_STATE] = "backend: state",
+    [HD5770_WHY_MIXED_DEPTH] = "mixed depth",
 };
 
 const char *hd5770_why_name(unsigned why)
@@ -3870,6 +3871,82 @@ static void vs_check(Draw *d, const uint32_t *rec, unsigned np,
 }
 
 /*
+ * One rasteriser per depth plane: the host GPU's interpolated depth and
+ * the CPU's differ in the last place, so a LEQUAL or EQUAL pass of one
+ * over depth the other wrote loses pixels. Kept for backends with full.
+ */
+static bool zown_on(const HD5770Gfx *g, const Draw *d)
+{
+    return g->gpu && g->gpu_mode == HD5770_GPU_ON && g->gpu->ops->full &&
+           d->db && d->zfmt;
+}
+
+/* the entry of the draw's depth plane; made if it has none */
+static int zown_find(HD5770Gfx *g, const Draw *d, bool make)
+{
+    unsigned i;
+
+    for (i = 0; i < HD5770_ZOWN; i++) {
+        if (g->zown[i].used && g->zown[i].base == d->zs.base) {
+            return i;
+        }
+    }
+    if (!make) {
+        return -1;
+    }
+    i = g->zown_next++ % HD5770_ZOWN;
+    memset(&g->zown[i], 0, sizeof(g->zown[i]));
+    g->zown[i].used = true;
+    g->zown[i].base = d->zs.base;
+    g->zown[i].ext[0] = g->zown[i].ext[1] = INT_MAX;
+    g->zown[i].ext[2] = g->zown[i].ext[3] = INT_MIN;
+    return i;
+}
+
+/* the plane holds depth the host GPU wrote since its last clear */
+static bool zown_gpu(HD5770Gfx *g, const Draw *d)
+{
+    int i = zown_on(g, d) ? zown_find(g, d, false) : -1;
+
+    return i >= 0 && g->zown[i].gpu;
+}
+
+/* the draw has drawn, on the host GPU or the CPU */
+static void zown_drawn(HD5770Gfx *g, const Draw *d, bool gpu)
+{
+    int i;
+
+    if (!zown_on(g, d)) {
+        return;
+    }
+    i = zown_find(g, d, true);
+    if (d->rctl & RC_DEPTH_CLEAR) {
+        /* a constant: the same from both; over all drawn since the last */
+        if (d->x0 <= g->zown[i].ext[0] && d->y0 <= g->zown[i].ext[1] &&
+            d->x1 >= g->zown[i].ext[2] && d->y1 >= g->zown[i].ext[3]) {
+            g->zown[i].gpu = g->zown[i].cpu = false;
+            g->zown[i].ext[0] = g->zown[i].ext[1] = INT_MAX;
+            g->zown[i].ext[2] = g->zown[i].ext[3] = INT_MIN;
+        }
+        return;
+    }
+    if (gpu && g->zown[i].cpu) {
+        g->gst.mixed_gpu++;
+    }
+    if ((d->dctl & DC_Z) && (d->dctl & DC_Z_WRITE)) {
+        if (gpu) {
+            g->zown[i].gpu = true;
+        } else {
+            g->zown[i].cpu = true;
+        }
+        g->zown[i].ext[0] = MIN(g->zown[i].ext[0], d->x0);
+        g->zown[i].ext[1] = MIN(g->zown[i].ext[1], d->y0);
+        g->zown[i].ext[2] = MAX(g->zown[i].ext[2], d->x1);
+        g->zown[i].ext[3] = MAX(g->zown[i].ext[3], d->y1);
+    }
+}
+
+/*
  * The draw on the host GPU, if the backend takes it. With gpu=verify the
  * CPU path draws it again over the same pixels, the two are compared,
  * and VRAM keeps the CPU's result.
@@ -4095,15 +4172,19 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     /*
      * A small draw stays on the CPU; not while a backend that draws into a
      * copy of memory has draws queued: the CPU would wait for them and
-     * the copy be read back first
+     * the copy be read back first; nor a draw on a depth plane the host
+     * GPU has written
      */
     if (g->gpu_mode == HD5770_GPU_ON &&
         !(g->gpu->ops->wrote && (g->npend || g->ram_pend)) &&
         (d->db ? area * ps_cost(d, ir) < HD5770_DB_MIN_PIXELS
                : area * ps_cost(d, ir) < g->gpu->ops->min_pixels &&
                  !gpu_queued(g, d, y0, y1))) {
-        GPU_FB(d, GFB_SMALL, HD5770_WHY_SMALL);
-        goto out;
+        if (!zown_gpu(g, d)) {
+            GPU_FB(d, GFB_SMALL, HD5770_WHY_SMALL);
+            goto out;
+        }
+        g->gst.mixed_kept++;
     }
     /* the VRAM rows the draw writes: targets, depth, stencil */
     ws[0] = q->rt.space || !d->color ? NULL : &q->rt;
@@ -4166,6 +4247,9 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     }
     ok = true;
     d->cwhy = HD5770_WHY_GPU;
+    if (q->ntri) {
+        zown_drawn(g, d, true);
+    }
     g->gst.taken++;
     g->gst.taken_db += q->db;
     for (i = 0; i < nr; i++) {
@@ -4528,6 +4612,11 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
     gpu_lock(g, true);
     taken = gpu_draw(d, vp, nv, prim, t);
     gpu_lock(g, false);
+    if (!taken && d->cwhy < HD5770_WHY_N && zown_gpu(g, d)) {
+        /* the CPU draws over depth the host GPU wrote */
+        g->gst.mixed_why[d->cwhy]++;
+        d->cwhy = HD5770_WHY_MIXED_DEPTH;
+    }
     if (d->cwhy < HD5770_WHY_N &&
         (d->why >= HD5770_WHY_N ||
          (d->why <= HD5770_WHY_BUILDING && d->cwhy > HD5770_WHY_BUILDING))) {
@@ -4588,6 +4677,9 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
         }
         if (d->resolve && d->ok) {
             cpu_wrote(g, d->rs.base, hd5770_surf_size(&d->rs));
+        }
+        if (d->wy1 >= d->wy0) {
+            zown_drawn(g, d, false);
         }
     }
 }
@@ -5124,6 +5216,18 @@ void hd5770_gfx_why_stats(HD5770Gfx *g, GString *out)
                                    t->why_ns[i] / 1000000,
                                    t->why_px[i] / 1000);
         }
+    }
+    for (i = 0; i < HD5770_WHY_N; i++) {
+        if (t->mixed_why[i]) {
+            g_string_append_printf(out, "mixed depth, %s: draws %" PRIu64 "\n",
+                                   hd5770_why_name(i), t->mixed_why[i]);
+        }
+    }
+    if (t->mixed_kept || t->mixed_gpu) {
+        g_string_append_printf(out, "mixed depth: small draws kept on the host"
+                               " GPU %" PRIu64 ", host GPU draws over depth"
+                               " the CPU drew %" PRIu64 "\n", t->mixed_kept,
+                               t->mixed_gpu);
     }
     for (i = 0; i < HD5770_WHY_N; i++) {
         if (t->vs_why[i]) {

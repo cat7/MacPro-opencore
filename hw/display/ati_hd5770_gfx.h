@@ -215,6 +215,7 @@ enum {
 };
 
 #define HD5770_PENDING          16
+#define HD5770_ZOWN             8
 
 /*
  * Where a draw ran: on the host GPU, or the first condition that kept it
@@ -268,6 +269,7 @@ enum {
     HD5770_WHY_BK_OTHER,
     HD5770_WHY_BK_BUILD_SLOW,   /* its program was not built in time */
     HD5770_WHY_BK_NATIVE_STATE, /* state the native pipeline lacks */
+    HD5770_WHY_MIXED_DEPTH,     /* on the CPU over depth the host GPU drew */
     HD5770_WHY_N
 };
 
@@ -297,6 +299,12 @@ typedef struct HD5770GpuStats {
      */
     uint64_t why_draws[HD5770_WHY_N], why_ns[HD5770_WHY_N];
     uint64_t why_px[HD5770_WHY_N];
+    /* the draws under HD5770_WHY_MIXED_DEPTH by what sent them to the CPU */
+    uint64_t mixed_why[HD5770_WHY_N];
+    /* draws taken by the host GPU over depth the CPU drew */
+    uint64_t mixed_gpu;
+    /* draws with depth kept from the small-draw policy */
+    uint64_t mixed_kept;
     /* draws whose vertex shader has no host IR, by reason */
     uint64_t vs_why[HD5770_WHY_N];
 } HD5770GpuStats;
@@ -322,6 +330,16 @@ typedef struct HD5770Gfx {
     /* VRAM ranges queued draws read or write, [lo, hi) */
     uint64_t pend[HD5770_PENDING][2];
     unsigned npend;
+    /*
+     * depth planes and who has written depth into them since their last
+     * clear; ext: the scissors of those draws, x0 y0 x1 y1
+     */
+    struct {
+        uint64_t base;
+        bool used, gpu, cpu;
+        int ext[4];
+    } zown[HD5770_ZOWN];
+    unsigned zown_next;
     HD5770GpuStats gst;
     /* serialises the backend between threads; recursive, may be NULL */
     void (*lock)(struct HD5770Gfx *g, bool on);
