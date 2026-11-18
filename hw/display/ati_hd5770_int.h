@@ -390,6 +390,7 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
 void ati_hd5770_cp_drain(ATIHD5770State *s);
+bool ati_hd5770_cp_running(ATIHD5770State *s);
 /* CRTC 0 scans out VRAM bytes [lo, hi) from now on */
 void ati_hd5770_cp_scan(ATIHD5770State *s, uint64_t lo, uint64_t hi);
 bool ati_hd5770_engine_reg(uint32_t off);

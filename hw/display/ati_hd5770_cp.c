@@ -1441,6 +1441,13 @@ static void cp_kick(ATIHD5770State *s)
     qemu_mutex_unlock(&s->eng_lock);
 }
 
+/* the engine is running packets */
+bool ati_hd5770_cp_running(ATIHD5770State *s)
+{
+    return qatomic_read(&s->eng_busy) && !s->cp_stalled &&
+           !qatomic_read(&s->eng_hold);
+}
+
 /* SCANOUT FLIPS above; a run of the engine follows */
 void ati_hd5770_cp_scan(ATIHD5770State *s, uint64_t lo, uint64_t hi)
 {

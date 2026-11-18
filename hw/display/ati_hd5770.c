@@ -726,7 +726,7 @@ static void ati_hd5770_wlog(ATIHD5770State *s, DirtyBitmapSnapshot *snap)
     }
 }
 
-/* a flip is awaited no longer than this */
+/* a flip the engine is not on its way to is awaited no longer than this */
 #define FLIP_WAIT_MS            500
 
 /*
@@ -754,7 +754,8 @@ static void ati_hd5770_flip(ATIHD5770State *s, ATIHD5770Mode *mode)
     if (!s->flip_since) {
         s->flip_since = now;
     }
-    if (now - s->flip_since < FLIP_WAIT_MS && o->fb_offset != lo &&
+    if ((now - s->flip_since < FLIP_WAIT_MS || ati_hd5770_cp_running(s)) &&
+        o->fb_offset != lo &&
         o->width == mode->width && o->height == mode->height &&
         o->bpp == mode->bpp && o->pitch == mode->pitch &&
         o->depth == mode->depth && o->format == mode->format &&
