@@ -70,7 +70,8 @@
 #define NAT_RING        (48u << 20)
 #define NAT_RINGS       3
 #define NAT_READ        (32u << 20)     /* write-backs of one wait */
-#define NAT_CACHE_MAX   (512ull << 20)  /* textures and shadows */
+/* textures and shadows: this and twice the VRAM */
+#define NAT_CACHE_BASE  (512ull << 20)
 #define NAT_IDLE        256             /* syncs an unused entry stays */
 
 enum {
@@ -308,6 +309,7 @@ typedef struct HD5770Mtlr {
     /* changes when memory may have: bands are compared once per stamp */
     uint64_t stamp[2];          /* VRAM, guest RAM */
     uint64_t bytes, seq;        /* of the entries; the draw's number */
+    uint64_t cache_max, bytes_most, roomed;
     uint64_t pass_done;         /* passes up to this one are complete */
     uint64_t cb_passes;         /* the same, from the completed handlers */
     GMutex lk, rlock;
@@ -1678,32 +1680,73 @@ static uint64_t nat_bytes(const NatSurf *e)
     return (uint64_t)e->s.pitch * e->s.height * e->s.bpe + e->cov;
 }
 
+static void nat_drop(HD5770Mtlr *m, NatSurf *e)
+{
+    NatSurf **h;
+
+    if (e->dirty) {
+        nat_writeback(m, e, NW_EVICT);
+    }
+    if (m->cur == e || m->cur_z == e || m->cur_s == e || m->ncurm) {
+        nat_end_pass(m);
+    }
+    m->bytes -= nat_bytes(e);
+    for (h = &m->hb[nat_hash_of(e)]; *h != e; h = &(*h)->hnext) {
+        /* search */
+    }
+    *h = e->hnext;
+    if (e->act) {
+        g_ptr_array_remove_fast(m->act, e);
+    }
+    g_ptr_array_remove_fast(m->surfs, e);
+}
+
 /* drops the entries last used before sync number before, but this draw's */
 static void nat_evict(HD5770Mtlr *m, uint64_t before)
 {
-    NatSurf **h;
     unsigned i;
 
     for (i = m->surfs->len; i-- > 0; ) {
         NatSurf *e = g_ptr_array_index(m->surfs, i);
 
         if (e->used < before && e->pin != m->seq && !e->nfly) {
-            if (e->dirty) {
-                nat_writeback(m, e, NW_EVICT);
-            }
-            if (m->cur == e || m->cur_z == e || m->cur_s == e || m->ncurm) {
-                nat_end_pass(m);
-            }
-            m->bytes -= nat_bytes(e);
-            for (h = &m->hb[nat_hash_of(e)]; *h != e; h = &(*h)->hnext) {
-                /* search */
-            }
-            *h = e->hnext;
-            if (e->act) {
-                g_ptr_array_remove_fast(m->act, e);
-            }
-            g_ptr_array_remove_index_fast(m->surfs, i);
+            nat_drop(m, e);
         }
+    }
+}
+
+static int nat_cmp_pin(const void *a, const void *b)
+{
+    const NatSurf *x = *(NatSurf *const *)a, *y = *(NatSurf *const *)b;
+
+    return x->pin < y->pin ? -1 : x->pin > y->pin;
+}
+
+/*
+ * room for an entry of n bytes: the entries no draw has used for longest
+ * go, down to three quarters of the limit
+ */
+static void nat_room(HD5770Mtlr *m, uint64_t n)
+{
+    uint64_t goal = m->cache_max - m->cache_max / 4;
+    unsigned i, len, pass;
+    NatSurf **o;
+
+    for (pass = 0; pass < 2 && m->bytes + n > m->cache_max; pass++) {
+        if (pass) {
+            /* the rest is in flight */
+            nat_drain(m);
+        }
+        len = m->surfs->len;
+        o = g_memdup2(m->surfs->pdata, len * sizeof(*o));
+        qsort(o, len, sizeof(*o), nat_cmp_pin);
+        for (i = 0; i < len && m->bytes + n > goal; i++) {
+            if (o[i]->pin != m->seq && !o[i]->nfly) {
+                nat_drop(m, o[i]);
+                m->roomed++;
+            }
+        }
+        g_free(o);
     }
 }
 
@@ -1799,9 +1842,8 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
         return NULL;
     }
     if (m->bytes + (uint64_t)s->s.pitch * s->s.height * s->s.bpe + cov >
-        NAT_CACHE_MAX) {
-        nat_drain(m);
-        nat_evict(m, UINT64_MAX);
+        m->cache_max) {
+        nat_room(m, (uint64_t)s->s.pitch * s->s.height * s->s.bpe + cov);
     }
     e = g_new0(NatSurf, 1);
     e->s = s->s;
@@ -1876,6 +1918,7 @@ static NatSurf *nat_surf(HD5770Mtlr *m, const HD5770GpuSurf *s, unsigned hf)
     e->used = m->epoch;
     e->pin = m->seq;
     m->bytes += nat_bytes(e);
+    m->bytes_most = MAX(m->bytes_most, m->bytes);
     g_ptr_array_add(m->surfs, e);
     i = nat_hash_of(e);
     e->hnext = m->hb[i];
@@ -3581,10 +3624,10 @@ static void nat_epoch(HD5770Mtlr *m, bool idle)
     if (!idle) {
         return;
     }
-    if (m->bytes > NAT_CACHE_MAX || !(m->epoch & 63)) {
+    if (m->bytes > m->cache_max || !(m->epoch & 63)) {
         /* over the limit: all but this sync's; else the long unused */
         @autoreleasepool {
-            nat_evict(m, m->bytes > NAT_CACHE_MAX ? m->epoch :
+            nat_evict(m, m->bytes > m->cache_max ? m->epoch :
                          m->epoch > NAT_IDLE ? m->epoch - NAT_IDLE : 0);
         }
     }
@@ -3738,6 +3781,10 @@ static void nat_stats(void *opaque, GString *out)
                            m->wbacks,
                            m->wback_bytes >> 10, m->checks,
                            m->cmp_bytes >> 10, m->surfs->len);
+    g_string_append_printf(out, "native: entries hold %" PRIu64 " MB, at most %"
+                           PRIu64 " of %" PRIu64 " MB, dropped for room %"
+                           PRIu64 "\n", m->bytes >> 20, m->bytes_most >> 20,
+                           m->cache_max >> 20, m->roomed);
     g_string_append_printf(out, "native: ms: draw %" PRId64 " sync %" PRId64
                            ", of them wait %" PRId64 " check %" PRId64
                            " upload %" PRId64 " write-back %" PRId64 "\n",
@@ -3887,6 +3934,7 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
         m->dev = dev;
         m->vram = vram;
         m->vram_size = vram_size;
+        m->cache_max = NAT_CACHE_BASE + 2 * vram_size;
         m->q = [dev newCommandQueue];
         m->ring = [dev newBufferWithLength:NAT_RING
                                    options:MTLResourceStorageModeShared];
