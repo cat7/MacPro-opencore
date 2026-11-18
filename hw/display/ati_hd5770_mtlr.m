@@ -284,6 +284,7 @@ typedef struct HD5770Mtlr {
     uint64_t stamp[2];          /* VRAM, guest RAM */
     uint64_t bytes, seq;        /* of the entries; the draw's number */
     uint64_t pass_done;         /* passes up to this one are complete */
+    uint64_t cb_passes;         /* the same, from the completed handlers */
     GMutex lk, rlock;
     GQueue fences;              /* NatFence, oldest first, not retired */
     GPtrArray *bufs;            /* read buffers not in use */
@@ -347,8 +348,12 @@ static bool nat_decline(HD5770Mtlr *m, unsigned r, unsigned why)
  */
 static void nat_commit(HD5770Mtlr *m, id<MTLCommandBuffer> cb)
 {
+    uint64_t passes = m->passes;
+
     qatomic_inc(&m->cbs_out);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        /* the handlers run one after another, in the order committed */
+        qatomic_set(&m->cb_passes, passes);
         qatomic_dec(&m->cbs_out);
     }];
     [cb commit];
@@ -807,6 +812,9 @@ static void nat_upload(HD5770Mtlr *m, NatSurf *e, uint32_t y0, uint32_t y1)
     uint32_t w = e->s.pitch, bpe = e->s.bpe, bk = NF_BLK(e->hf);
     int64_t t0;
 
+    if (e->pass > m->pass_done) {
+        m->pass_done = MAX(m->pass_done, qatomic_read(&m->cb_passes));
+    }
     if (e->pass > m->pass_done) {
         /* a pass not yet complete uses the texture */
         nat_wait(m);
