@@ -59,7 +59,8 @@
 #define GL_SEG_DRAWS    64      /* draws per segment */
 #define GL_MAX_TILES    (4 * 1024 * 1024)
 #define GL_GROUPS       65535   /* work groups per dispatch call */
-/* a draw waits for its program's build up to its estimated CPU cost, capped */
+/* a draw waits this long for a program whose binary is on disk */
+#define GL_LOAD_WAIT_NS (500 * 1000 * 1000ll)
 #define GL_POOL         (128u << 20)    /* slots for guest RAM pages */
 
 /* ---- GL, spelled out: opengl32.dll exports 1.1 only ---- */
@@ -330,6 +331,7 @@ typedef struct GlProg {
     char *src;                  /* until the GL thread has the program */
     uint8_t *bin;               /* a compile worker's binary, until loaded */
     uint32_t bin_len, bin_fmt;
+    bool on_disk;               /* its binary was there when it was queued */
 } GlProg;
 
 enum { GLP_QUEUED, GLP_READY, GLP_FAILED };
@@ -460,6 +462,7 @@ typedef struct HD5770Gl {
     uint64_t failed;
     uint64_t compile_ns, wait_ns, encode_ns, gpu_ns, rb_ns;
     uint64_t pb_hits, pb_rejected, pb_stored;
+    uint64_t load_waits, load_wait_ns;
     uint64_t ram_draws, pool_resets, slots_max;
 } HD5770Gl;
 
@@ -1480,6 +1483,13 @@ static GlProg *gl_prog(HD5770Gl *g, const HD5770IR *ir, uint32_t mipmask)
         return p;
     }
     if (g->cthread_on) {
+        if (g->cdir) {
+            uint8_t key[32];
+            char *path = pb_path(g, p, key);
+
+            p->on_disk = g_file_test(path, G_FILE_TEST_EXISTS);
+            g_free(path);
+        }
         qemu_mutex_lock(&g->lock);
         g_queue_push_tail(g->cq, p);
         qemu_cond_signal(&g->ccond);
@@ -2024,6 +2034,18 @@ static bool gl_draw(void *opaque, const HD5770GpuDraw *d)
         mipmask |= (uint32_t)d->tex[i].mip << i;
     }
     p = gl_prog(g, d->ir, mipmask);
+    if (p->on_disk && qatomic_load_acquire(&p->state) == GLP_QUEUED) {
+        /* loaded in milliseconds: the draw waits rather than be left out */
+        t0 = get_clock();
+        while (qatomic_load_acquire(&p->state) == GLP_QUEUED &&
+               get_clock() - t0 < GL_LOAD_WAIT_NS) {
+            g_usleep(100);
+        }
+        g->load_waits++;
+        g->load_wait_ns += get_clock() - t0;
+        /* still not there: it is being compiled after all */
+        p->on_disk = false;
+    }
     switch (qatomic_load_acquire(&p->state)) {
     case GLP_QUEUED:
         g->declined[GLD_COMPILING]++;
@@ -2628,13 +2650,15 @@ static void gl_stats(void *opaque, GString *out)
         PRIu64 " wait ms %" PRIu64 " (gpu %" PRIu64 " read back %" PRIu64
         ") encode ms %" PRIu64 " programs %u compiled %" PRIu64
         " (failed %" PRIu64 ") in ms %" PRIu64 " binaries: loaded %" PRIu64
-        " rejected %" PRIu64 " stored %" PRIu64 "\n",
+        " rejected %" PRIu64 " stored %" PRIu64 ", draws that waited for one %"
+        PRIu64 " ms %" PRIu64 "\n",
         g->syncs, g->segs, g->dispatches,
         g->barriers, g->st_bytes >> 20, g->chk_bytes >> 20, g->up_bytes >> 20,
         g->rb_bytes >> 20, g->wb_bytes >> 10, g->wait_ns / 1000000,
         g->gpu_ns / 1000000, g->rb_ns / 1000000, g->encode_ns / 1000000,
         g_hash_table_size(g->progs), g->compiles, g->failed,
-        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored);
+        g->compile_ns / 1000000, g->pb_hits, g->pb_rejected, g->pb_stored,
+        g->load_waits, g->load_wait_ns / 1000000);
 }
 
 static void gl_prog_free(gpointer p)
