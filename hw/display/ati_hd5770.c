@@ -726,6 +726,46 @@ static void ati_hd5770_wlog(ATIHD5770State *s, DirtyBitmapSnapshot *snap)
     }
 }
 
+/* a flip is awaited no longer than this */
+#define FLIP_WAIT_MS            500
+
+/*
+ * mode is what CRTC 0 scans out by its registers. A surface it has
+ * turned to is shown once its bytes are in memory (SCANOUT FLIPS in
+ * ati_hd5770_cp.c); until then mode becomes the one shown last.
+ */
+static void ati_hd5770_flip(ATIHD5770State *s, ATIHD5770Mode *mode)
+{
+    HD5770Gpu *gpu = s->gfx3d.gpu;
+    uint64_t lo = mode->fb_offset, hi = lo + mode->fb_len;
+    const ATIHD5770Mode *o = &s->mode;
+    int64_t now;
+
+    if (qatomic_read(&gpu->scan_lo) != lo ||
+        qatomic_read(&gpu->scan_hi) != hi) {
+        /* moved by a register other than the surface address */
+        ati_hd5770_cp_scan(s, lo, hi);
+    }
+    if (qatomic_read(&s->flip_done) == qatomic_read(&s->flip_req)) {
+        s->flip_since = 0;
+        return;
+    }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (!s->flip_since) {
+        s->flip_since = now;
+    }
+    if (now - s->flip_since < FLIP_WAIT_MS && o->fb_offset != lo &&
+        o->width == mode->width && o->height == mode->height &&
+        o->bpp == mode->bpp && o->pitch == mode->pitch &&
+        o->depth == mode->depth && o->format == mode->format &&
+        o->fb_len == mode->fb_len && o->tiled == mode->tiled) {
+        *mode = *o;
+        s->flip_held++;
+    } else {
+        s->flip_late++;
+    }
+}
+
 /*
  * The refresh up to the conversion: dirty snapshot, mode, palette and
  * surface. False when CRTC 0 shows nothing (the last frame stays).
@@ -748,6 +788,10 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
     if (!ati_hd5770_dce4_scanout(s, mode)) {
         g_free(snap);
         return false;
+    }
+    s->refreshes++;
+    if (s->gfx3d.gpu) {
+        ati_hd5770_flip(s, mode);
     }
     memcpy(s->palette, ati_hd5770_dce4_lut(s), sizeof(s->palette));
     if (s->regs[EG_GRPH_LUT_10BIT_BYPASS_CONTROL >> 2] &
@@ -778,23 +822,6 @@ static bool ati_hd5770_refresh_prepare(ATIHD5770State *s,
     }
     g_free(snap);
     s->mode = *mode;
-    if (s->gfx3d.gpu) {
-        HD5770Gpu *gpu = s->gfx3d.gpu;
-        bool moved = qatomic_read(&gpu->scan_lo) != mode->fb_offset ||
-                     qatomic_read(&gpu->scan_hi) != mode->fb_offset +
-                                                    mode->fb_len;
-
-        qatomic_set(&gpu->scan_lo, mode->fb_offset);
-        qatomic_set(&gpu->scan_hi, mode->fb_offset + mode->fb_len);
-        if (moved) {
-            /*
-             * by a register other than the surface address: a run of
-             * the engine ends with the fence that writes the surface
-             */
-            s->cp.scan_flush++;
-            ati_hd5770_cp_flush(s);
-        }
-    }
     return true;
 }
 

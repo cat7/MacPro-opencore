@@ -665,8 +665,8 @@ bool ati_hd5770_dce4_read(ATIHD5770State *s, uint32_t off, uint32_t *val)
 
 /*
  * CRTC 0 scans out another surface: the host GPU backend learns the
- * bytes at once, and a run of the engine ends with a fence, which
- * brings them up to date if the backend kept them as a target
+ * bytes at once, and the engine issues the fence that brings them up to
+ * date if the backend kept them as a target
  */
 static void scan_moved(ATIHD5770State *s)
 {
@@ -678,10 +678,7 @@ static void scan_moved(ATIHD5770State *s)
          qatomic_read(&gpu->scan_hi) == m.fb_offset + m.fb_len)) {
         return;
     }
-    qatomic_set(&gpu->scan_lo, m.fb_offset);
-    qatomic_set(&gpu->scan_hi, m.fb_offset + m.fb_len);
-    s->cp.scan_flush++;
-    ati_hd5770_cp_flush(s);
+    ati_hd5770_cp_scan(s, m.fb_offset, m.fb_offset + m.fb_len);
 }
 
 bool ati_hd5770_dce4_write(ATIHD5770State *s, uint32_t off, uint32_t val)

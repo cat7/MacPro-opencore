@@ -95,7 +95,7 @@ typedef struct HD5770CPStats {
     uint64_t kicks, dwords, type0, type2, type3, op[256], gap_op[256];
     uint64_t ibs, ib_overrun, eop, eop_irq, eop_masked, rb_irq;
     uint64_t scratch_wb, rptr_wb, stalls, wait_ok, sem_signal, sem_wait;
-    uint64_t ahead, ahead_draws, scan_flush;
+    uint64_t ahead, ahead_draws, scan_flush, flips;
     uint64_t draws, resets, ucode_pfp, ucode_me, ucode_rlc, skipped;
     uint64_t type0_regs, set_regs, load_regs, shadow_writes;
     uint64_t bad_header;
@@ -289,6 +289,10 @@ struct ATIHD5770State {
     uint64_t fx_retired;
     QEMUBH *fx_bh;
     uint64_t fx_records, fx_now, fx_settles, fx_bh_runs;
+    /* SCANOUT FLIPS in ati_hd5770_cp.c; flip_seen is the engine's */
+    uint32_t flip_req, flip_done, flip_at, flip_seen;
+    int64_t flip_since;         /* the refresh's: ms, 0 = none awaited */
+    uint64_t refreshes, flip_held, flip_late;
     QemuThread eng_thread;
     QemuMutex eng_lock;
     QemuCond eng_cond, eng_idle_cond;
@@ -386,7 +390,8 @@ bool ati_hd5770_cp_read(ATIHD5770State *s, uint32_t off, uint32_t *val);
 bool ati_hd5770_cp_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 bool ati_hd5770_cp_known(uint32_t off);
 void ati_hd5770_cp_drain(ATIHD5770State *s);
-void ati_hd5770_cp_flush(ATIHD5770State *s);
+/* CRTC 0 scans out VRAM bytes [lo, hi) from now on */
+void ati_hd5770_cp_scan(ATIHD5770State *s, uint64_t lo, uint64_t hi);
 bool ati_hd5770_engine_reg(uint32_t off);
 void ati_hd5770_reg_lock(ATIHD5770State *s);
 void ati_hd5770_reg_unlock(ATIHD5770State *s);

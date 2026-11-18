@@ -335,13 +335,13 @@ static void scratch_writeback(ATIHD5770State *s, unsigned n, uint32_t val)
  * LOCK ORDER: eng_lock -> fx_lock; the backend's thread takes the BQL
  * only by trylock.
  */
-enum { FX_WR32, FX_WR64, FX_CLOCK, FX_SEM, FX_SCRATCH, FX_IRQ };
+enum { FX_WR32, FX_WR64, FX_CLOCK, FX_SEM, FX_SCRATCH, FX_IRQ, FX_FLIP };
 
 #define FX_MAX                  8
 
 typedef struct HD5770Effect {
     uint8_t kind;
-    uint32_t a;                 /* FX_SEM set to 1; FX_SCRATCH, FX_IRQ */
+    uint32_t a;                 /* FX_SEM set to 1; FX_SCRATCH, FX_IRQ, FX_FLIP */
     uint64_t addr, val;
 } HD5770Effect;
 
@@ -397,6 +397,9 @@ static void fx_apply(ATIHD5770State *s, const HD5770Effect *e)
                 cp_bql_leave(s, bql);
             }
         }
+        break;
+    case FX_FLIP:
+        qatomic_set(&s->flip_done, e->a);
         break;
     }
 }
@@ -615,6 +618,50 @@ static void fx_run_end(ATIHD5770State *s)
         ati_hd5770_gpu_sync(s);
     } else if (hd5770_gfx_busy(&s->gfx3d)) {
         fx_issue(s, g_new0(struct HD5770Fence, 1));
+    }
+}
+
+/*
+ * SCANOUT FLIPS. The surface CRTC 0 turns to may be one the backend
+ * keeps newer than memory. The display goes on showing the surface
+ * before it (ati_hd5770.c) until flip_done equals flip_req: the engine
+ * has run every packet written to the ring before the flip, and the
+ * fence issued at that point, which writes what lies over the scan
+ * range, has retired.
+ *
+ * flip_req is odd while the scan range and flip_at (the ring's write
+ * pointer at the flip) are being set.
+ */
+
+/*
+ * Between two packets of the ring, read pointer rptr: the flip asked
+ * for is recorded when the engine stands where the ring ended at the
+ * flip (any: wherever it stands)
+ */
+static void cp_flip(ATIHD5770State *s, uint32_t rptr, uint32_t mask, bool any)
+{
+    uint32_t r = qatomic_read(&s->flip_req), at;
+    HD5770Effect e = { .kind = FX_FLIP, .a = r };
+
+    if (r == s->flip_seen || (r & 1)) {
+        return;
+    }
+    at = qatomic_read(&s->flip_at);
+    if (qatomic_read(&s->flip_req) != r || (!any && (at & mask) != rptr)) {
+        return;
+    }
+    s->flip_seen = r;
+    s->cp.flips++;
+    if (!s->fx_on) {
+        ati_hd5770_gpu_sync(s);
+        fx_apply(s, &e);
+    } else if (hd5770_gfx_busy(&s->gfx3d) || qatomic_read(&s->fx_out)) {
+        struct HD5770Fence *f = g_new0(struct HD5770Fence, 1);
+
+        f->e[f->n++] = e;
+        fx_issue(s, f);
+    } else {
+        fx_apply(s, &e);
     }
 }
 
@@ -1270,9 +1317,12 @@ static void cp_run(ATIHD5770State *s)
     uint32_t size, mask, wptr, rptr0 = s->cp_rptr;
     uint64_t base;
 
-    if (s->cp_running ||
-        (s->regs[EG_CP_ME_CNTL >> 2] & EG_CP_ME_HALT) ||
+    if (s->cp_running) {
+        return;
+    }
+    if ((s->regs[EG_CP_ME_CNTL >> 2] & EG_CP_ME_HALT) ||
         !s->regs[EG_CP_RB_BASE >> 2]) {
+        cp_flip(s, 0, 0, true);
         return;
     }
     s->cp_running = true;
@@ -1303,6 +1353,7 @@ static void cp_run(ATIHD5770State *s)
             }
             continue;
         }
+        cp_flip(s, s->cp_rptr, mask, false);
         avail = (wptr - s->cp_rptr) & mask;
         if (!avail) {
             break;
@@ -1337,6 +1388,11 @@ static void cp_run(ATIHD5770State *s)
         } else if (r == PKT_IB) {
             s->cp_depth = 1;
         }
+    }
+    if (!s->cp_depth && !s->cp_stalled && !qatomic_read(&s->eng_hold)) {
+        /* a flip whose ring position was not met: at the ring's end */
+        cp_flip(s, s->cp_rptr, mask,
+                (s->regs[EG_CP_RB_WPTR >> 2] & mask) == s->cp_rptr);
     }
     /* the engine goes idle with its draws in memory */
     fx_run_end(s);
@@ -1385,11 +1441,21 @@ static void cp_kick(ATIHD5770State *s)
     qemu_mutex_unlock(&s->eng_lock);
 }
 
-/* a run of the engine although nothing was written to the ring */
-void ati_hd5770_cp_flush(ATIHD5770State *s)
+/* SCANOUT FLIPS above; a run of the engine follows */
+void ati_hd5770_cp_scan(ATIHD5770State *s, uint64_t lo, uint64_t hi)
 {
+    HD5770Gpu *gpu = s->gfx3d.gpu;
+
+    qatomic_inc(&s->flip_req);
+    qatomic_set(&gpu->scan_lo, lo);
+    qatomic_set(&gpu->scan_hi, hi);
+    qatomic_set(&s->flip_at, s->regs[EG_CP_RB_WPTR >> 2]);
+    qatomic_inc(&s->flip_req);
+    s->cp.scan_flush++;
     if (s->eng_on) {
         cp_kick(s);
+    } else {
+        qatomic_set(&s->flip_done, qatomic_read(&s->flip_req));
     }
 }
 
@@ -1717,6 +1783,11 @@ void ati_hd5770_cp_stats(ATIHD5770State *s, GString *out)
                            ", built ahead %" PRIu64 " times over %" PRIu64
                            " draws\n", c->scan_flush, c->ahead,
                            c->ahead_draws);
+    g_string_append_printf(out, "display: refreshes %" PRIu64 ", flips %"
+                           PRIu64 " recorded, refreshes that kept the "
+                           "surface before %" PRIu64 ", showed a flip not "
+                           "recorded %" PRIu64 "\n", s->refreshes, c->flips,
+                           s->flip_held, s->flip_late);
     g_string_append_printf(out,
         "CP: kicks %" PRIu64 " dwords %" PRIu64 " type0 %" PRIu64
         " type2 %" PRIu64 " type3 %" PRIu64 " ibs %" PRIu64 "\n"
