@@ -762,17 +762,14 @@ static const char glsl_alu[] =
 "}\n"
 "\n";
 
-/* names of register set q: the pixel's (0), right (1), below (2) */
-static const char *const set_sfx[3] = { "", "_1", "_2" };
-
-static void src_expr(GString *o, const HD5770IRSrc *s, unsigned q)
+static void src_expr(GString *o, const HD5770IRSrc *s)
 {
     switch (s->kind) {
     case HD5770_IRS_GPR:
-        g_string_append_printf(o, "r%s[%u][%u]", set_sfx[q], s->idx, s->chan);
+        g_string_append_printf(o, "r[%u][%u]", s->idx, s->chan);
         break;
     case HD5770_IRS_PV:
-        g_string_append_printf(o, "pv%s[%u]", set_sfx[q], s->chan);
+        g_string_append_printf(o, "pv[%u]", s->chan);
         break;
     case HD5770_IRS_CONST:
         g_string_append_printf(o, "words[kvo + %uu]", s->k);
@@ -794,10 +791,8 @@ static unsigned src_mods(const HD5770IRInst *in)
     return m;
 }
 
-static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
-                       unsigned q)
+static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g)
 {
-    const char *x = set_sfx[q];
     unsigned i, k;
 
     g_string_append(o, "    {\n");
@@ -809,7 +804,7 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
         }
         for (k = 0; k < in->nsrc; k++) {
             g_string_append_printf(o, "        uint s%u_%u = ", i, k);
-            src_expr(o, &in->src[k], q);
+            src_expr(o, &in->src[k]);
             g_string_append(o, ";\n");
         }
         g_string_append_printf(o, "        uint q%u = 0u;\n", i);
@@ -831,9 +826,8 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
                                    m, i, m, i);
         } else if (in->interp) {
             g_string_append_printf(o, "        q%u = U(hd_interp(di, ti, pr, %uu, %uu, "
-                                   "%s, b0%s, b1%s, b2%s, pw%s));\n", i, in->prm,
-                                   in->dst_chan, in->flat ? "true" : "false",
-                                   x, x, x, x);
+                                   "%s, b0, b1, b2, pw));\n", i, in->prm,
+                                   in->dst_chan, in->flat ? "true" : "false");
         } else if (in->max4) {
             continue;
         } else if (in->cube) {
@@ -848,9 +842,7 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
                     g_string_append(o, ", 0u");
                 }
             }
-            /* only the pixel's own set kills */
-            g_string_append(o, q ? ", k); }\n"
-                                 : ", k); if (k) { killed = true; } }\n");
+            g_string_append(o, ", k); if (k) { killed = true; } }\n");
         }
     }
     if (g->dot) {
@@ -914,13 +906,13 @@ static void emit_group(GString *o, const HD5770IR *ir, const HD5770IRGroup *g,
                                    i, in->op, src_mods(in),
                                    in->clamp ? "true" : "false", in->omod, i);
         }
-        g_string_append_printf(o, "        pv%s[%u] = q%u;\n", x, in->slot, i);
+        g_string_append_printf(o, "        pv[%u] = q%u;\n", in->slot, i);
     }
     for (i = 0; i < g->n; i++) {
         const HD5770IRInst *in = &ir->insts[g->first + i];
 
         if (in->wr) {
-            g_string_append_printf(o, "        r%s[%u][%u] = q%u;\n", x, in->dst,
+            g_string_append_printf(o, "        r[%u][%u] = q%u;\n", in->dst,
                                    in->dst_chan, i);
         }
     }
@@ -1130,7 +1122,7 @@ static void vs_body(GString *o, const HD5770IR *ir)
         switch (op->kind) {
         case HD5770_IRO_ALU:
             for (j = 0; j < op->n; j++) {
-                emit_group(o, ir, &ir->groups[op->first + j], 0);
+                emit_group(o, ir, &ir->groups[op->first + j]);
             }
             break;
         case HD5770_IRO_FETCH:
@@ -1831,7 +1823,7 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
         switch (op->kind) {
         case HD5770_IRO_ALU:
             for (j = 0; j < op->n; j++) {
-                emit_group(o, ir, &ir->groups[op->first + j], 0);
+                emit_group(o, ir, &ir->groups[op->first + j]);
             }
             break;
         case HD5770_IRO_FETCH:
