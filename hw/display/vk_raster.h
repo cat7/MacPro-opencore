@@ -20,7 +20,8 @@
  *
  * ORDER. Calls take effect in call order. A draw is queued; vkr_flush()
  * hands the queue to the GPU, vkr_image_read() waits for it. One thread
- * at a time calls in.
+ * at a time calls in, but for vkr_mark_wait() and vkr_mark_free(), which
+ * any thread may call at any time.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -31,6 +32,7 @@
 typedef struct VkRaster VkRaster;
 typedef struct VkrImage VkrImage;
 typedef struct VkrShader VkrShader;
+typedef struct VkrMark VkrMark;
 
 enum {
     VKR_FMT_RGBA8, VKR_FMT_R8, VKR_FMT_RG8, VKR_FMT_RGBA16, VKR_FMT_R16,
@@ -136,6 +138,19 @@ void vkr_image_write(VkRaster *r, VkrImage *i, uint32_t level, uint32_t layer,
                      const void *px);
 void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
                     uint32_t w, uint32_t h, void *px);
+/*
+ * the same without waiting: the pixels are at the address returned once
+ * the mark made next is reached, until that mark is freed
+ */
+const void *vkr_image_read_later(VkRaster *r, VkrImage *i, uint32_t x,
+                                 uint32_t y, uint32_t w, uint32_t h);
+/*
+ * what is queued goes to the GPU; the mark is reached when the GPU has
+ * done it all. vkr_mark_wait() returns then.
+ */
+VkrMark *vkr_mark(VkRaster *r);
+void vkr_mark_wait(VkRaster *r, VkrMark *k);
+void vkr_mark_free(VkRaster *r, VkrMark *k);
 
 /* stage 0 vertex, 1 fragment; NULL and *log (g_free) when it fails */
 VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,

@@ -15,7 +15,6 @@
 
 #define VKR_RING        (256u << 20)
 #define VKR_KEEP        (384u << 20)    /* behind the ring, vkr_keep() */
-#define VKR_CBS         128
 
 #define VKR_BLOCK       (128u << 20)    /* image memory comes in these */
 
@@ -40,6 +39,23 @@ struct VkrImage {
     unsigned fmt;
     uint32_t w, h, levels, layers;
     bool volume;
+};
+
+/* host memory image pixels are read into */
+typedef struct VkrRead {
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    uint8_t *map;
+    size_t size;
+} VkrRead;
+
+/* a command buffer handed to the GPU; done and held under VkRaster.lock */
+struct VkrMark {
+    VkFence fence;
+    VkCommandBuffer cb;
+    GPtrArray *reads;           /* the reads queued in it */
+    bool done;                  /* reached, its command buffer freed */
+    bool held;                  /* the caller has it */
 };
 
 struct VkrShader {
@@ -73,13 +89,15 @@ struct VkRaster {
     VkCommandPool pool;
     VkCommandBuffer cb;
     bool cb_used;
-    VkCommandBuffer done[VKR_CBS];
-    unsigned ndone;
+    GQueue subs;                /* VkrMark: with the GPU, oldest first */
+    GPtrArray *reads;           /* VkrRead: queued in cb */
+    GPtrArray *idle;            /* VkrRead: free, under lock */
+    GMutex lock;
 
-    VkBuffer ring, tables, rb;
-    VkDeviceMemory ring_mem, tables_mem, rb_mem;
-    uint8_t *ring_map, *rb_map;
-    size_t ring_at, keep_at, rb_size, tables_size;
+    VkBuffer ring, tables;
+    VkDeviceMemory ring_mem, tables_mem;
+    uint8_t *ring_map;
+    size_t ring_at, keep_at, tables_size;
     uint32_t ring_gen;
 
     VkDescriptorSetLayout dsl;
@@ -146,8 +164,9 @@ static bool vkr_mem(VkRaster *r, VkMemoryRequirements *mr, VkFlags want,
     return false;
 }
 
-static bool vkr_buffer(VkRaster *r, size_t size, VkFlags usage, VkBuffer *b,
-                       VkDeviceMemory *mem, uint8_t **map)
+/* a mapped buffer; cached: memory the host reads fast */
+static bool vkr_buffer(VkRaster *r, size_t size, VkFlags usage, bool cached,
+                       VkBuffer *b, VkDeviceMemory *mem, uint8_t **map)
 {
     VkBufferCreateInfo bi = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -161,9 +180,14 @@ static bool vkr_buffer(VkRaster *r, size_t size, VkFlags usage, VkBuffer *b,
         return false;
     }
     vkGetBufferMemoryRequirements(r->dev, *b, &mr);
-    if (!vkr_mem(r, &mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mem) ||
-        vkBindBufferMemory(r->dev, *b, *mem, 0) != VK_SUCCESS ||
+    if (!(cached && vkr_mem(r, &mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                            VK_MEMORY_PROPERTY_HOST_CACHED_BIT, mem)) &&
+        !vkr_mem(r, &mr, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, mem)) {
+        return false;
+    }
+    if (vkBindBufferMemory(r->dev, *b, *mem, 0) != VK_SUCCESS ||
         vkMapMemory(r->dev, *mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
         return false;
     }
@@ -317,6 +341,63 @@ static void vkr_end_scope(VkRaster *r)
 
 static void vkr_cache_save(VkRaster *r);
 
+/* with the lock: neither the GPU nor the caller needs the mark */
+static void vkr_mark_drop(VkRaster *r, VkrMark *k)
+{
+    unsigned i;
+
+    for (i = 0; i < k->reads->len; i++) {
+        g_ptr_array_add(r->idle, g_ptr_array_index(k->reads, i));
+    }
+    g_ptr_array_free(k->reads, true);
+    vkDestroyFence(r->dev, k->fence, NULL);
+    g_free(k);
+}
+
+/* the command buffers the GPU is done with are freed; all: every one is */
+static void vkr_reap(VkRaster *r, bool all)
+{
+    VkrMark *k;
+
+    while ((k = g_queue_peek_head(&r->subs)) &&
+           (all || vkGetFenceStatus(r->dev, k->fence) == VK_SUCCESS)) {
+        g_queue_pop_head(&r->subs);
+        vkFreeCommandBuffers(r->dev, r->pool, 1, &k->cb);
+        g_mutex_lock(&r->lock);
+        k->done = true;
+        if (!k->held) {
+            vkr_mark_drop(r, k);
+        }
+        g_mutex_unlock(&r->lock);
+    }
+    if (g_queue_is_empty(&r->subs)) {
+        vkr_dead(r);
+    }
+}
+
+static VkrMark *vkr_submit(VkRaster *r)
+{
+    VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &r->cb,
+    };
+    VkrMark *k = g_new0(VkrMark, 1);
+
+    vkr_end_scope(r);
+    vkCreateFence(r->dev, &fi, NULL, &k->fence);
+    k->cb = r->cb;
+    k->reads = r->reads;
+    r->reads = g_ptr_array_new();
+    vkEndCommandBuffer(r->cb);
+    vkQueueSubmit(r->queue, 1, &si, k->fence);
+    g_queue_push_tail(&r->subs, k);
+    r->n_submits++;
+    vkr_begin(r);
+    return k;
+}
+
 void vkr_flush(VkRaster *r, bool wait)
 {
     vkr_end_scope(r);
@@ -326,30 +407,39 @@ void vkr_flush(VkRaster *r, bool wait)
         vkr_cache_save(r);
     }
     if (r->cb_used) {
-        VkSubmitInfo si = {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &r->cb,
-        };
-
-        vkEndCommandBuffer(r->cb);
-        vkQueueSubmit(r->queue, 1, &si, VK_NULL_HANDLE);
-        r->done[r->ndone++] = r->cb;
-        r->n_submits++;
-        vkr_begin(r);
+        vkr_submit(r);
     }
-    if ((wait || r->ndone >= VKR_CBS - 1) && r->ndone) {
+    if (wait && !g_queue_is_empty(&r->subs)) {
         int64_t t0 = g_get_monotonic_time();
 
         vkQueueWaitIdle(r->queue);
-        vkFreeCommandBuffers(r->dev, r->pool, r->ndone, r->done);
-        r->ndone = 0;
         r->n_waits++;
         r->wait_ns += (g_get_monotonic_time() - t0) * 1000;
     }
-    if (!r->ndone) {
-        vkr_dead(r);
+    vkr_reap(r, wait);
+}
+
+VkrMark *vkr_mark(VkRaster *r)
+{
+    VkrMark *k = vkr_submit(r);
+
+    k->held = true;
+    return k;
+}
+
+void vkr_mark_wait(VkRaster *r, VkrMark *k)
+{
+    vkWaitForFences(r->dev, 1, &k->fence, VK_TRUE, UINT64_MAX);
+}
+
+void vkr_mark_free(VkRaster *r, VkrMark *k)
+{
+    g_mutex_lock(&r->lock);
+    k->held = false;
+    if (k->done) {
+        vkr_mark_drop(r, k);
     }
+    g_mutex_unlock(&r->lock);
 }
 
 void vkr_data_room(VkRaster *r, size_t n)
@@ -416,7 +506,7 @@ void vkr_tables(VkRaster *r, const uint32_t *words, size_t n)
     g_assert(!r->tables);
     r->tables_size = MAX(n, 1) * 4;
     if (vkr_buffer(r, r->tables_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                   &r->tables, &r->tables_mem, &map)) {
+                   false, &r->tables, &r->tables_mem, &map)) {
         memcpy(map, words, n * 4);
     }
 }
@@ -598,8 +688,8 @@ void vkr_image_write(VkRaster *r, VkrImage *i, uint32_t level, uint32_t layer,
     r->n_writes++;
 }
 
-void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
-                    uint32_t w, uint32_t h, void *px)
+const void *vkr_image_read_later(VkRaster *r, VkrImage *i, uint32_t x,
+                                 uint32_t y, uint32_t w, uint32_t h)
 {
     size_t n = (size_t)w * h * vkr_fmt[i->fmt].bytes;
     VkBufferImageCopy c = {
@@ -609,25 +699,44 @@ void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
         .imageOffset = { x, y, 0 },
         .imageExtent = { w, h, 1 },
     };
+    VkrRead *rd = NULL;
+    unsigned k;
 
-    if (n > r->rb_size) {
-        vkr_flush(r, true);
-        if (r->rb) {
-            vkDestroyBuffer(r->dev, r->rb, NULL);
-            vkFreeMemory(r->dev, r->rb_mem, NULL);
+    g_mutex_lock(&r->lock);
+    for (k = 0; k < r->idle->len; k++) {
+        VkrRead *q = g_ptr_array_index(r->idle, k);
+
+        if (q->size >= n && q->size / 4 <= n) {
+            rd = g_ptr_array_remove_index_fast(r->idle, k);
+            break;
         }
-        r->rb_size = ROUND_UP(n, 1 << 20);
-        vkr_buffer(r, r->rb_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &r->rb,
-                   &r->rb_mem, &r->rb_map);
+    }
+    g_mutex_unlock(&r->lock);
+    if (!rd) {
+        rd = g_new0(VkrRead, 1);
+        rd->size = MAX(pow2ceil(n), 65536);
+        vkr_buffer(r, rd->size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true,
+                   &rd->buf, &rd->mem, &rd->map);
     }
     vkr_end_scope(r);
     vkr_settle(r);
-    vkCmdCopyImageToBuffer(r->cb, i->img, VK_IMAGE_LAYOUT_GENERAL, r->rb, 1,
+    vkCmdCopyImageToBuffer(r->cb, i->img, VK_IMAGE_LAYOUT_GENERAL, rd->buf, 1,
                            &c);
     r->cb_used = true;
-    vkr_flush(r, true);
-    memcpy(px, r->rb_map, n);
+    g_ptr_array_add(r->reads, rd);
     r->n_reads++;
+    return rd->map;
+}
+
+void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
+                    uint32_t w, uint32_t h, void *px)
+{
+    const void *p = vkr_image_read_later(r, i, x, y, w, h);
+    VkrMark *k = vkr_mark(r);
+
+    vkr_flush(r, true);
+    memcpy(px, p, (size_t)w * h * vkr_fmt[i->fmt].bytes);
+    vkr_mark_free(r, k);
 }
 
 VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
@@ -1205,9 +1314,21 @@ void vkr_close(VkRaster *r)
         vkDeviceWaitIdle(r->dev);
         vkr_cache_save(r);
         if (r->dead) {
-            vkr_dead(r);
+            unsigned k;
+
+            vkr_reap(r, true);
             g_ptr_array_free(r->dead, true);
             g_ptr_array_free(r->blocks, true);
+            g_ptr_array_extend_and_steal(r->idle, r->reads);
+            for (k = 0; k < r->idle->len; k++) {
+                VkrRead *rd = g_ptr_array_index(r->idle, k);
+
+                vkDestroyBuffer(r->dev, rd->buf, NULL);
+                vkFreeMemory(r->dev, rd->mem, NULL);
+                g_free(rd);
+            }
+            g_ptr_array_free(r->idle, true);
+            g_mutex_clear(&r->lock);
         }
         if (r->pipes) {
             g_hash_table_iter_init(&it, r->pipes);
@@ -1228,10 +1349,8 @@ void vkr_close(VkRaster *r)
         vkDestroyDescriptorSetLayout(r->dev, r->dsl, NULL);
         vkDestroyBuffer(r->dev, r->ring, NULL);
         vkDestroyBuffer(r->dev, r->tables, NULL);
-        vkDestroyBuffer(r->dev, r->rb, NULL);
         vkFreeMemory(r->dev, r->ring_mem, NULL);
         vkFreeMemory(r->dev, r->tables_mem, NULL);
-        vkFreeMemory(r->dev, r->rb_mem, NULL);
         vkDestroyCommandPool(r->dev, r->pool, NULL);
         vkDestroyDevice(r->dev, NULL);
     }
@@ -1464,8 +1583,8 @@ VkRaster *vkr_open(const char *cache, const char **err)
         !vkr_buffer(r, (size_t)VKR_RING + VKR_KEEP,
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &r->ring, &r->ring_mem,
-                    &r->ring_map)) {
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false, &r->ring,
+                    &r->ring_mem, &r->ring_map)) {
         g_free(blob);
         goto fail;
     }
@@ -1475,6 +1594,10 @@ VkRaster *vkr_open(const char *cache, const char **err)
     r->samps = g_array_new(false, false, sizeof(VkrSamp));
     r->blocks = g_ptr_array_new();
     r->dead = g_ptr_array_new();
+    r->reads = g_ptr_array_new();
+    r->idle = g_ptr_array_new();
+    g_queue_init(&r->subs);
+    g_mutex_init(&r->lock);
     glslang_initialize_process();
     vkr_begin(r);
     *err = NULL;
