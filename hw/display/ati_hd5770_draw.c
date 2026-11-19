@@ -322,6 +322,7 @@ typedef struct Draw {
     HD5770Lanes *lanes, *nh, *nv;   /* nh, nv: neighbours for gradients */
     unsigned nlanes;            /* 1, 3 with neighbours; made when rasterised */
     bool gpu_prog;              /* the program may go to the host GPU */
+    bool fb;                    /* a texture overlaps the rows of a target */
     unsigned gfb;               /* why the last draw stayed on the CPU */
     /* programs first seen by a draw looked at ahead: not kept */
     HD5770Prog *ahead_prog[3];
@@ -707,24 +708,36 @@ void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
 }
 
 /*
- * The CPU writes surface s: after the queued draws that touch it. With
- * the native pipeline a surface not in one piece of VRAM is taken page
- * by page: runs of VRAM pages by range, and guest RAM minds only the
- * draws that use guest RAM.
+ * The CPU writes rows y0..y1-1 of surface s: after the queued draws that
+ * touch the surface, which a backend may hold whole. A surface that does
+ * not lie in one piece of VRAM as declared is none a backend holds: the
+ * rows count, and with the native pipeline they are taken page by page:
+ * runs of VRAM pages by range, and guest RAM minds only the draws that
+ * use guest RAM.
  */
-static void pend_write(HD5770Gfx *g, const HD5770Surf *s)
+static void pend_write(HD5770Gfx *g, const HD5770Surf *s, int y0, int y1)
 {
-    uint64_t size = hd5770_surf_size(s), off, at, n, lo = 0, hi = 0;
+    uint64_t base, end, size, off, at, n, lo = 0, hi = 0;
     bool all = !rd_written(g);
 
-    if (vram_off(g, s->base, size, &off)) {
+    if (vram_off(g, s->base, hd5770_surf_size(s), &off)) {
+        hd5770_gfx_touch(g, off, hd5770_surf_size(s));
+        return;
+    }
+    hd5770_surf_rows(s, MAX(y0, 0), MIN(MAX(y1, 0), (int)s->height), &base,
+                     &end);
+    size = end - base;
+    if (!size) {
+        return;
+    }
+    if (vram_off(g, base, size, &off)) {
         hd5770_gfx_touch(g, off, size);
         return;
     }
     if (!g->ram_pend && !g->npend) {
         return;
     }
-    for (at = s->base & ~0xfffull; !all && at < s->base + size; at += 4096) {
+    for (at = base & ~0xfffull; !all && at < base + size; at += 4096) {
         uint8_t *p = g->mem.map(g->mem.opaque, at, &n, false);
 
         if (p && p >= g->vram && p < g->vram + g->vram_size) {
@@ -5035,8 +5048,37 @@ static void ps_mips(Draw *d)
     }
 }
 
-/* a texture of the pixel shader overlaps a target the draw writes */
-static bool ps_feedback(Draw *d, bool all)
+/* v's row joins [*lo, *hi]; false when its window position does not say */
+static bool vtx_row(const Vtx *v, float *lo, float *hi)
+{
+    if (v->clip || !(fabsf(v->y) < 1e6f)) {
+        return false;
+    }
+    *lo = MIN(*lo, v->y);
+    *hi = MAX(*hi, v->y);
+    return true;
+}
+
+/* the rows [*y0, *y1) of the clip box primitives of rows lo..hi cover */
+static void prim_rows(const Draw *d, unsigned prim, float lo, float hi,
+                      int *y0, int *y1)
+{
+    if (prim == PRIM_RECTLIST) {
+        /* the fourth corner */
+        float h = hi - lo;
+
+        lo -= h;
+        hi += h;
+    }
+    *y0 = MAX(d->y0, (int)floorf(lo) - 1);
+    *y1 = MAX(MIN(d->y1, (int)ceilf(hi) + 2), *y0);
+}
+
+/*
+ * a texture of the pixel shader overlaps rows y0..y1-1 of a target the
+ * draw writes
+ */
+static bool ps_feedback(Draw *d, bool all, int y0, int y1)
 {
     uint8_t ids[16];
     unsigned nres, i, k, nt = d->mrt ? d->nmrt : 1;
@@ -5061,8 +5103,10 @@ static bool ps_feedback(Draw *d, bool all)
         }
         for (k = 0; k < nt; k++) {
             const HD5770Surf *rs = d->mrt ? mrt_surf(d, k) : &d->rt;
-            uint64_t rlo = rs->base, rhi = rs->base + hd5770_surf_size(rs);
+            uint64_t rlo, rhi;
 
+            hd5770_surf_rows(rs, MAX(y0, 0),
+                             MIN(MAX(y1, 0), (int)rs->height), &rlo, &rhi);
             if (lo < rhi && rlo < hi) {
                 return true;
             }
@@ -5074,21 +5118,29 @@ static bool ps_feedback(Draw *d, bool all)
 /*
  * The pixel shader runs on lanes unless it samples the render target:
  * then each pixel must see the ones drawn before it. A program with an
- * IR may go to the host GPU under the same condition (gpu_prog).
+ * IR may go to the host GPU under the same condition (gpu_prog). The
+ * draw writes rows y0..y1-1 at most: the clip box, and once the vertices
+ * are known the rows they span, if a texture overlapped the first (fb).
  */
-static void lanes_setup(Draw *d)
+static void lanes_setup(Draw *d, int y0, int y1)
 {
     unsigned nconst, i;
-    bool grad;
+    bool grad, fb, fb_all;
     const HD5770IR *ir = hd5770_prog_ir(d->ps);
 
     if (d->resolve || !ir) {
         return;
     }
-    if (d->g->gpu && d->g->gpu_mode != HD5770_GPU_OFF && !ps_feedback(d, true)) {
+    g_free(d->kv);
+    d->kv = NULL;
+    d->gpu_prog = false;
+    fb_all = ps_feedback(d, true, y0, y1);
+    fb = ps_feedback(d, false, y0, y1);
+    d->fb = fb_all || fb;
+    if (d->g->gpu && d->g->gpu_mode != HD5770_GPU_OFF && !fb_all) {
         d->gpu_prog = true;
     }
-    if (!hd5770_prog_lanes(d->ps, &nconst, &grad) || ps_feedback(d, false)) {
+    if (!hd5770_prog_lanes(d->ps, &nconst, &grad) || fb) {
         if (d->gpu_prog) {
             d->kv = g_new(HD5770Val, MAX(ir->nconsts, 1));
             hd5770_prog_bind(d->ps, &d->ps_env, d->kv);
@@ -5408,9 +5460,17 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
                        HD5770Thread *t)
 {
     HD5770Gfx *g = d->g;
+    float ylo = INFINITY, yhi = -INFINITY;
+    int wy0 = d->y0, wy1 = d->y1;
     bool taken;
     unsigned i;
 
+    for (i = 0; i < nv && vtx_row(vp[i], &ylo, &yhi); i++) {
+        /* the rows of the vertices */
+    }
+    if (nv && i == nv) {
+        prim_rows(d, prim, ylo, yhi, &wy0, &wy1);
+    }
     memset(t, 0, sizeof(*t));
     d->gfb = GFB_NONE;
     d->cwhy = HD5770_WHY_N;
@@ -5443,11 +5503,11 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
         /* the CPU writes the targets: after queued draws that touch them */
         for (i = 0; i < nws; i++) {
             if (ws[i]) {
-                pend_write(g, ws[i]);
+                pend_write(g, ws[i], wy0, wy1);
             }
         }
         if (d->resolve) {
-            pend_write(g, &d->rs);
+            pend_write(g, &d->rs, 0, d->rs.height);
         }
         int64_t t0 = get_clock();
         uint64_t px0 = d->st->pixels;
@@ -5694,7 +5754,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
     ps_inputs(d);
     d->ps_env.interp_n = interp_n;
     ps_mips(d);
-    lanes_setup(d);
+    lanes_setup(d, d->y0, d->y1);
 
     nv = MIN(count, MAX_VERTS);
     if (count > MAX_VERTS) {
@@ -5822,6 +5882,18 @@ have_idx:
             }
         }
         g->gst.vs_ns += get_clock() - tv;
+        if (d->fb && ninst == 1) {
+            float ylo = INFINITY, yhi = -INFINITY;
+            int y0, y1;
+
+            for (i = 0; i < nu && vtx_row(&vb[i], &ylo, &yhi); i++) {
+                /* the rows of the vertices */
+            }
+            if (nu && i == nu) {
+                prim_rows(d, prim, ylo, yhi, &y0, &y1);
+                lanes_setup(d, y0, y1);
+            }
+        }
         if (vc.rec) {
             vs_check(d, vc.rec, vc.np, slot, nv, inst, vb, vm);
             if (vc.ctri) {

@@ -10,8 +10,9 @@
  * names as written are compared with what was last seen there, and the
  * image is loaded again when they differ. An image drawn to is newer
  * than memory until it is written back: at a sync, at a fence when it
- * lies over the scanout or has not been drawn to for a second, or when
- * another image over the same memory is used.
+ * lies over the scanout or has not been drawn to for a second, when
+ * another image over the same memory is used, or when the CPU has written
+ * other bytes under it.
  *
  * FENCES. A fence with images to write back queues their read-out behind
  * the draws and returns a ticket; the thread vk_retire() waits for the
@@ -2099,6 +2100,8 @@ static void vk_wrote(void *opaque, uint64_t off, uint64_t len)
     HD5770Vk *m = opaque;
 
     if (len) {
+        /* an image drawn to elsewhere over these bytes is loaded again */
+        vk_settle(m, NULL, off, off + len, VB_RANGE);
         vk_named(m, off, off + len);
     }
     m->epoch++;
