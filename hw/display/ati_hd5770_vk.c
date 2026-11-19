@@ -937,6 +937,11 @@ static unsigned vk_tex_fmt(const HD5770GpuTex *t)
         /* the host's channels are the components in reverse */
         return VKR_FMT_ABGR4;
     }
+    if (t->num == HD5770_NUM_NORM && !t->sgn && !t->is_float &&
+        t->comps == 3 && t->fmt == HD5770_FMT_5_6_5) {
+        /* the host's channels are the components in reverse */
+        return VKR_FMT_RGB565;
+    }
     if (t->num != HD5770_NUM_NORM || t->sgn || t->comps != 1) {
         return VKR_FMT_N;
     }
@@ -979,6 +984,20 @@ static unsigned vk_rt(const HD5770Surf *s, uint32_t fmt, uint32_t num,
         *mask = ((wmask >> src[0]) & 1) | ((wmask >> src[1]) & 1) << 1;
         *rhf = VKR_FMT_RG32F;
         return *blend ? VD_BLEND_ORDER : VD_TAKEN;
+    }
+    if (num == 0 && !is_float && comps == 3 && fmt == HD5770_FMT_5_6_5 &&
+        src[0] < 4 && src[1] < 4 && src[2] < 4) {
+        uint32_t t = src[0];
+
+        /* no alpha kept: the fourth channel is the program's, for blends */
+        src[0] = src[2];
+        src[2] = t;
+        src[3] = 3;
+        for (i = 0; i < 3; i++) {
+            *mask |= ((wmask >> src[i]) & 1) << i;
+        }
+        *rhf = VKR_FMT_RGB565;
+        return VD_TAKEN;
     }
     for (i = 0; i < 4; i++) {
         perm |= src[i] < 4 ? 1u << src[i] : 0x10;
@@ -1732,7 +1751,9 @@ staged:
         UF(HD5770_NU_TEX + HD5770_NU_TEX_WORDS * i + 1, (float)t->h);
         for (c = 0; c < 4; c++) {
             tu[2 + c] = hf[i] == VKR_FMT_ABGR4 && t->dst_sel[c] < 4
-                        ? 3 - t->dst_sel[c] : t->dst_sel[c];
+                        ? 3 - t->dst_sel[c]
+                        : hf[i] == VKR_FMT_RGB565 && t->dst_sel[c] < 3
+                        ? 2 - t->dst_sel[c] : t->dst_sel[c];
         }
         tu[6] = t->base_lv;
         tu[7] = t->levels;

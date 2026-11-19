@@ -45,6 +45,7 @@ enum {
     VKR_FMT_BC1, VKR_FMT_BC2, VKR_FMT_BC3, VKR_FMT_BC4, VKR_FMT_BC5,
     VKR_FMT_BC4S, VKR_FMT_BC5S,
     VKR_FMT_ABGR4,              /* 16 bits, red in the low four */
+    VKR_FMT_RGB565,             /* 16 bits, red in the high five */
     VKR_FMT_D32F,               /* depth, read and written as floats */
     VKR_FMT_N,
 };
