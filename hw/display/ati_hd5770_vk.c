@@ -28,7 +28,7 @@
 #define DC_Z            (1u << 1)
 #define DC_Z_WRITE      (1u << 2)
 
-#define VK_SURFS_MAX    3000
+#define VK_HASH         4096
 #define VK_LAZY_NS      1000000000ll
 
 enum {
@@ -43,6 +43,13 @@ static const char *const vd_name[VD_N] = {
     "stencil", "target format", "target in RAM", "blend order",
     "texture kind", "texture format", "texture surface", "texture is target",
     "depth surface", "w", "vertex stage", "room",
+};
+
+/* why an image went back to memory */
+enum { VB_SYNC, VB_RANGE, VB_SCANOUT, VB_IDLE, VB_ALIAS, VB_N };
+
+static const char *const vb_name[VB_N] = {
+    "sync", "range sync", "scanout", "idle", "other image",
 };
 
 typedef struct VkSurf {
@@ -62,12 +69,25 @@ typedef struct VkSurf {
     int r[4];                   /* drawn and not written back */
     uint64_t gen, epoch, used;
     int64_t tdraw;
+    struct VkSurf *hnext;       /* the next that starts at the same place */
 } VkSurf;
 
+/* a vertex buffer's bytes kept in the words */
 typedef struct VkVb {
-    uint64_t voff;
+    uint64_t voff, gen, epoch;
     uint32_t len, off;
 } VkVb;
+
+typedef struct VkNote {
+    unsigned stage;
+    char *src;
+} VkNote;
+
+/* a pipeline to build ahead: its stages by key */
+typedef struct VkJob {
+    char *fs, *vs;
+    VkrPipeDesc d;
+} VkJob;
 
 typedef struct HD5770Vk {
     HD5770Gpu pub;
@@ -75,18 +95,24 @@ typedef struct HD5770Vk {
     uint8_t *vram, *ram;
     uint64_t vram_size, ram_size;
     GPtrArray *surfs, *dirty;
+    VkSurf *hb[VK_HASH];        /* the images by where they start */
+    uint64_t limit;             /* device memory the images may take */
     GHashTable *progs;          /* key -> VkrShader, or vk_fail */
+    /* build ahead: stages to compile (key -> VkNote), pipelines to build */
+    GHashTable *noted;
+    GArray *jobs;
+    bool dry;
     uint64_t *pgen, gen, epoch, seq, failed;
     char *fail_log;
     char last_surf[160];        /* the last surface without an image */
-    GArray *vbs;
-    uint32_t vb_gen;
+    GHashTable *vbs;            /* VRAM offset -> VkVb */
     uint8_t *tmp;
     size_t tmp_len;
     uint64_t *offs;
     size_t noffs;
     uint64_t nd[VD_N], dims[8], rtf[64], txf[64];
-    uint64_t uploads, upload_bytes, backs, back_bytes, fences, syncs;
+    uint64_t uploads, upload_bytes, backs[VB_N], back_bytes[VB_N];
+    uint64_t fences, syncs, ranges;
     uint64_t vs_draws, vs_tris, tris, vb_bytes, evicted;
     int64_t draw_ns, sync_ns;
 } HD5770Vk;
@@ -95,6 +121,9 @@ static int vk_fail;
 
 static bool vk_decline(HD5770Vk *m, unsigned r, unsigned why)
 {
+    if (m->dry) {
+        return false;
+    }
     m->nd[r]++;
     m->pub.why = why;
     return false;
@@ -296,7 +325,7 @@ static void vk_load(HD5770Vk *m, VkSurf *e)
 }
 
 /* the image's pixels drawn go to memory */
-static void vk_back(HD5770Vk *m, VkSurf *e)
+static void vk_back(HD5770Vk *m, VkSurf *e, unsigned why)
 {
     const HD5770GpuSurf *s = &e->lv[0];
     uint32_t w, h;
@@ -337,12 +366,13 @@ static void vk_back(HD5770Vk *m, VkSurf *e)
     if (m->pub.done) {
         m->pub.done(m->pub.opaque, s->voff + lo, s->voff + hi);
     }
-    m->backs++;
-    m->back_bytes += n * s->s.bpe;
+    m->backs[why]++;
+    m->back_bytes[why] += n * s->s.bpe;
 }
 
 /* images newer than memory over VRAM [lo, hi), but e, are written back */
-static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi)
+static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi,
+                      unsigned why)
 {
     unsigned i;
 
@@ -350,7 +380,7 @@ static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi)
         VkSurf *o = g_ptr_array_index(m->dirty, i);
 
         if (o != e && o->lo < hi && lo < o->hi) {
-            vk_back(m, o);
+            vk_back(m, o, why);
             i--;
         }
     }
@@ -364,7 +394,7 @@ static void vk_ready(HD5770Vk *m, VkSurf *e)
 
     e->used = m->seq;
     for (l = 0; l < e->nlv && !e->lv[l].space; l++) {
-        vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l]);
+        vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
     }
     if (e->dirty || (e->epoch == m->epoch && e->loaded)) {
         return;
@@ -405,20 +435,45 @@ static void vk_surf_free(gpointer p)
     g_free(e);
 }
 
+static unsigned vk_hash(const HD5770GpuSurf *s)
+{
+    uint64_t k = !s->space ? s->voff :
+                 ((s->npages ? s->pages[0] : 0) + (uint64_t)s->pg0) |
+                 1ull << 63;
+
+    return (k * 0x9e3779b97f4a7c15ull) >> 52;
+}
+
+static gint vk_older(gconstpointer a, gconstpointer b)
+{
+    const VkSurf *x = *(VkSurf *const *)a, *y = *(VkSurf *const *)b;
+
+    return x->used < y->used ? -1 : x->used > y->used;
+}
+
+/* the quarter of the images used longest ago goes */
 static void vk_evict(HD5770Vk *m)
 {
-    unsigned i;
+    unsigned i, n = m->surfs->len / 4;
 
-    for (i = 0; i < m->surfs->len; i++) {
-        VkSurf *e = g_ptr_array_index(m->surfs, i);
+    g_ptr_array_sort(m->surfs, vk_older);
+    for (i = 0; i < m->surfs->len && n; i++) {
+        VkSurf *e = g_ptr_array_index(m->surfs, i), **h;
 
-        if (!e->dirty && e->used + 2000 < m->seq) {
-            vkr_image_free(m->r, e->img);
-            g_ptr_array_remove_index_fast(m->surfs, i);
-            m->evicted++;
-            i--;
+        if (e->dirty || e->used == m->seq) {
+            continue;
         }
+        for (h = &m->hb[vk_hash(&e->lv[0])]; *h != e; h = &(*h)->hnext) {
+            /* search */
+        }
+        *h = e->hnext;
+        vkr_image_free(m->r, e->img);
+        g_ptr_array_remove_index(m->surfs, i);
+        m->evicted++;
+        i--;
+        n--;
     }
+    vkr_flush(m->r, true);
 }
 
 static bool vk_same(const VkSurf *e, const HD5770GpuSurf *s)
@@ -464,11 +519,9 @@ static VkSurf *vk_no_surf(HD5770Vk *m, VkSurf *e, const char *why)
 static VkSurf *vk_find(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
                        unsigned zfmt)
 {
-    unsigned i;
+    VkSurf *e;
 
-    for (i = 0; i < m->surfs->len; i++) {
-        VkSurf *e = g_ptr_array_index(m->surfs, i);
-
+    for (e = m->hb[vk_hash(s)]; e; e = e->hnext) {
         if (!e->mip && e->hf == hf && e->zfmt == zfmt &&
             e->lv[0].s.height >= s->s.height &&
             (e->lv[0].s.fast || e->lv[0].s.height == s->s.height) &&
@@ -479,40 +532,46 @@ static VkSurf *vk_find(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
     return NULL;
 }
 
+/* the image of a texture's levels 0..nlv-1 */
+static VkSurf *vk_find_tex(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
+                           unsigned blk, const HD5770GpuTex *t, unsigned nlv)
+{
+    VkSurf *o;
+    unsigned l;
+
+    for (o = m->hb[vk_hash(s)]; o; o = o->hnext) {
+        if (!o->mip || o->hf != hf || o->nlv != nlv ||
+            o->slices != MAX(t->slices, 1u) || o->vol != (t->dim == 2) ||
+            !vk_same(o, s) || o->lv[0].s.height != s->s.height) {
+            continue;
+        }
+        for (l = 1; l < nlv && o->lv[l].voff == t->lv[l].voff &&
+                    o->lw[l] * blk >= t->lw[l] &&
+                    o->lh[l] * blk >= t->lh[l]; l++) {
+            /* the levels */
+        }
+        if (l == nlv) {
+            return o;
+        }
+    }
+    return NULL;
+}
+
 /* the image of a surface; t: of a texture's levels 0..nlv-1 */
 static VkSurf *vk_surf(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
                        unsigned zfmt, unsigned blk, const HD5770GpuTex *t,
                        unsigned nlv)
 {
-    VkSurf *e = NULL;
+    VkSurf *e;
     unsigned i, l;
 
-    if (!t) {
-        e = vk_find(m, s, hf, zfmt);
-    } else {
-        for (i = 0; i < m->surfs->len && !e; i++) {
-            VkSurf *o = g_ptr_array_index(m->surfs, i);
-
-            if (!o->mip || o->hf != hf || o->nlv != nlv ||
-                o->slices != MAX(t->slices, 1u) || o->vol != (t->dim == 2) ||
-                !vk_same(o, s) ||
-                o->lv[0].s.height != s->s.height) {
-                continue;
-            }
-            for (l = 1; l < nlv && o->lv[l].voff == t->lv[l].voff &&
-                        o->lw[l] * blk >= t->lw[l] &&
-                        o->lh[l] * blk >= t->lh[l]; l++) {
-                /* the levels */
-            }
-            e = l == nlv ? o : NULL;
-        }
-    }
+    e = t ? vk_find_tex(m, s, hf, blk, t, nlv) : vk_find(m, s, hf, zfmt);
     if (e) {
         /* this draw's: not dropped for a later image of it */
         e->used = m->seq;
         return e;
     }
-    if (m->surfs->len >= VK_SURFS_MAX) {
+    if (vkr_image_bytes(m->r) > m->limit) {
         vk_evict(m);
     }
     e = g_new0(VkSurf, 1);
@@ -524,9 +583,6 @@ static VkSurf *vk_surf(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
     e->slices = t ? MAX(t->slices, 1u) : 1;
     e->vol = t && t->dim == 2;
     e->lv[0] = *s;
-    if (m->surfs->len >= VK_SURFS_MAX) {
-        return vk_no_surf(m, e, "too many images");
-    }
     for (l = 0; l < e->nlv; l++) {
         e->lv[l] = l ? t->lv[l] : *s;
         e->sb[l] = t ? t->slice_bytes[l] : 0;
@@ -561,13 +617,20 @@ static VkSurf *vk_surf(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
         e->lo = s->voff;
         e->hi = s->voff + e->cov[0];
     }
-    e->img = vkr_image_new(m->r, hf, e->lw[0] * blk, e->lh[0] * blk, e->nlv,
-                           e->slices, e->vol,
-                           !t && vkr_format_ok(m->r, hf, true));
+    for (i = 0; i < 2 && !e->img; i++) {
+        if (i) {
+            vk_evict(m);
+        }
+        e->img = vkr_image_new(m->r, hf, e->lw[0] * blk, e->lh[0] * blk,
+                               e->nlv, e->slices, e->vol,
+                               !t && vkr_format_ok(m->r, hf, true));
+    }
     if (!e->img) {
         return vk_no_surf(m, e, "no host image");
     }
     e->used = m->seq;
+    e->hnext = m->hb[vk_hash(&e->lv[0])];
+    m->hb[vk_hash(&e->lv[0])] = e;
     g_ptr_array_add(m->surfs, e);
     return e;
 }
@@ -802,6 +865,26 @@ static void vk_sampler(const HD5770GpuTex *t, bool mip, unsigned last,
     }
 }
 
+/* build ahead: the stage of the key is known, or noted */
+static bool vk_noted(HD5770Vk *m, const char *key)
+{
+    return g_hash_table_contains(m->progs, key) ||
+           g_hash_table_contains(m->noted, key);
+}
+
+static void vk_note(HD5770Vk *m, const char *key, unsigned stage, char *src)
+{
+    VkNote *n;
+
+    if (!src) {
+        return;
+    }
+    n = g_new(VkNote, 1);
+    n->stage = stage;
+    n->src = src;
+    g_hash_table_insert(m->noted, g_strdup(key), n);
+}
+
 static VkrShader *vk_prog(HD5770Vk *m, const char *key, unsigned stage,
                           char *src)
 {
@@ -829,37 +912,72 @@ static VkrShader *vk_prog(HD5770Vk *m, const char *key, unsigned stage,
     return s;
 }
 
-/* a vertex buffer's bytes in the words; their byte offset there */
+/* no page of VRAM [lo, hi) was written after generation gen */
+static bool vk_unwritten(HD5770Vk *m, uint64_t lo, uint64_t hi, uint64_t gen)
+{
+    uint64_t p;
+
+    if (!m->pub.written) {
+        return false;
+    }
+    vk_pull(m, lo, hi);
+    for (p = lo >> 12; p <= (hi - 1) >> 12; p++) {
+        if (m->pgen[p] > gen) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * a vertex buffer's bytes in the words; their byte offset there. Those
+ * of VRAM are kept while the write log leaves their pages alone.
+ */
 static uint32_t vk_vb(HD5770Vk *m, const HD5770GpuSurf *b, uint32_t len)
 {
     uint32_t off;
     uint8_t *p;
-    unsigned i;
-    VkVb e;
 
     if (!b->space) {
+        VkVb *c = g_hash_table_lookup(m->vbs, &b->voff);
+
         if (b->voff >= m->vram_size) {
             len = 0;
         } else {
             len = MIN(len, m->vram_size - b->voff);
         }
-        for (i = 0; i < m->vbs->len; i++) {
-            VkVb *c = &g_array_index(m->vbs, VkVb, i);
-
-            if (c->voff == b->voff && c->len >= len) {
-                return c->off;
-            }
+        if (c && c->len >= len &&
+            (c->epoch == m->epoch || !len ||
+             vk_unwritten(m, c->voff, c->voff + c->len, c->gen))) {
+            c->epoch = m->epoch;
+            return c->off;
         }
+        p = vkr_keep(m->r, len + 16, &off);
+        if (!p) {
+            vkr_keep_reset(m->r);
+            g_hash_table_remove_all(m->vbs);
+            c = NULL;
+            p = vkr_keep(m->r, len + 16, &off);
+        }
+        if (!c) {
+            c = g_new0(VkVb, 1);
+            c->voff = b->voff;
+            g_hash_table_insert(m->vbs, &c->voff, c);
+        }
+        if (len) {
+            vk_pull(m, b->voff, b->voff + len);
+        }
+        c->gen = m->gen;
+        c->epoch = m->epoch;
+        c->len = len;
+        c->off = off * 4;
+        memcpy(p, m->vram + b->voff, len);
+        m->vb_bytes += len;
+        return c->off;
     }
     p = vkr_data(m->r, len + 16, &off);
     m->vb_bytes += len;
-    if (!b->space) {
-        memcpy(p, m->vram + b->voff, len);
-        e.voff = b->voff;
-        e.len = len;
-        e.off = off * 4;
-        g_array_append_val(m->vbs, e);
-    } else {
+    {
         uint64_t o = 0;
 
         while (o < len) {
@@ -893,6 +1011,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     VkSurf *zs = NULL, *ts[HD5770_GPU_TEX], *at[9];
     unsigned hf[HD5770_GPU_TEX], lvs[HD5770_GPU_TEX];
     unsigned nrt, nt = 0, nat = 0, i, j, c, mask = 0;
+    bool hasz = d->db && d->zfmt;
     uint32_t vw = UINT32_MAX, vh = UINT32_MAX, padded = 0, flat, *u, uo, vo;
     int sc[4] = { d->sc[0], d->sc[1], d->sc[2], d->sc[3] };
     int x0, y0, x1, y1, bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
@@ -969,13 +1088,14 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
                         &tg[nt].blend, &tg[nt].hf, &tg[nt].out, &tg[nt].mask);
         }
         if (why != VD_TAKEN) {
-            m->rtf[(d->nmrt ? r->fmt : d->rt_fmt) & 63] += why == VD_RT_FMT;
+            m->rtf[(d->nmrt ? r->fmt : d->rt_fmt) & 63] += why == VD_RT_FMT &&
+                                                           !m->dry;
             return vk_decline(m, why, why == VD_BLEND_ORDER
                                       ? HD5770_WHY_BK_NATIVE_STATE
                                       : HD5770_WHY_BK_SURF);
         }
         if (!vkr_format_ok(m->r, tg[nt].hf, true)) {
-            m->rtf[(d->nmrt ? r->fmt : d->rt_fmt) & 63]++;
+            m->rtf[(d->nmrt ? r->fmt : d->rt_fmt) & 63] += !m->dry;
             return vk_decline(m, VD_RT_FMT, HD5770_WHY_BK_SURF);
         }
         if (tg[nt].surf->space) {
@@ -1029,12 +1149,12 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
             (t->dim == 1 && t->slices > 1) ||
             ((k.nsl[i] > 1 || t->dim == 2) && t->surf.space)) {
             /* 1D */
-            m->dims[MIN(t->dim, 7)]++;
+            m->dims[MIN(t->dim, 7)] += !m->dry;
             return vk_decline(m, VD_TEX_KIND, HD5770_WHY_BK_SURF);
         }
         hf[i] = vk_tex_fmt(t);
         if (hf[i] == VKR_FMT_N) {
-            m->txf[t->fmt & 63]++;
+            m->txf[t->fmt & 63] += !m->dry;
             return vk_decline(m, VD_TEX_FMT, HD5770_WHY_BK_SURF);
         }
         lvs[i] = t->mip && !t->surf.space
@@ -1064,17 +1184,18 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
             return vk_decline(m, VD_VS, HD5770_WHY_BK_NATIVE_STATE);
         }
     }
-    for (i = 0; i < nt; i++) {
+    for (i = 0; i < nt && !m->dry; i++) {
         tg[i].e = vk_surf(m, tg[i].surf, tg[i].hf, 0, 1, NULL, 1);
         if (!tg[i].e) {
             return vk_decline(m, VD_TEX_SURF, HD5770_WHY_BK_SURF);
         }
         at[nat++] = tg[i].e;
     }
-    if (d->db && d->zfmt) {
-        zs = d->zs.space ? NULL
-                         : vk_surf(m, &d->zs, VKR_FMT_D32F, d->zfmt, 1, NULL,
-                                   1);
+    if (hasz && d->zs.space) {
+        return vk_decline(m, VD_DB_SURF, HD5770_WHY_BK_SURF);
+    }
+    if (hasz && !m->dry) {
+        zs = vk_surf(m, &d->zs, VKR_FMT_D32F, d->zfmt, 1, NULL, 1);
         if (!zs) {
             return vk_decline(m, VD_DB_SURF, HD5770_WHY_BK_SURF);
         }
@@ -1100,8 +1221,9 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     y0 = MAX(MAX(sc[1], by0), 0);
     x1 = MIN(MIN(sc[2], bx1), (int)vw);
     y1 = MIN(MIN(sc[3], by1), (int)vh);
-    if ((!d->ntri && !(v && v->ntidx && v->cull != 3)) || !nat || x0 >= x1 ||
-        y0 >= y1 || (!mask && !d->db)) {
+    if (!m->dry &&
+        ((!d->ntri && !(v && v->ntidx && v->cull != 3)) || !nat || x0 >= x1 ||
+         y0 >= y1 || (!mask && !d->db))) {
         m->nd[VD_EMPTY]++;
         return true;
     }
@@ -1110,6 +1232,29 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
         unsigned bk = hf[i] >= VKR_FMT_BC1 && hf[i] <= VKR_FMT_BC5S ? 4 : 1;
         VkSurf *e = NULL;
 
+        if (m->dry) {
+            /* the image there is, or the one that would be made */
+            bool lv = lvs[i] > 1 || k.nsl[i] > 1 || t->dim == 2;
+            uint32_t iw = lv ? ROUND_UP(t->w, bk) : t->surf.s.pitch * bk;
+            uint32_t ih = lv ? ROUND_UP(t->h, bk) : t->surf.s.height * bk;
+
+            if (lv) {
+                e = vk_find_tex(m, &t->surf, hf[i], bk, t, lvs[i]);
+            } else {
+                if (hf[i] == VKR_FMT_R32F && !t->surf.space) {
+                    e = vk_find(m, &t->surf, VKR_FMT_D32F, 3);
+                }
+                e = e ? e : vk_find(m, &t->surf, hf[i], 0);
+            }
+            if (e) {
+                iw = e->lw[0] * bk;
+                ih = e->lh[0] * bk;
+            }
+            if (t->w != iw || t->h != ih) {
+                padded |= 1u << i;
+            }
+            continue;
+        }
         if (lvs[i] > 1 || k.nsl[i] > 1 || t->dim == 2) {
             e = vk_surf(m, &t->surf, hf[i], 0, bk, t, lvs[i]);
         } else {
@@ -1138,10 +1283,10 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
             padded |= 1u << i;
         }
     }
-    zclear = zs && (d->rctl & 1);
-    zwrite = zs && (d->dctl & DC_Z) && (d->dctl & DC_Z_WRITE);
-    k.zexp = zs && !zclear && d->zexport && ir->zexport;
-    k.zout = zs && !zclear && (k.zexp ||
+    zclear = hasz && (d->rctl & 1);
+    zwrite = hasz && (d->dctl & DC_Z) && (d->dctl & DC_Z_WRITE);
+    k.zexp = hasz && !zclear && d->zexport && ir->zexport;
+    k.zout = hasz && !zclear && (k.zexp ||
                                !(d->zmin <= 0.0f && d->zmax >= 1.0f));
     k.ninputs = d->ninputs;
     k.pos_gpr = d->pos_gpr >= 0 && d->pos_gpr < 127 ? d->pos_gpr : -1;
@@ -1167,6 +1312,37 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
                                k.col[i].out, k.col[i].comps, k.col[i].src[0],
                                k.col[i].src[1], k.col[i].src[2],
                                k.col[i].src[3]);
+    }
+    if (m->dry) {
+        VkJob job = { .fs = g_strdup(key->str) };
+
+        vk_note(m, key->str, 1,
+                vk_noted(m, key->str) ? NULL :
+                hd5770_glsl_native_fs(ir, &k, padded, vkr_barycentric(m->r)));
+        if (v) {
+            g_string_printf(key, "v%016" PRIx64 "/%u/%u/%08x", v->ir->hash,
+                            v->ir->ninsts, k.ninputs, flat);
+            for (i = 0; i < k.ninputs; i++) {
+                g_string_append_printf(key, ".%d", v->src[i]);
+            }
+            vk_note(m, key->str, 0,
+                    vk_noted(m, key->str) ? NULL :
+                    hd5770_glsl_native_vs(v->ir, k.ninputs, flat, v->src));
+        } else {
+            g_string_printf(key, "p%u/%08x", k.ninputs, flat);
+            vk_note(m, key->str, 0,
+                    vk_noted(m, key->str) ? NULL :
+                    hd5770_glsl_native_pvs(k.ninputs, flat));
+        }
+        job.vs = g_string_free(key, false);
+        job.d.ncolor = nt;
+        for (i = 0; i < nt; i++) {
+            job.d.fmt[i] = tg[i].hf;
+            vk_blend(tg[i].blend, tg[i].mask, &job.d.blend[i]);
+        }
+        job.d.depth = hasz;
+        g_array_append_val(m->jobs, job);
+        return true;
     }
     q.fs = vk_prog(m, key->str, 1,
                    g_hash_table_contains(m->progs, key->str) ? NULL :
@@ -1216,10 +1392,6 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
         return vk_decline(m, VD_ROOM, HD5770_WHY_BK_ROOM);
     }
     vkr_data_room(m->r, need);
-    if (m->vb_gen != vkr_data_gen(m->r)) {
-        m->vb_gen = vkr_data_gen(m->r);
-        g_array_set_size(m->vbs, 0);
-    }
     u = vkr_data(m->r, (HD5770_NU_WORDS + ir->nconsts + 1) * 4, &uo);
     memset(u, 0, HD5770_NU_WORDS * 4);
 #define UF(i, f) do { float f_ = (f); memcpy(&u[i], &f_, 4); } while (0)
@@ -1394,10 +1566,77 @@ static bool vk_draw(void *opaque, const HD5770GpuDraw *d)
     return r;
 }
 
+static void vk_job_clear(gpointer p)
+{
+    VkJob *j = p;
+
+    g_free(j->fs);
+    g_free(j->vs);
+}
+
+static void vk_note_free(gpointer p)
+{
+    VkNote *n = p;
+
+    g_free(n->src);
+    g_free(n);
+}
+
+/* the stages and pipelines noted are built, several at a time */
+static void vk_build(HD5770Vk *m)
+{
+    unsigned n = g_hash_table_size(m->noted), i = 0, np = 0;
+    g_autofree unsigned *stage = g_new(unsigned, n);
+    g_autofree char **src = g_new(char *, n), **key = g_new(char *, n);
+    g_autofree VkrShader **out = g_new0(VkrShader *, n);
+    g_autofree VkrPipeDesc *pd = g_new(VkrPipeDesc, m->jobs->len);
+    GHashTableIter it;
+    gpointer kp, vp;
+
+    g_hash_table_iter_init(&it, m->noted);
+    while (g_hash_table_iter_next(&it, &kp, &vp)) {
+        key[i] = kp;
+        stage[i] = ((VkNote *)vp)->stage;
+        src[i++] = ((VkNote *)vp)->src;
+    }
+    vkr_shaders_new(m->r, n, stage, src, out);
+    for (i = 0; i < n; i++) {
+        m->failed += !out[i];
+        g_hash_table_insert(m->progs, g_strdup(key[i]),
+                            out[i] ? (gpointer)out[i] : &vk_fail);
+    }
+    g_hash_table_remove_all(m->noted);
+    for (i = 0; i < m->jobs->len; i++) {
+        VkJob *j = &g_array_index(m->jobs, VkJob, i);
+        gpointer fs = g_hash_table_lookup(m->progs, j->fs);
+        gpointer vs = g_hash_table_lookup(m->progs, j->vs);
+
+        if (fs && vs && fs != &vk_fail && vs != &vk_fail) {
+            pd[np] = j->d;
+            pd[np].fs = fs;
+            pd[np++].vs = vs;
+        }
+    }
+    vkr_pipes_ahead(m->r, pd, np);
+    g_array_set_size(m->jobs, 0);
+}
+
+static void vk_prep(void *opaque, const HD5770GpuDraw *d)
+{
+    HD5770Vk *m = opaque;
+
+    if (!d) {
+        vk_build(m);
+        return;
+    }
+    m->dry = true;
+    vk_draw_locked(m, d);
+    m->dry = false;
+}
+
 static void vk_epoch(HD5770Vk *m)
 {
     m->epoch++;
-    g_array_set_size(m->vbs, 0);
     m->pub.kept = m->dirty->len != 0;
 }
 
@@ -1407,9 +1646,9 @@ static void vk_sync(void *opaque)
     int64_t t0 = get_clock();
 
     while (m->dirty->len) {
-        vk_back(m, g_ptr_array_index(m->dirty, 0));
+        vk_back(m, g_ptr_array_index(m->dirty, 0), VB_SYNC);
     }
-    vkr_flush(m->r, true);
+    vkr_flush(m->r, false);
     vk_epoch(m);
     m->syncs++;
     m->sync_ns += get_clock() - t0;
@@ -1419,11 +1658,13 @@ static void vk_sync_range(void *opaque, uint64_t off, uint64_t len)
 {
     HD5770Vk *m = opaque;
     int64_t t0 = get_clock();
+    unsigned n = m->dirty->len;
 
-    vk_settle(m, NULL, off, off + len);
-    vkr_flush(m->r, true);
-    vk_epoch(m);
-    m->syncs++;
+    vk_settle(m, NULL, off, off + len, VB_RANGE);
+    if (n != m->dirty->len) {
+        vk_epoch(m);
+    }
+    m->ranges++;
     m->sync_ns += get_clock() - t0;
 }
 
@@ -1439,7 +1680,7 @@ static uint64_t vk_fence(void *opaque)
         VkSurf *e = g_ptr_array_index(m->dirty, i);
 
         if ((e->lo < hi && lo < e->hi) || t0 - e->tdraw >= VK_LAZY_NS) {
-            vk_back(m, e);
+            vk_back(m, e, e->lo < hi && lo < e->hi ? VB_SCANOUT : VB_IDLE);
             i--;
         }
     }
@@ -1477,15 +1718,21 @@ static void vk_stats(void *opaque, GString *out)
     vkr_stats(m->r, out);
     g_string_append_printf(out,
         "vk: vertex stage draws %" PRIu64 " (%" PRIu64 " triangles), others %"
-        PRIu64 " triangles; vertex buffer MB %" PRIu64 "; images %u (%u newer"
-        " than memory, %" PRIu64 " dropped)\n"
-        "vk: loads %" PRIu64 " (%" PRIu64 " MB) write-backs %" PRIu64 " (%"
-        PRIu64 " MB) fences %" PRIu64 " syncs %" PRIu64 "; ms in draws %"
-        PRId64 " in syncs and fences %" PRId64 "\nvk: draws",
+        PRIu64 " triangles; vertex buffer MB %" PRIu64 "; images %u, %" PRIu64
+        " MB (%u newer than memory, %" PRIu64 " dropped)\n"
+        "vk: loads %" PRIu64 " (%" PRIu64 " MB) fences %" PRIu64 " syncs %"
+        PRIu64 " range syncs %" PRIu64 "; ms in draws %" PRId64
+        " in syncs and fences %" PRId64 "\nvk: write-backs",
         m->vs_draws, m->vs_tris, m->tris, m->vb_bytes >> 20, m->surfs->len,
-        m->dirty->len, m->evicted, m->uploads, m->upload_bytes >> 20,
-        m->backs, m->back_bytes >> 20, m->fences, m->syncs,
-        m->draw_ns / 1000000, m->sync_ns / 1000000);
+        vkr_image_bytes(m->r) >> 20, m->dirty->len, m->evicted, m->uploads, m->upload_bytes >> 20,
+        m->fences, m->syncs, m->ranges, m->draw_ns / 1000000,
+        m->sync_ns / 1000000);
+    for (i = 0; i < VB_N; i++) {
+        g_string_append_printf(out, " %s %" PRIu64 " (%" PRIu64 " MB);",
+                               vb_name[i], m->backs[i],
+                               m->back_bytes[i] >> 20);
+    }
+    g_string_append(out, "\nvk: draws");
     for (i = 0; i < VD_N; i++) {
         if (m->nd[i]) {
             g_string_append_printf(out, " %s %" PRIu64 ";", vd_name[i],
@@ -1526,7 +1773,9 @@ static void vk_close(void *opaque)
     g_ptr_array_free(m->surfs, true);
     g_ptr_array_free(m->dirty, true);
     g_hash_table_destroy(m->progs);
-    g_array_free(m->vbs, true);
+    g_hash_table_destroy(m->noted);
+    g_array_free(m->jobs, true);
+    g_hash_table_destroy(m->vbs);
     vkr_close(m->r);
     g_free(m->pgen);
     g_free(m->fail_log);
@@ -1546,6 +1795,7 @@ static const HD5770GpuOps vk_ops = {
     .wrote = vk_wrote,
     .fence = vk_fence,
     .sync_range = vk_sync_range,
+    .prep = vk_prep,
     .depth = true,
     .mipmaps = true,
     .resinfo = true,
@@ -1556,7 +1806,7 @@ static const HD5770GpuOps vk_ops = {
 HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
 {
     const char *base = g_getenv("LOCALAPPDATA");
-    g_autofree char *dir = NULL, *cache = NULL;
+    g_autofree char *dir = NULL;
     g_autofree uint32_t *tab = NULL;
     VkRaster *r;
     HD5770Vk *m;
@@ -1565,9 +1815,8 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     if (base) {
         dir = g_build_filename(base, "qemu-x86-opencore", "hd5770-vk", NULL);
         g_mkdir_with_parents(dir, 0700);
-        cache = g_build_filename(dir, "pipelines.bin", NULL);
     }
-    r = vkr_open(cache, err);
+    r = vkr_open(dir, err);
     if (!r) {
         return NULL;
     }
@@ -1582,9 +1831,15 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     m->surfs = g_ptr_array_new_with_free_func(vk_surf_free);
     m->dirty = g_ptr_array_new();
     m->progs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    m->vbs = g_array_new(false, false, sizeof(VkVb));
+    m->noted = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                     vk_note_free);
+    m->jobs = g_array_new(false, false, sizeof(VkJob));
+    g_array_set_clear_func(m->jobs, vk_job_clear);
+    m->vbs = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     m->pgen = g_new0(uint64_t, (vram_size >> 12) + 1);
     m->epoch = 1;
+    /* twice the card's memory: surfaces are held in several forms */
+    m->limit = MAX(vram_size * 2, 512ull << 20);
     m->pub.ops = &vk_ops;
     m->pub.b = m;
     m->pub.vs_draw = true;
