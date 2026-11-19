@@ -22,6 +22,7 @@
 #include "hw/pci/pci_device.h"
 #include "system/dma.h"
 #include "system/memory.h"
+#include "system/ramblock.h"
 #include "ati_hd5770_int.h"
 #include "ati_hd5770_regs.h"
 #include "trace.h"
@@ -35,7 +36,55 @@ typedef struct MCSpan {
 
 static uint8_t *vram_ptr(ATIHD5770State *s)
 {
-    return memory_region_get_ram_ptr(&s->vram);
+    return s->vram_host;
+}
+
+/*
+ * BUS PAGES. Reads of system memory go through the host memory of the
+ * bus page when it is RAM. A page's host memory is looked up once and
+ * kept until the device's address space changes (bus_gen counts its
+ * commits). Any thread reads; an entry counts when its tag is the same
+ * before and after its host pointer is taken.
+ */
+static uint8_t *bus_page(ATIHD5770State *s, uint64_t addr)
+{
+    uint64_t page = addr >> 12;
+    uint64_t tag = (uint64_t)qatomic_read(&s->bus_gen) << 32 | page;
+    HD5770BusPage *e = &s->bus_pages[page % HD5770_BUS_PAGES];
+    dma_addr_t len = 0x1000;
+    ram_addr_t off;
+    uint8_t *p;
+    bool ram;
+
+    if (page >> 32) {
+        return NULL;
+    }
+    if (qatomic_read(&e->tag) == tag) {
+        p = qatomic_read(&e->host);
+        if (qatomic_read(&e->tag) == tag) {
+            return p;
+        }
+    }
+    p = pci_dma_map(PCI_DEVICE(s), page << 12, &len, DMA_DIRECTION_TO_DEVICE);
+    if (!p) {
+        return NULL;
+    }
+    ram = len == 0x1000 && qemu_ram_block_from_host(p, false, &off);
+    pci_dma_unmap(PCI_DEVICE(s), p, len, DMA_DIRECTION_TO_DEVICE, 0);
+    if (!ram) {
+        return NULL;
+    }
+    qatomic_set(&e->tag, 0);
+    qatomic_set(&e->host, p);
+    qatomic_set(&e->tag, tag);
+    return p;
+}
+
+static void bus_commit(MemoryListener *l)
+{
+    ATIHD5770State *s = container_of(l, ATIHD5770State, bus_listener);
+
+    qatomic_set(&s->bus_gen, s->bus_gen + 1);
 }
 
 /* MC address outside the GART: VRAM inside the FB window, else the bus */
@@ -170,9 +219,15 @@ static void mc_access(ATIHD5770State *s, uint64_t mc, void *buf, unsigned len,
             }
             if (write) {
                 pci_dma_write(PCI_DEVICE(s), sp.addr, p, n);
-            } else if (pci_dma_read(PCI_DEVICE(s), sp.addr, p, n) !=
-                       MEMTX_OK) {
-                memset(p, 0, n);
+            } else {
+                uint8_t *h = bus_page(s, sp.addr);
+
+                if (h && n <= 0x1000 - (sp.addr & 0xfff)) {
+                    memcpy(p, h + (sp.addr & 0xfff), n);
+                } else if (pci_dma_read(PCI_DEVICE(s), sp.addr, p, n) !=
+                           MEMTX_OK) {
+                    memset(p, 0, n);
+                }
             }
         }
         mc += n;
@@ -281,8 +336,14 @@ static uint8_t *gfx_map(void *opaque, uint64_t mc, uint64_t *len, bool write)
         *len = MIN(sp.len, s->vram_size - sp.addr);
         return vram_ptr(s) + sp.addr;
     }
-    /* system memory: one page at a time, released after the draw */
+    /* system memory: one page at a time */
     plen = MIN(sp.len, 0x1000 - (sp.addr & 0xfff));
+    p = write ? NULL : bus_page(s, sp.addr);
+    if (p) {
+        *len = plen;
+        return (uint8_t *)p + (sp.addr & 0xfff);
+    }
+    /* mapped, and released after the draw */
     p = pci_dma_map(PCI_DEVICE(s), sp.addr, &plen,
                     write ? DMA_DIRECTION_FROM_DEVICE
                           : DMA_DIRECTION_TO_DEVICE);
@@ -331,6 +392,20 @@ void ati_hd5770_mc_gfx_init(ATIHD5770State *s)
     s->gfx3d.mem.opaque = s;
     s->gfx3d.mem.map = gfx_map;
     s->gfx3d.mem.dirty = gfx_dirty;
+    s->vram_host = memory_region_get_ram_ptr(&s->vram);
+    s->bus_pages = g_new0(HD5770BusPage, HD5770_BUS_PAGES);
+    s->bus_gen = 1;
+    s->bus_listener.name = "ati-hd5770";
+    s->bus_listener.commit = bus_commit;
+    memory_listener_register(&s->bus_listener,
+                             pci_get_address_space(PCI_DEVICE(s)));
+}
+
+void ati_hd5770_mc_gfx_fini(ATIHD5770State *s)
+{
+    memory_listener_unregister(&s->bus_listener);
+    g_free(s->bus_pages);
+    s->bus_pages = NULL;
 }
 
 /* ---------------------------------------------------------------- */

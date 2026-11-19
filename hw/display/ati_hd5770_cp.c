@@ -762,14 +762,17 @@ static void set_regs(ATIHD5770State *s, unsigned cls, const uint32_t *b,
         uint32_t idx = (b[1] & 0xffff) + (i - 2);
 
         cp_reg_write(s, base + idx * 4, b[i]);
-        if (shadowing) {
-            /* the CP's copy of the register: no wait for draws */
-            uint8_t v[4];
+    }
+    if (shadowing) {
+        /* the CP's copy of the registers: no wait for draws */
+        uint32_t *v = g_new(uint32_t, n - 2);
 
-            stl_le_p(v, b[i]);
-            ati_hd5770_mc_post(s, shadow + idx * 4, v, 4);
-            s->cp.shadow_writes++;
+        for (i = 2; i < n; i++) {
+            v[i - 2] = cpu_to_le32(b[i]);
         }
+        ati_hd5770_mc_post(s, shadow + (b[1] & 0xffff) * 4, v, (n - 2) * 4);
+        g_free(v);
+        s->cp.shadow_writes += n - 2;
     }
     s->cp.set_regs += n - 2;
 }
@@ -791,10 +794,13 @@ static void load_regs(ATIHD5770State *s, unsigned cls, const uint32_t *b,
     for (i = 3; i + 1 < n; i += 2) {
         uint32_t off = b[i] & 0xffff, cnt = b[i + 1] & 0x3fff;
 
+        uint32_t *v = g_new(uint32_t, MAX(cnt, 1));
+
+        ati_hd5770_mc_read(s, mem + off * 4, v, cnt * 4);
         for (j = 0; j < cnt; j++) {
-            cp_reg_write(s, base + (off + j) * 4,
-                         ati_hd5770_mc_rd32(s, mem + (off + j) * 4));
+            cp_reg_write(s, base + (off + j) * 4, le32_to_cpu(v[j]));
         }
+        g_free(v);
         s->cp.load_regs += cnt;
     }
 }
@@ -1001,6 +1007,7 @@ static int cp_type3_op(ATIHD5770State *s, const uint32_t *b, uint32_t n,
         ib->base = addr40(b[1], b[2], 3);
         ib->size = b[3] & 0xfffff;
         ib->pos = 0;
+        s->cp_win_n = 0;
         s->cp.ibs++;
         return PKT_IB;
     }
@@ -1277,6 +1284,27 @@ static void rptr_writeback(ATIHD5770State *s)
     s->cp.rptr_wb++;
 }
 
+/*
+ * n dwords at pos of an indirect buffer: fetched a window at a time, as
+ * the buffer was when the window was read
+ */
+static const uint32_t *ib_words(ATIHD5770State *s, const HD5770Stream *ib,
+                                uint32_t pos, uint32_t n)
+{
+    if (n > HD5770_CP_WIN) {
+        fetch(s, ib->base, pos, 0, n, s->cp_pkt);
+        return s->cp_pkt;
+    }
+    if (s->cp_win_base != ib->base || pos < s->cp_win_pos ||
+        pos + n > s->cp_win_pos + s->cp_win_n) {
+        s->cp_win_base = ib->base;
+        s->cp_win_pos = pos;
+        s->cp_win_n = MIN(ib->size - pos, HD5770_CP_WIN);
+        fetch(s, ib->base, pos, 0, s->cp_win_n, s->cp_win);
+    }
+    return s->cp_win + (pos - s->cp_win_pos);
+}
+
 /* the innermost indirect buffer until it ends, stalls or nests */
 static int ib_step(ATIHD5770State *s)
 {
@@ -1288,7 +1316,7 @@ static int ib_step(ATIHD5770State *s)
     if (ib->pos >= ib->size) {
         return PKT_END;
     }
-    fetch(s, ib->base, ib->pos, 0, 1, &h);
+    h = *ib_words(s, ib, ib->pos, 1);
     n = pkt_len(h);
     if (!n) {
         s->cp.bad_header++;
@@ -1299,8 +1327,7 @@ static int ib_step(ATIHD5770State *s)
         s->cp.ib_overrun++;
         return PKT_END;
     }
-    fetch(s, ib->base, ib->pos, 0, n, s->cp_pkt);
-    r = cp_exec(s, s->cp_pkt, n, level, &skip);
+    r = cp_exec(s, ib_words(s, ib, ib->pos, n), n, level, &skip);
     if (r == PKT_STALL) {
         return r;
     }
@@ -1898,6 +1925,7 @@ void ati_hd5770_cp_reset(ATIHD5770State *s)
     s->cp_rptr = 0;
     s->cp_skip = 0;
     s->cp_depth = 0;
+    s->cp_win_n = 0;
     s->cp_stalled = false;
     s->cp_running = false;
     s->cp_load_ctl = 0;
@@ -1958,6 +1986,7 @@ static uint64_t gpu_written_cb(void *opaque, uint64_t off)
             bits |= 1ull << i;
         }
     }
+    RCU_READ_LOCK_GUARD();
     for (i = 0; i < n; i++) {
         if (physical_memory_get_dirty_flag(ram + off + (i << 12),
                                            DIRTY_MEMORY_VGA)) {
@@ -2045,6 +2074,7 @@ void ati_hd5770_cp_init(ATIHD5770State *s)
     s->gfx = g_new0(uint32_t, HD5770_GFX_DWORDS);
     s->gfx_dwords = HD5770_GFX_DWORDS;
     s->cp_pkt = g_new0(uint32_t, HD5770_CP_MAX_PKT);
+    s->cp_win = g_new0(uint32_t, HD5770_CP_WIN);
     s->cp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cp_timer_cb, s);
     s->alu_const = g_new0(uint32_t, HD5770_ALU_CONST_DWORDS);
     s->alu_const_dwords = HD5770_ALU_CONST_DWORDS;
@@ -2117,8 +2147,11 @@ void ati_hd5770_cp_fini(ATIHD5770State *s)
     s->cp_timer = NULL;
     g_free(s->gfx);
     s->gfx = NULL;
+    ati_hd5770_mc_gfx_fini(s);
     g_free(s->cp_pkt);
     s->cp_pkt = NULL;
+    g_free(s->cp_win);
+    s->cp_win = NULL;
     hd5770_gfx_fini(&s->gfx3d);
     g_free(s->gfx_stats);
     g_free(s->alu_const);

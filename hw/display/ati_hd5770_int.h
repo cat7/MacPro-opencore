@@ -74,6 +74,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIHD5770State, ATI_HD5770)
 #define HD5770_UCODE_DWORDS             2048
 #define HD5770_CP_MAX_PKT               (0x4000 + 2)
 #define HD5770_CP_IB_LEVELS             2
+#define HD5770_CP_WIN                   4096
 #define HD5770_CENSUS_SLOTS             32
 
 /* a command stream the CP is inside: an indirect buffer */
@@ -114,6 +115,14 @@ typedef struct HD5770Map {
     dma_addr_t len;
     bool write;
 } HD5770Map;
+
+/* the host memory of a bus page of RAM; tag: bus_gen << 32 | page */
+typedef struct HD5770BusPage {
+    uint64_t tag;
+    uint8_t *host;
+} HD5770BusPage;
+
+#define HD5770_BUS_PAGES                16384
 
 typedef struct HD5770MCStats {
     uint64_t gart, gart_invalid, tlb_inval, fault_reads, fault_writes;
@@ -264,6 +273,10 @@ struct ATIHD5770State {
     uint32_t cp_load_ctl, cp_shadow_ctl;
     uint64_t cp_shadow_base[8]; /* LOAD_* bases: config .. ctl const */
     uint32_t *cp_pkt;
+    /* dwords cp_win_pos.. of the indirect buffer at cp_win_base, fetched */
+    uint32_t *cp_win;
+    uint64_t cp_win_base;
+    uint32_t cp_win_pos, cp_win_n;
     uint64_t gpu_clock_capture;
     QEMUTimer *cp_timer;        /* re-polls stalled waits */
     /*
@@ -334,6 +347,11 @@ struct ATIHD5770State {
     uint32_t alu_const_dwords;
     HD5770Map *maps;
     uint32_t n_maps, max_maps;
+    uint8_t *vram_host;
+    /* BUS PAGES in ati_hd5770_mc.c */
+    MemoryListener bus_listener;
+    uint32_t bus_gen;
+    HD5770BusPage *bus_pages;
 };
 
 /* ati_hd5770.c */
@@ -378,6 +396,7 @@ void ati_hd5770_mc_wr32(ATIHD5770State *s, uint64_t mc, uint32_t val);
 void ati_hd5770_mc_wr64(ATIHD5770State *s, uint64_t mc, uint64_t val);
 bool ati_hd5770_mc_reg_write(ATIHD5770State *s, uint32_t off, uint32_t val);
 void ati_hd5770_mc_gfx_init(ATIHD5770State *s);
+void ati_hd5770_mc_gfx_fini(ATIHD5770State *s);
 void ati_hd5770_hdp_init(ATIHD5770State *s);
 void ati_hd5770_hdp_update(ATIHD5770State *s);
 void ati_hd5770_mc_unmap_all(ATIHD5770State *s);
