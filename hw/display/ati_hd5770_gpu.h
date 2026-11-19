@@ -520,6 +520,8 @@ typedef struct HD5770NatKey {
      * are: the function reads them (Apple GPUs)
      */
     bool keep;
+    /* the alpha test is on (GLSL: a function without it discards less) */
+    bool atest;
 } HD5770NatKey;
 const char *hd5770_msl_alu(void);
 char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k);

@@ -1650,6 +1650,7 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
     GString *o;
     unsigned i, j, ng = MAX(ir->ngpr, 1u);
     uint32_t iflat = 0, ivar = 0, flat;
+    bool kills = false;
     size_t from;
 
     if (ir->vs || k->ninputs > 32 || ir->nres > HD5770_GPU_TEX ||
@@ -1855,14 +1856,28 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
             "        killed = killed || ((words[uo + %uu] >> idx) & 1u) == 0u;\n"
             "    }\n", HD5770_NU_CR, HD5770_NU_CLIPRULE);
     }
-    /* shade(): the alpha test reads export 0 */
-    g_string_append_printf(o,
-        "    if (killed || %s ||\n"
-        "        ((cm & 1u) != 0u && !hd_nalpha(words[uo + %uu], F(words[uo + %uu]),"
-        " F(C[0][3])))) {\n"
-        "        discard;\n"
-        "    }\n", k->ncol ? "cm == 0u" : "(cm & 1u) == 0u", HD5770_NU_AFUNC,
-        HD5770_NU_AREF);
+    /*
+     * shade(): the alpha test reads export 0. A function that cannot
+     * discard leaves the host its early depth test.
+     */
+    for (i = 0; i < ir->ninsts; i++) {
+        kills |= ir->insts[i].kill;
+    }
+    if (k->atest) {
+        g_string_append_printf(o,
+            "    if (killed || %s ||\n"
+            "        ((cm & 1u) != 0u && !hd_nalpha(words[uo + %uu], F(words[uo + %uu]),"
+            " F(C[0][3])))) {\n"
+            "        discard;\n"
+            "    }\n", k->ncol ? "cm == 0u" : "(cm & 1u) == 0u",
+            HD5770_NU_AFUNC, HD5770_NU_AREF);
+    } else if (kills || ir->cf || k->clip ||
+               !(k->ncol ? ir->cmask : ir->cmask & 1)) {
+        g_string_append_printf(o,
+            "    if (killed || %s) {\n"
+            "        discard;\n"
+            "    }\n", k->ncol ? "cm == 0u" : "(cm & 1u) == 0u");
+    }
     for (i = 0; i < MAX(k->ncol, 1u); i++) {
         unsigned cb = k->ncol ? k->col[i].cb & 7 : 0;
         unsigned out = k->ncol ? k->col[i].out : k->out;

@@ -1548,6 +1548,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     k.zexp = hasz && !zclear && d->zexport && ir->zexport;
     k.zout = hasz && !zclear && (k.zexp ||
                                !(d->zmin <= 0.0f && d->zmax >= 1.0f));
+    k.atest = d->alpha_test;
     k.ninputs = d->ninputs;
     k.pos_gpr = d->pos_gpr >= 0 && d->pos_gpr < 127 ? d->pos_gpr : -1;
     k.flat = d->flat;
@@ -1575,10 +1576,10 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     }
     flat = hd5770_glsl_native_flat(ir, &k);
     key = g_string_new(NULL);
-    g_string_printf(key, "f%016" PRIx64 "/%u/%u/%d/%08x/%u%u%u%u/%u%u%u/%u%u/%x",
+    g_string_printf(key, "f%016" PRIx64 "/%u/%u/%d/%08x/%u%u%u%u/%u%u%u/%u%u%u/%x",
                     ir->hash, ir->ninsts, k.ninputs, k.pos_gpr, k.flat,
                     k.rt_src[0], k.rt_src[1], k.rt_src[2], k.rt_src[3], k.out,
-                    k.rt_comps, k.clip, k.zout, k.zexp, padded);
+                    k.rt_comps, k.clip, k.zout, k.zexp, k.atest, padded);
     for (i = 0; i < d->ntex; i++) {
         g_string_append_printf(key, ".%u.%u", k.dim[i], k.nsl[i]);
     }
