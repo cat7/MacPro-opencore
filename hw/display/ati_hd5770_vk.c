@@ -87,6 +87,7 @@ typedef struct VkSurf {
     bool loaded, dirty;
     int r[4];                   /* drawn and not written back */
     uint64_t gen, epoch, used;
+    uint64_t settled;           /* HD5770Vk.drawn when it last settled */
     uint64_t flight;            /* the ticket that writes it back */
     bool flying;                /* in HD5770Vk.flying */
     int64_t tdraw;
@@ -97,6 +98,7 @@ typedef struct VkSurf {
 typedef struct VkVb {
     uint64_t voff, gen, epoch;
     uint32_t len, off;
+    uint8_t *seen;              /* the bytes as copied */
 } VkVb;
 
 /* buffers one thread works in */
@@ -119,6 +121,18 @@ typedef struct VkTicket {
     VkrMark *mark;
     GArray *backs;
 } VkTicket;
+
+/* what a draw's stages depend on, and the stages */
+typedef struct VkPair {
+    struct {
+        uint64_t ps, vs;        /* the programs' hashes */
+        uint32_t ps_n, vs_n, padded, has_vs;
+        HD5770NatKey k;
+        int32_t src[HD5770_GPU_INPUTS];
+    } key;
+    VkrShader *fs, *vsh;
+    uint32_t flat;
+} VkPair;
 
 typedef struct VkNote {
     unsigned stage;
@@ -150,11 +164,14 @@ typedef struct HD5770Vk {
     VkSurf *hb[VK_HASH];        /* the images by where they start */
     uint64_t limit;             /* device memory the images may take */
     GHashTable *progs;          /* key -> VkrShader, or vk_fail */
+    GHashTable *pairs;          /* VkPair by its key */
+    uint64_t drawn;             /* counts the images that became dirty */
     /* build ahead: stages to compile (key -> VkNote), pipelines to build */
     GHashTable *noted;
     GArray *jobs;
     bool dry;
     uint64_t *pgen, gen, epoch, seq, failed;
+    uint64_t *pulled;           /* per 64 pages: the epoch of the last pull */
     char *fail_log;
     char last_surf[160];        /* the last surface without an image */
     GHashTable *vbs;            /* VRAM offset -> VkVb */
@@ -307,6 +324,11 @@ static void vk_pull(HD5770Vk *m, uint64_t lo, uint64_t hi)
         return;
     }
     for (c = lo & ~0x3ffffull; c < hi; c += 0x40000) {
+        /* the log is asked once an epoch */
+        if (m->pulled[c >> 18] == m->epoch) {
+            continue;
+        }
+        m->pulled[c >> 18] = m->epoch;
         bits = m->pub.written(m->pub.opaque, c);
         if (!bits) {
             continue;
@@ -504,9 +526,12 @@ static void vk_ready(HD5770Vk *m, VkSurf *e)
     bool diff = !e->loaded;
 
     e->used = m->seq;
-    for (l = 0; l < e->nlv && !e->lv[l].space; l++) {
+    /* no image became dirty since it settled: none lies over it */
+    for (l = 0; l < e->nlv && !e->lv[l].space && e->settled != m->drawn;
+         l++) {
         vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
     }
+    e->settled = m->drawn;
     if (e->dirty || e->flight > qatomic_read(&m->retired) ||
         (e->epoch == m->epoch && e->loaded)) {
         return;
@@ -755,6 +780,7 @@ static void vk_drew(HD5770Vk *m, VkSurf *e, int x0, int y0, int x1, int y1)
 {
     if (!e->dirty) {
         e->dirty = true;
+        m->drawn++;
         e->r[0] = x0;
         e->r[1] = y0;
         e->r[2] = x1;
@@ -981,6 +1007,23 @@ static void vk_sampler(const HD5770GpuTex *t, bool mip, unsigned last,
     }
 }
 
+static guint vk_pair_hash(gconstpointer p)
+{
+    const uint8_t *b = p;
+    guint h = 2166136261u;
+    size_t i;
+
+    for (i = 0; i < sizeof(((VkPair *)0)->key); i++) {
+        h = (h ^ b[i]) * 16777619u;
+    }
+    return h;
+}
+
+static gboolean vk_pair_equal(gconstpointer a, gconstpointer b)
+{
+    return !memcmp(a, b, sizeof(((VkPair *)0)->key));
+}
+
 /* build ahead: the stage of the key is known, or noted */
 static bool vk_noted(HD5770Vk *m, const char *key)
 {
@@ -1028,6 +1071,14 @@ static VkrShader *vk_prog(HD5770Vk *m, const char *key, unsigned stage,
     return s;
 }
 
+static void vk_vb_free(gpointer p)
+{
+    VkVb *c = p;
+
+    g_free(c->seen);
+    g_free(c);
+}
+
 /* no page of VRAM [lo, hi) was written after generation gen */
 static bool vk_unwritten(HD5770Vk *m, uint64_t lo, uint64_t hi, uint64_t gen)
 {
@@ -1064,7 +1115,10 @@ static uint32_t vk_vb(HD5770Vk *m, const HD5770GpuSurf *b, uint32_t len)
         }
         if (c && c->len >= len &&
             (c->epoch == m->epoch || !len ||
-             vk_unwritten(m, c->voff, c->voff + c->len, c->gen))) {
+             vk_unwritten(m, c->voff, c->voff + c->len, c->gen) ||
+             !memcmp(c->seen, m->vram + c->voff, c->len))) {
+            /* written or not, the bytes are the ones copied */
+            c->gen = c->epoch == m->epoch ? c->gen : m->gen;
             c->epoch = m->epoch;
             return c->off;
         }
@@ -1087,7 +1141,9 @@ static uint32_t vk_vb(HD5770Vk *m, const HD5770GpuSurf *b, uint32_t len)
         c->epoch = m->epoch;
         c->len = len;
         c->off = off * 4;
-        memcpy(p, m->vram + b->voff, len);
+        c->seen = g_realloc(c->seen, len);
+        memcpy(c->seen, m->vram + b->voff, len);
+        memcpy(p, c->seen, len);
         m->vb_bytes += len;
         return c->off;
     }
@@ -1116,8 +1172,9 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
 {
     const HD5770IR *ir = d->ir;
     const HD5770GpuVs *v = d->vs;
-    HD5770NatKey k = { 0 };
+    HD5770NatKey k;
     VkrDraw q = { 0 };
+    VkPair *pr, sk;
     struct {
         const HD5770GpuSurf *surf;
         VkSurf *e;
@@ -1138,6 +1195,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     size_t need;
 
     m->seq++;
+    memset(&k, 0, sizeof(k));
     if (d->resolve) {
         return vk_decline(m, VD_RESOLVE, HD5770_WHY_BK_NATIVE_STATE);
     }
@@ -1414,6 +1472,24 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
         k.rt_src[i] = tg[0].src[i];
     }
     VK_PART(VP_IMAGES);
+    memset(&sk, 0, sizeof(sk));
+    sk.key.ps = ir->hash;
+    sk.key.ps_n = ir->ninsts;
+    sk.key.padded = padded;
+    memcpy(&sk.key.k, &k, sizeof(k));
+    if (v) {
+        sk.key.has_vs = 1;
+        sk.key.vs = v->ir->hash;
+        sk.key.vs_n = v->ir->ninsts;
+        memcpy(sk.key.src, v->src, k.ninputs * sizeof(int32_t));
+    }
+    pr = m->dry ? NULL : g_hash_table_lookup(m->pairs, &sk.key);
+    if (pr) {
+        q.fs = pr->fs;
+        q.vs = pr->vsh;
+        flat = pr->flat;
+        goto staged;
+    }
     flat = hd5770_glsl_native_flat(ir, &k);
     key = g_string_new(NULL);
     g_string_printf(key, "f%016" PRIx64 "/%u/%u/%d/%08x/%u%u%u%u/%u%u%u/%u%u/%x",
@@ -1491,6 +1567,12 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     if (!q.vs) {
         return vk_decline(m, v ? VD_VS : VD_PROG_BUILD, HD5770_WHY_BK_PROG);
     }
+    pr = g_memdup2(&sk, sizeof(sk));
+    pr->fs = q.fs;
+    pr->vsh = q.vs;
+    pr->flat = flat;
+    g_hash_table_insert(m->pairs, &pr->key, pr);
+staged:
     VK_PART(VP_STAGES);
     for (i = 0; i < d->ntex; i++) {
         vk_ready(m, ts[i]);
@@ -1989,10 +2071,12 @@ static void vk_close(void *opaque)
     g_array_free(m->backs, true);
     g_hash_table_destroy(m->progs);
     g_hash_table_destroy(m->noted);
+    g_hash_table_destroy(m->pairs);
     g_array_free(m->jobs, true);
     g_hash_table_destroy(m->vbs);
     vkr_close(m->r);
     g_free(m->pgen);
+    g_free(m->pulled);
     g_free(m->fail_log);
     g_free(m->sc.tmp);
     g_free(m->sc.offs);
@@ -2056,9 +2140,14 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     m->progs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     m->noted = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                      vk_note_free);
+    m->pairs = g_hash_table_new_full(vk_pair_hash, vk_pair_equal, NULL,
+                                     g_free);
+    m->drawn = 1;
     m->jobs = g_array_new(false, false, sizeof(VkJob));
     g_array_set_clear_func(m->jobs, vk_job_clear);
-    m->vbs = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+    m->vbs = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL,
+                                   vk_vb_free);
+    m->pulled = g_new0(uint64_t, (vram_size >> 18) + 1);
     m->pgen = g_new0(uint64_t, (vram_size >> 12) + 1);
     m->epoch = 1;
     /* twice the card's memory: surfaces are held in several forms */
