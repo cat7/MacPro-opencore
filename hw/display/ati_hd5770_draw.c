@@ -457,6 +457,13 @@ static void wpend_add(HD5770Gfx *g, uint64_t lo, uint64_t hi)
     g->wpend[at][1] = MAX(g->wpend[at][1], hi);
 }
 
+struct HD5770DrawMem {
+    Draw *d;
+    HD5770GpuDraw *q;
+    HD5770Val (*kc[16])[4];
+    uint64_t *kc_ok[16];
+};
+
 static void gpu_lock(HD5770Gfx *g, bool on)
 {
     if (g->lock) {
@@ -2031,8 +2038,15 @@ static void kcache_vs(void *opaque, unsigned buf, unsigned idx,
     hd5770_mem_read(&d->g->mem, base + idx * 16ull, v, 16);
     if (buf < 16 && idx < KC_MAX) {
         if (!d->kc_ok[buf]) {
-            d->kc_ok[buf] = g_new0(uint64_t, KC_MAX / 64);
-            d->kc[buf] = g_malloc(KC_MAX * sizeof(*d->kc[buf]));
+            struct HD5770DrawMem *dm = d->g->dm;
+
+            if (!dm->kc[buf]) {
+                dm->kc_ok[buf] = g_new(uint64_t, KC_MAX / 64);
+                dm->kc[buf] = g_malloc(KC_MAX * sizeof(*dm->kc[buf]));
+            }
+            d->kc_ok[buf] = dm->kc_ok[buf];
+            d->kc[buf] = dm->kc[buf];
+            memset(d->kc_ok[buf], 0, KC_MAX / 8);
         }
         memcpy(d->kc[buf][idx], v, 16);
         d->kc_ok[buf][idx / 64] |= 1ull << (idx % 64);
@@ -2045,8 +2059,6 @@ static void kcache_drop(Draw *d)
     unsigned k;
 
     for (k = 0; k < 16; k++) {
-        g_free(d->kc_ok[k]);
-        g_free(d->kc[k]);
         d->kc_ok[k] = NULL;
         d->kc[k] = NULL;
     }
@@ -3755,7 +3767,6 @@ static void gpu_req_free(HD5770GpuDraw *q)
     g_free((void *)q->zs.pages);
     g_free((void *)q->ss.pages);
     g_free((void *)q->rs.pages);
-    g_free(q);
 }
 
 /*
@@ -4451,7 +4462,8 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
             }
         }
     }
-    q = g_new0(HD5770GpuDraw, 1);
+    q = g->dm->q;
+    memset(q, 0, sizeof(*q));
     if (d->color && !gpu_surf(g, &d->rt, true, &q->rt)) {
         GPU_FB(d, GFB_RT, HD5770_WHY_RT_SURF);
         goto out;
@@ -5456,7 +5468,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         return;
     }
     /* the textures are set up when first used */
-    d = g_malloc(sizeof(Draw));
+    d = g->dm->d;
     memset(d, 0, offsetof(Draw, tex));
     memset((uint8_t *)d + offsetof(Draw, tex_key), 0,
            sizeof(Draw) - offsetof(Draw, tex_key));
@@ -5820,8 +5832,6 @@ out:
         hd5770_prog_free(d->ahead_prog[i]);
     }
     g_free(d->kv);
-    kcache_drop(d);
-    g_free(d);
     st->ns += get_clock() - t0;
 }
 
@@ -5846,6 +5856,9 @@ void hd5770_gfx_init(HD5770Gfx *g)
         unorm8[i] = i / (float)((1u << 8) - 1);
     }
     g->cache = g_new0(HD5770ShaderCache, 1);
+    g->dm = g_new0(struct HD5770DrawMem, 1);
+    g->dm->d = g_malloc(sizeof(Draw));
+    g->dm->q = g_new(HD5770GpuDraw, 1);
 }
 
 void hd5770_gfx_fini(HD5770Gfx *g)
@@ -5877,6 +5890,14 @@ void hd5770_gfx_fini(HD5770Gfx *g)
     }
     g_free(g->cache);
     g->cache = NULL;
+    for (b = 0; b < 16; b++) {
+        g_free(g->dm->kc[b]);
+        g_free(g->dm->kc_ok[b]);
+    }
+    g_free(g->dm->d);
+    g_free(g->dm->q);
+    g_free(g->dm);
+    g->dm = NULL;
 }
 
 static const char *const skip_names[HD5770_SKIP_MAX] = {

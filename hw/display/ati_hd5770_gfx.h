@@ -339,6 +339,8 @@ typedef struct HD5770Gfx {
     HD5770Mem mem;
     HD5770GfxStats *st;
     HD5770ShaderCache *cache;
+    /* what every draw allocates, kept from one draw to the next */
+    struct HD5770DrawMem *dm;
     /* host GPU backend (ati_hd5770_gpu.h), NULL for none */
     HD5770Gpu *gpu;
     int gpu_mode;
