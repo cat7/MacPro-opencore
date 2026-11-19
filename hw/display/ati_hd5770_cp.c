@@ -2013,8 +2013,19 @@ static void gpu_open(ATIHD5770State *s)
          : hd5770_mtl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
                            &err);
 #elif defined(CONFIG_WIN32)
-    gp = hd5770_gl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
-                        &err);
+#ifdef CONFIG_ATI_HD5770_VK
+    if (strcmp(mode, "verify")) {
+        gp = hd5770_vk_open(memory_region_get_ram_ptr(&s->vram),
+                            s->vram_size, &err);
+        if (!gp) {
+            warn_report("ati-hd5770: no Vulkan renderer: %s", err);
+        }
+    }
+#endif
+    if (!gp) {
+        gp = hd5770_gl_open(memory_region_get_ram_ptr(&s->vram),
+                            s->vram_size, &err);
+    }
 #endif
     if (!gp) {
         warn_report("ati-hd5770: gpu=%s: %s; drawing on the CPU", mode, err);
@@ -2023,7 +2034,7 @@ static void gpu_open(ATIHD5770State *s)
     gp->done = gpu_done_cb;
     gp->done_ram = gpu_done_ram_cb;
     gp->opaque = s;
-    if (!strcmp(mode, "native")) {
+    if (gp->ops->native) {
         s->gpu_wlog = g_malloc0((s->vram_size >> 12) + 1);
         gp->written = gpu_written_cb;
     }
