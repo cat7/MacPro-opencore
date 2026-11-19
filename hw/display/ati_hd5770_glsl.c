@@ -4,10 +4,12 @@
  *
  * The library texts are the port of hd5770_msl_lib (ati_hd5770_msl.c):
  * as functions, what the CPU path computes. Every float operation is
- * precise and rounded as the CPU path rounds it: division and square
- * root are corrected to the IEEE result through doubles, and a * b + c
- * is fused only where the CPU path's compiler fuses it (HD_FUSED: on
- * AArch64 hosts, not on x86, whose build has no FMA).
+ * precise and rounded as the CPU path rounds it: a * b + c is fused only
+ * where the CPU path's compiler fuses it (HD_FUSED: on AArch64 hosts,
+ * not on x86, whose build has no FMA), and in a vertex stage division,
+ * square root, exp2 and log2 are corrected to the IEEE result through
+ * doubles (HD_EXACT). A fragment stage takes the host's: doubles cost a
+ * full-screen pass milliseconds.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -127,6 +129,7 @@ static const char glsl_arith[] =
 "        }\n"
 "        return hd_isnan(q) ? F(0xffc00000u) : q;\n"
 "    }\n"
+"#if HD_EXACT\n"
 "    {\n"
 "        double da = abs(double(a)), db = abs(double(b));\n"
 "        float m = aq;\n"
@@ -146,6 +149,9 @@ static const char glsl_arith[] =
 "        }\n"
 "        return ((U(a) ^ U(b)) & 0x80000000u) != 0u ? -m : m;\n"
 "    }\n"
+"#else\n"
+"    return q;\n"
+"#endif\n"
 "}\n"
 "\n"
 "/* sqrt correctly rounded */\n"
@@ -156,6 +162,7 @@ static const char glsl_arith[] =
 "    if (!(a > 0.0) || a > FLT_MAX || ((U(a) >> 23) & 0xffu) == 0u) {\n"
 "        return a == 0.0 ? a : (a > 0.0 ? s : (hd_isnan(a) ? a : F(0xffc00000u)));\n"
 "    }\n"
+"#if HD_EXACT\n"
 "    {\n"
 "        double da = double(a);\n"
 "\n"
@@ -173,6 +180,7 @@ static const char glsl_arith[] =
 "            }\n"
 "        }\n"
 "    }\n"
+"#endif\n"
 "    return s;\n"
 "}\n"
 "\n"
@@ -180,6 +188,7 @@ static const char glsl_arith[] =
 " * arguments (the driver's are approximations) */\n"
 "float hd_exp2(float a)\n"
 "{\n"
+"#if HD_EXACT\n"
 "    if (hd_isnan(a) || a < -151.0 || a >= 128.0) {\n"
 "        return exp2(a);\n"
 "    }\n"
@@ -199,10 +208,14 @@ static const char glsl_arith[] =
 "    p = p * t + 1.0LF;\n"
 "    p = p * t + 1.0LF;\n"
 "    return float(ldexp(p, int(n)));\n"
+"#else\n"
+"    return exp2(a);\n"
+"#endif\n"
 "}\n"
 "\n"
 "float hd_log2(float a)\n"
 "{\n"
+"#if HD_EXACT\n"
 "    if (hd_isnan(a) || a <= 0.0 || isinf(a)) {\n"
 "        return log2(a);\n"
 "    }\n"
@@ -227,6 +240,9 @@ static const char glsl_arith[] =
 "    q = q * z + 1.0LF / 3.0LF;\n"
 "    q = q * z + 1.0LF;\n"
 "    return float(double(e) + 2.0LF * s * q * 1.44269504088896340736LF);\n"
+"#else\n"
+"    return log2(a);\n"
+"#endif\n"
 "}\n"
 "\n"
 "/* float pairs (hi, lo) */\n"
@@ -1184,10 +1200,14 @@ static void vs_body(GString *o, const HD5770IR *ir)
  * stage, laid out as glsl_vs_lib reads it, the set-up from word
  * HD5770_NV_X on.
  */
-static void nat_head(GString *o, bool formats)
+/*
+ * exact: division, square root, exp2 and log2 rounded as the CPU path's,
+ * through doubles; a vertex stage's positions must be the CPU path's
+ */
+static void nat_head(GString *o, bool formats, bool exact)
 {
     g_string_append_printf(o,
-        "#version 450\n#define HD_FUSED %d\n"
+        "#version 450\n#define HD_FUSED %d\n#define HD_EXACT %d\n"
         "layout(std430, set = 0, binding = 0) readonly buffer Words { uint words[]; };\n"
         "layout(std430, set = 0, binding = 1) readonly buffer Tables {"
         " uint hd_u8[256]; uint hd_fmt_bits[]; };\n"
@@ -1196,7 +1216,8 @@ static void nat_head(GString *o, bool formats)
         "#define F(x) uintBitsToFloat(x)\n"
         "#define U(x) floatBitsToUint(x)\n"
         "#define I(x) int(x)\n"
-        "#define FLT_MAX uintBitsToFloat(0x7f7fffffu)\n", HD5770_GLSL_FUSED);
+        "#define FLT_MAX uintBitsToFloat(0x7f7fffffu)\n", HD5770_GLSL_FUSED,
+        exact);
     g_string_append(o, glsl_arith);
     if (formats) {
         g_string_append(o, glsl_formats);
@@ -1318,7 +1339,7 @@ char *hd5770_glsl_native_pvs(unsigned ninputs, uint32_t flat)
     GString *o = g_string_new(NULL);
     unsigned i;
 
-    nat_head(o, false);
+    nat_head(o, false, true);
     nat_io(o, ninputs, flat, true);
     g_string_append_printf(o,
         "void main()\n{\n"
@@ -1359,7 +1380,7 @@ char *hd5770_glsl_native_vs(const HD5770IR *ir, unsigned ninputs,
         }
     }
     o = g_string_new(NULL);
-    nat_head(o, true);
+    nat_head(o, true, true);
     g_string_append(o, glsl_vs_lib);
     nat_io(o, ninputs, flat, true);
     from = o->len;
@@ -1678,7 +1699,7 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
     }
     flat = k->flat | iflat;
     o = g_string_new(NULL);
-    nat_head(o, false);
+    nat_head(o, false, false);
     if (bary) {
         g_string_insert(o, strchr(o->str, '\n') + 1 - o->str,
             "#extension GL_EXT_fragment_shader_barycentric : require\n");
