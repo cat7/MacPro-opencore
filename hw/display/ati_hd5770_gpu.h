@@ -453,10 +453,6 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask);
  * in ati_hd5770_msl.c
  */
 char *hd5770_msl_vs_program(const HD5770IR *ir);
-/* the same as a GLSL compute shader (ati_hd5770_glsl.c) */
-char *hd5770_glsl_vs_program(const HD5770IR *ir);
-/* pass B, the triangle set-up, as a GLSL compute shader */
-char *hd5770_glsl_setup_program(void);
 /* the triangle set-up and box drawing of the vertex stage */
 extern const char hd5770_msl_setup[];
 extern const char hd5770_msl_lib[];
@@ -466,12 +462,8 @@ extern const char hd5770_msl_lib[];
  * text common to MSL and GLSL (ati_hd5770_emit.c, which lists the
  * macros the backend defines first)
  */
-/*
- * straight: a program without loops or calls becomes straight code (NVIDIA's
- * GL linker takes much longer over it; Metal runs it faster)
- */
-void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
-                    bool straight);
+/* a program without loops or calls becomes straight code */
+void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask);
 
 /*
  * The native pipeline (macOS, ati_hd5770_mtlr.m): draws go through the
@@ -586,13 +578,7 @@ char *hd5770_glsl_native_vs(const HD5770IR *ir, unsigned ninputs,
 HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size,
                           const char **err);
 
-/* GLSL (ati_hd5770_glsl.c): a program, and the library alone */
-char *hd5770_glsl_program(const HD5770IR *ir);
-/* the same for draws whose texture units in mipmask are mipmapped */
-char *hd5770_glsl_program_mip(const HD5770IR *ir, uint32_t mipmask);
-char *hd5770_glsl_lib_only(void);
-/* the tables storage buffer 7 holds; the words needed if n is too small */
+/* the words of the tables buffer; the number needed if n is too small */
 size_t hd5770_glsl_tables(uint32_t *out, size_t n);
-extern const char hd5770_glsl_lib[];
 
 #endif

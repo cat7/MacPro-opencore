@@ -2529,7 +2529,7 @@ char *hd5770_msl_program_mip(const HD5770IR *ir, uint32_t mipmask)
             "#define HD_OUTB(n) thread bool &n\n"
             "#define HD_OUTU(n) thread uint &n\n"
             "#define HD_OUTC(n) thread uint (&n)[8][4]\n");
-        hd5770_emit_cf(o, ir, mipmask, true);
+        hd5770_emit_cf(o, ir, mipmask);
     }
     g_string_append(o,
         "/* the pixel (x, y) of triangle t: false if t does not cover it */\n"
@@ -3646,7 +3646,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             "#define HD_OUTU(n) thread uint &n\n"
             "#define HD_OUTC(n) thread uint (&n)[8][4]\n",
             k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr ? k->pos_gpr : -1);
-        hd5770_emit_cf(o, ir, 0, true);
+        hd5770_emit_cf(o, ir, 0);
     }
     if (k->zout || k->ncol) {
         g_string_append(o, "struct NO {\n");

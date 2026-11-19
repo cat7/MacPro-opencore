@@ -542,11 +542,11 @@ static bool e_linear(const HD5770IR *ir)
 
 /* the state machine of one function */
 static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
-                   const int *pidx, bool straight)
+                   const int *pidx)
 {
     unsigned i, j, ng = MAX(ir->ngpr, 1u);
     GString *fh = g_string_new(NULL), *ob = g_string_new(NULL);
-    bool lin = straight && e_linear(ir);
+    bool lin = e_linear(ir);
 
     g_string_append(fh, "        if (fq >= 0) {\n");
 
@@ -798,8 +798,7 @@ static void e_body(GString *o, const HD5770IR *ir, uint32_t mipmask, bool main,
     g_string_free(ob, true);
 }
 
-void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
-                    bool straight)
+void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask)
 {
     int *pidx = g_new(int, ir->nfetches + 1);
     unsigned i, np = 0;
@@ -823,7 +822,7 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
             "        seen[i] = false;\n"
             "        rec[i][0] = 0u;\n        rec[i][1] = 0u;\n        rec[i][2] = 0u;\n"
             "        rec[i][3] = 0u;\n    }\n", np, np, np);
-        e_body(o, ir, mipmask, false, pidx, straight);
+        e_body(o, ir, mipmask, false, pidx);
         g_string_append(o, "}\n\n");
     }
     g_string_append(o,
@@ -849,7 +848,7 @@ void hd5770_emit_cf(GString *o, const HD5770IR *ir, uint32_t mipmask,
             "    hd_nb(HD_CTX_ARGS, N2B0, N2B1, N2B2, N2PW, N2PX, N2PY, rec2, seen2);\n",
             np, np, np, np);
     }
-    e_body(o, ir, mipmask, true, pidx, straight);
+    e_body(o, ir, mipmask, true, pidx);
     g_string_append(o, "}\n\n");
     g_free(pidx);
 }
