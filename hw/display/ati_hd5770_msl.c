@@ -3319,6 +3319,9 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
     unsigned i, j, ng = MAX(ir->ngpr, 1u), nlv = 0, ntx = 0;
     unsigned slot[HD5770_GPU_TEX];
     uint32_t iflat = 0, ivar = 0, ufn = 0;
+    /* the compact register of the position */
+    int pos = k->pos_gpr >= 0 && ir->map[k->pos_gpr] != 0xff ?
+              ir->map[k->pos_gpr] : -1;
     bool mips = false;
 
     if (ir->vs || k->ninputs > 32 || k->nvb > HD5770_GPU_VB ||
@@ -3645,7 +3648,7 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             "#define HD_OUTB(n) thread bool &n\n"
             "#define HD_OUTU(n) thread uint &n\n"
             "#define HD_OUTC(n) thread uint (&n)[8][4]\n",
-            k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr ? k->pos_gpr : -1);
+            pos);
         hd5770_emit_cf(o, ir, 0);
     }
     if (k->zout || k->ncol) {
@@ -3701,12 +3704,12 @@ char *hd5770_msl_native_fs(const HD5770IR *ir, const HD5770NatKey *k)
             "        R0[i][0] = R0[i][1] = R0[i][2] = R0[i][3] = 0;\n"
             "    }\n", ng, ng);
     }
-    if (!ir->cf && k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
+    if (!ir->cf && pos >= 0) {
         g_string_append_printf(o,
             "    R0[%d][0] = U(in.pos.x - 0.5f + u.pc);\n"
             "    R0[%d][1] = U(in.pos.y - 0.5f + u.pc);\n"
             "    R0[%d][2] = U(0.0f);\n    R0[%d][3] = U(1.0f);\n",
-            k->pos_gpr, k->pos_gpr, k->pos_gpr, k->pos_gpr);
+            pos, pos, pos, pos);
     }
     if (!ir->cf) {
         g_string_append_printf(o, "    R0[%u][0] = U(in.bc.y);\n    R0[%u][1] = U(in.bc.z);\n",

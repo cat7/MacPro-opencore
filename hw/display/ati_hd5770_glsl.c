@@ -1671,6 +1671,9 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
     GString *o;
     unsigned i, j, ng = MAX(ir->ngpr, 1u);
     uint32_t iflat = 0, ivar = 0, flat;
+    /* the compact register of the position */
+    int pos = k->pos_gpr >= 0 && ir->map[k->pos_gpr] != 0xff ?
+              ir->map[k->pos_gpr] : -1;
     bool kills = false;
     size_t from;
 
@@ -1802,9 +1805,7 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
             "#define HD_OUTU(n) out uint n\n"
             "#define HD_OUTC(n) out uint n[8][4]\n",
             HD5770_NU_KV, HD5770_NU_BCONST, HD5770_NU_LCONST,
-            k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr ? k->pos_gpr
-                                                               : -1,
-            HD5770_NU_ZERO);
+            pos, HD5770_NU_ZERO);
         hd5770_emit_cf(o, ir, 0);
     }
     g_string_append_printf(o,
@@ -1828,10 +1829,10 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
             "           killed, C, cm, zd, sd, zw);\n",
             bary ? "gl_BaryCoordNoPerspEXT.x, gl_BaryCoordNoPerspEXT.y,"
                    " gl_BaryCoordNoPerspEXT.z" : "0.0, 0.0, 0.0");
-    } else if (k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
+    } else if (pos >= 0) {
         g_string_append_printf(o,
             "    r[%d] = uvec4(U(gl_FragCoord.x - 0.5 + pc), U(gl_FragCoord.y - 0.5 + pc),"
-            " U(0.0), U(1.0));\n", k->pos_gpr);
+            " U(0.0), U(1.0));\n", pos);
     }
     if (bary && !ir->cf) {
         g_string_append_printf(o,
