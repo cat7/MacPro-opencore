@@ -10,7 +10,8 @@
  * SHADER CONTRACT. Set 0, binding 0 is `readonly buffer { uint words[]; }`:
  * everything a draw reads besides textures (constants, vertex data,
  * indices) lies in it, put there with vkr_data(); a block stays where it
- * is while vkr_data_gen() does not change. Binding 1 is a second buffer
+ * is while vkr_data_gen() does not change. Blocks of vkr_keep() stay
+ * until vkr_keep_reset(). Binding 1 is a second buffer
  * of words that never change (vkr_tables()). Binding 2 + i is texture
  * unit i, a sampler2D (sampler2DArray for an image with layers, sampler3D
  * for a volume). The push constants are VkrDraw.pc. Vertices are
@@ -98,7 +99,16 @@ typedef struct VkrDraw {
     uint32_t index;             /* word offset from vkr_data() */
 } VkrDraw;
 
-/* cache: file the built pipelines are kept in, or NULL */
+/* what a pipeline is built for; a draw's is built when first drawn */
+typedef struct VkrPipeDesc {
+    VkrShader *vs, *fs;
+    uint32_t ncolor;
+    uint32_t fmt[VKR_COLORS];
+    VkrBlend blend[VKR_COLORS];
+    uint32_t depth;             /* a depth image is attached */
+} VkrPipeDesc;
+
+/* cache: folder the stages and pipelines built are kept in, or NULL */
 VkRaster *vkr_open(const char *cache, const char **err);
 void vkr_close(VkRaster *r);
 const char *vkr_device(VkRaster *r);
@@ -118,6 +128,8 @@ VkrImage *vkr_image_new(VkRaster *r, unsigned fmt, uint32_t w, uint32_t h,
                         uint32_t levels, uint32_t layers, bool volume,
                         bool target);
 void vkr_image_free(VkRaster *r, VkrImage *i);
+/* device memory the images take */
+uint64_t vkr_image_bytes(VkRaster *r);
 /* block formats: x, y, w, h in texels, whole blocks */
 void vkr_image_write(VkRaster *r, VkrImage *i, uint32_t level, uint32_t layer,
                      uint32_t x, uint32_t y, uint32_t w, uint32_t h,
@@ -128,6 +140,10 @@ void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
 /* stage 0 vertex, 1 fragment; NULL and *log (g_free) when it fails */
 VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
                           char **log);
+/* n stages, and the pipelines of n descriptions, several at a time */
+void vkr_shaders_new(VkRaster *r, unsigned n, const unsigned *stage,
+                     char *const *glsl, VkrShader **out);
+void vkr_pipes_ahead(VkRaster *r, const VkrPipeDesc *d, unsigned n);
 
 /*
  * room for n bytes in the words buffer, *off their word offset; blocks
@@ -137,6 +153,12 @@ VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
 void *vkr_data(VkRaster *r, size_t n, uint32_t *off);
 void vkr_data_room(VkRaster *r, size_t n);
 uint32_t vkr_data_gen(VkRaster *r);
+/*
+ * room for n bytes that stays until vkr_keep_reset(), which waits for
+ * the draws queued; NULL: no room left
+ */
+void *vkr_keep(VkRaster *r, size_t n, uint32_t *off);
+void vkr_keep_reset(VkRaster *r);
 
 void vkr_draw(VkRaster *r, const VkrDraw *d);
 void vkr_flush(VkRaster *r, bool wait);

@@ -7,17 +7,34 @@
 
 #include "qemu/osdep.h"
 #include "qemu/host-utils.h"
+#include "qemu/atomic.h"
 #include <vulkan/vulkan.h>
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
 #include "vk_raster.h"
 
 #define VKR_RING        (256u << 20)
+#define VKR_KEEP        (384u << 20)    /* behind the ring, vkr_keep() */
 #define VKR_CBS         128
+
+#define VKR_BLOCK       (128u << 20)    /* image memory comes in these */
+
+typedef struct VkrSpan {
+    VkDeviceSize off, size;
+} VkrSpan;
+
+/* device memory images share: its free spans, in order */
+typedef struct VkrBlock {
+    VkDeviceMemory mem;
+    uint32_t type;
+    VkDeviceSize size;
+    GArray *free;
+} VkrBlock;
 
 struct VkrImage {
     VkImage img;
-    VkDeviceMemory mem;
+    VkrBlock *blk;
+    VkrSpan span;
     VkImageView view;           /* all levels */
     VkImageView rt;             /* level 0 */
     unsigned fmt;
@@ -30,13 +47,7 @@ struct VkrShader {
     unsigned stage;
 };
 
-typedef struct VkrPipeKey {
-    VkrShader *vs, *fs;
-    uint32_t ncolor;
-    uint32_t fmt[VKR_COLORS];
-    VkrBlend blend[VKR_COLORS];
-    uint32_t depth;
-} VkrPipeKey;
+typedef VkrPipeDesc VkrPipeKey;
 
 typedef struct VkrPipe {
     VkrPipeKey key;
@@ -68,15 +79,17 @@ struct VkRaster {
     VkBuffer ring, tables, rb;
     VkDeviceMemory ring_mem, tables_mem, rb_mem;
     uint8_t *ring_map, *rb_map;
-    size_t ring_at, rb_size, tables_size;
+    size_t ring_at, keep_at, rb_size, tables_size;
     uint32_t ring_gen;
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkPipelineCache pcache;
-    char *cache_path;
+    char *cache_dir, *cache_path;
     GHashTable *pipes;
     GArray *samps;
+    GPtrArray *blocks, *dead;
+    uint64_t image_bytes;
 
     bool rendering;
     unsigned cur_n;
@@ -85,6 +98,7 @@ struct VkRaster {
     VkPipeline cur_pipe;
 
     uint64_t n_draws, n_scopes, n_submits, n_waits, n_pipes, n_shaders;
+    uint64_t n_compiled, n_ahead;
     uint64_t n_writes, n_reads, n_wraps, saved_pipes;
     int64_t saved_at;
     int64_t pipe_ns, shader_ns, wait_ns;
@@ -157,6 +171,123 @@ static bool vkr_buffer(VkRaster *r, size_t size, VkFlags usage, VkBuffer *b,
     return true;
 }
 
+/* room for an image in a block of its memory type */
+static bool vkr_image_mem(VkRaster *r, VkrImage *i)
+{
+    VkMemoryRequirements mr;
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+    };
+    VkrBlock *b = NULL;
+    VkrSpan sp;
+    uint32_t t;
+    unsigned k, j;
+
+    vkGetImageMemoryRequirements(r->dev, i->img, &mr);
+    for (t = 0; t < r->mp.memoryTypeCount; t++) {
+        if ((mr.memoryTypeBits >> t) & 1 &&
+            r->mp.memoryTypes[t].propertyFlags &
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            break;
+        }
+    }
+    if (t == r->mp.memoryTypeCount) {
+        return false;
+    }
+    for (k = 0; k <= r->blocks->len; k++) {
+        if (k == r->blocks->len) {
+            b = g_new0(VkrBlock, 1);
+            b->type = t;
+            b->size = MAX(mr.size, VKR_BLOCK);
+            ai.allocationSize = b->size;
+            ai.memoryTypeIndex = t;
+            if (vkAllocateMemory(r->dev, &ai, NULL, &b->mem) != VK_SUCCESS) {
+                g_free(b);
+                return false;
+            }
+            b->free = g_array_new(false, false, sizeof(VkrSpan));
+            sp = (VkrSpan){ 0, b->size };
+            g_array_append_val(b->free, sp);
+            g_ptr_array_add(r->blocks, b);
+        }
+        b = g_ptr_array_index(r->blocks, k);
+        for (j = 0; b->type == t && j < b->free->len; j++) {
+            VkrSpan *f = &g_array_index(b->free, VkrSpan, j);
+            VkDeviceSize at = ROUND_UP(f->off, mr.alignment);
+            VkDeviceSize end = f->off + f->size;
+
+            if (at + mr.size > end) {
+                continue;
+            }
+            /* the span taken starts where the free one did */
+            i->span = (VkrSpan){ f->off, at + mr.size - f->off };
+            f->off += i->span.size;
+            f->size -= i->span.size;
+            if (!f->size) {
+                g_array_remove_index(b->free, j);
+            }
+            i->blk = b;
+            r->image_bytes += i->span.size;
+            return vkBindImageMemory(r->dev, i->img, b->mem,
+                                     at) == VK_SUCCESS;
+        }
+    }
+    return false;
+}
+
+static void vkr_image_mem_free(VkRaster *r, VkrImage *i)
+{
+    VkrBlock *b = i->blk;
+    VkrSpan *f;
+    unsigned j;
+
+    if (!b) {
+        return;
+    }
+    for (j = 0; j < b->free->len &&
+                g_array_index(b->free, VkrSpan, j).off < i->span.off; j++) {
+        /* search */
+    }
+    g_array_insert_val(b->free, j, i->span);
+    r->image_bytes -= i->span.size;
+    f = &g_array_index(b->free, VkrSpan, j);
+    if (j + 1 < b->free->len && f->off + f->size == f[1].off) {
+        f->size += f[1].size;
+        g_array_remove_index(b->free, j + 1);
+    }
+    if (j && f[-1].off + f[-1].size == f->off) {
+        f[-1].size += f->size;
+        g_array_remove_index(b->free, j);
+    }
+    if (b->free->len == 1 &&
+        g_array_index(b->free, VkrSpan, 0).size == b->size) {
+        vkFreeMemory(r->dev, b->mem, NULL);
+        g_array_free(b->free, true);
+        g_ptr_array_remove_fast(r->blocks, b);
+        g_free(b);
+    }
+}
+
+static void vkr_image_destroy(VkRaster *r, VkrImage *i)
+{
+    vkDestroyImageView(r->dev, i->view, NULL);
+    vkDestroyImageView(r->dev, i->rt, NULL);
+    vkDestroyImage(r->dev, i->img, NULL);
+    vkr_image_mem_free(r, i);
+    g_free(i);
+}
+
+/* nothing queued uses the images freed: they go */
+static void vkr_dead(VkRaster *r)
+{
+    unsigned k;
+
+    for (k = 0; k < r->dead->len; k++) {
+        vkr_image_destroy(r, g_ptr_array_index(r->dead, k));
+    }
+    g_ptr_array_set_size(r->dead, 0);
+}
+
 static void vkr_begin(VkRaster *r)
 {
     VkCommandBufferAllocateInfo ai = {
@@ -216,6 +347,9 @@ void vkr_flush(VkRaster *r, bool wait)
         r->n_waits++;
         r->wait_ns += (g_get_monotonic_time() - t0) * 1000;
     }
+    if (!r->ndone) {
+        vkr_dead(r);
+    }
 }
 
 void vkr_data_room(VkRaster *r, size_t n)
@@ -244,6 +378,25 @@ void *vkr_data(VkRaster *r, size_t n, uint32_t *off)
 uint32_t vkr_data_gen(VkRaster *r)
 {
     return r->ring_gen;
+}
+
+void *vkr_keep(VkRaster *r, size_t n, uint32_t *off)
+{
+    void *p = r->ring_map + VKR_RING + r->keep_at;
+
+    n = ROUND_UP(n, 16);
+    if (n > VKR_KEEP - r->keep_at) {
+        return NULL;
+    }
+    *off = (VKR_RING + r->keep_at) / 4;
+    r->keep_at += n;
+    return p;
+}
+
+void vkr_keep_reset(VkRaster *r)
+{
+    vkr_flush(r, true);
+    r->keep_at = 0;
 }
 
 const char *vkr_device(VkRaster *r)
@@ -315,7 +468,6 @@ VkrImage *vkr_image_new(VkRaster *r, unsigned fmt, uint32_t w, uint32_t h,
     };
     VkImageAspectFlags asp = fmt == VKR_FMT_D32F ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                  : VK_IMAGE_ASPECT_COLOR_BIT;
-    VkMemoryRequirements mr;
     VkrImage *i;
 
     if (fmt >= VKR_FMT_N || !w || !h || w > 16384 || h > 16384 || !levels ||
@@ -343,14 +495,8 @@ VkrImage *vkr_image_new(VkRaster *r, unsigned fmt, uint32_t w, uint32_t h,
         g_free(i);
         return NULL;
     }
-    vkGetImageMemoryRequirements(r->dev, i->img, &mr);
-    if (!vkr_mem(r, &mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &i->mem) ||
-        vkBindImageMemory(r->dev, i->img, i->mem, 0) != VK_SUCCESS) {
-        vkDestroyImage(r->dev, i->img, NULL);
-        if (i->mem) {
-            vkFreeMemory(r->dev, i->mem, NULL);
-        }
-        g_free(i);
+    if (!vkr_image_mem(r, i)) {
+        vkr_image_destroy(r, i);
         return NULL;
     }
     vi.image = i->img;
@@ -381,7 +527,7 @@ void vkr_image_free(VkRaster *r, VkrImage *i)
     if (!i) {
         return;
     }
-    vkr_flush(r, true);
+    vkr_end_scope(r);
     for (k = 0; k < VKR_COLORS; k++) {
         if (r->cur[k] == i) {
             r->cur[k] = NULL;
@@ -390,11 +536,16 @@ void vkr_image_free(VkRaster *r, VkrImage *i)
     if (r->cur_z == i) {
         r->cur_z = NULL;
     }
-    vkDestroyImageView(r->dev, i->view, NULL);
-    vkDestroyImageView(r->dev, i->rt, NULL);
-    vkDestroyImage(r->dev, i->img, NULL);
-    vkFreeMemory(r->dev, i->mem, NULL);
-    g_free(i);
+    /* destroyed once the draws queued are done */
+    g_ptr_array_add(r->dead, i);
+    if (r->dead->len >= 256) {
+        vkr_flush(r, true);
+    }
+}
+
+uint64_t vkr_image_bytes(VkRaster *r)
+{
+    return r->image_bytes;
 }
 
 /* writes, reads and draws to one image are kept apart */
@@ -495,31 +646,51 @@ VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
         .messages = GLSLANG_MSG_DEFAULT_BIT,
         .resource = glslang_default_resource(),
     };
-    glslang_shader_t *sh = glslang_shader_create(&in);
+    glslang_shader_t *sh = NULL;
     glslang_program_t *pg = NULL;
     VkShaderModuleCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
     };
     /* the SPIR-V optimiser takes seconds over a stage */
     glslang_spv_options_t so = { .disable_optimizer = true };
+    g_autofree char *sum = NULL, *path = NULL, *spv = NULL;
+    gsize spv_len = 0;
     VkrShader *s = NULL;
     int64_t t0 = g_get_monotonic_time();
 
     *log = NULL;
-    if (!glslang_shader_preprocess(sh, &in) || !glslang_shader_parse(sh, &in)) {
-        *log = g_strdup(glslang_shader_get_info_log(sh));
-        goto out;
+    if (r->cache_dir) {
+        /* the stage's SPIR-V is kept under the text's checksum */
+        sum = g_compute_checksum_for_string(G_CHECKSUM_SHA256, glsl, -1);
+        path = g_strdup_printf("%s/%s.%u.spv", r->cache_dir, sum, stage);
+        g_file_get_contents(path, &spv, &spv_len, NULL);
     }
-    pg = glslang_program_create();
-    glslang_program_add_shader(pg, sh);
-    if (!glslang_program_link(pg, GLSLANG_MSG_SPV_RULES_BIT |
-                              GLSLANG_MSG_VULKAN_RULES_BIT)) {
-        *log = g_strdup(glslang_program_get_info_log(pg));
-        goto out;
+    if (spv_len && !(spv_len & 3)) {
+        ci.codeSize = spv_len;
+        ci.pCode = (const uint32_t *)spv;
+    } else {
+        sh = glslang_shader_create(&in);
+        if (!glslang_shader_preprocess(sh, &in) ||
+            !glslang_shader_parse(sh, &in)) {
+            *log = g_strdup(glslang_shader_get_info_log(sh));
+            goto out;
+        }
+        pg = glslang_program_create();
+        glslang_program_add_shader(pg, sh);
+        if (!glslang_program_link(pg, GLSLANG_MSG_SPV_RULES_BIT |
+                                  GLSLANG_MSG_VULKAN_RULES_BIT)) {
+            *log = g_strdup(glslang_program_get_info_log(pg));
+            goto out;
+        }
+        glslang_program_SPIRV_generate_with_options(pg, in.stage, &so);
+        ci.codeSize = glslang_program_SPIRV_get_size(pg) * 4;
+        ci.pCode = glslang_program_SPIRV_get_ptr(pg);
+        if (path) {
+            g_file_set_contents(path, (const char *)ci.pCode, ci.codeSize,
+                                NULL);
+        }
+        qatomic_inc(&r->n_compiled);
     }
-    glslang_program_SPIRV_generate_with_options(pg, in.stage, &so);
-    ci.codeSize = glslang_program_SPIRV_get_size(pg) * 4;
-    ci.pCode = glslang_program_SPIRV_get_ptr(pg);
     s = g_new0(VkrShader, 1);
     s->stage = stage;
     if (vkCreateShaderModule(r->dev, &ci, NULL, &s->mod) != VK_SUCCESS) {
@@ -531,9 +702,11 @@ out:
     if (pg) {
         glslang_program_delete(pg);
     }
-    glslang_shader_delete(sh);
-    r->n_shaders++;
-    r->shader_ns += (g_get_monotonic_time() - t0) * 1000;
+    if (sh) {
+        glslang_shader_delete(sh);
+    }
+    qatomic_inc(&r->n_shaders);
+    qatomic_add(&r->shader_ns, (g_get_monotonic_time() - t0) * 1000);
     return s;
 }
 
@@ -581,7 +754,8 @@ static gboolean vkr_key_equal(gconstpointer a, gconstpointer b)
     return !memcmp(a, b, sizeof(VkrPipeKey));
 }
 
-static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
+/* the pipeline of p->key; any thread */
+static void vkr_pipe_build(VkRaster *r, VkrPipe *p)
 {
     static const VkDynamicState dyn[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -592,14 +766,13 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
     };
-    VkrPipeKey key;
-    VkrPipe *p;
+    const VkrPipeKey *key = &p->key;
     VkPipelineShaderStageCreateInfo st[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = d->vs->mod,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = key->vs->mod,
           .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = d->fs->mod,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = key->fs->mod,
           .pName = "main" },
     };
     VkPipelineVertexInputStateCreateInfo vin = {
@@ -631,7 +804,7 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
     VkPipelineColorBlendAttachmentState ba[VKR_COLORS];
     VkPipelineColorBlendStateCreateInfo bs = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = d->ncolor,
+        .attachmentCount = key->ncolor,
         .pAttachments = ba,
     };
     VkPipelineDynamicStateCreateInfo dy = {
@@ -642,9 +815,9 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
     VkFormat cf[VKR_COLORS];
     VkPipelineRenderingCreateInfo ri = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-        .colorAttachmentCount = d->ncolor,
+        .colorAttachmentCount = key->ncolor,
         .pColorAttachmentFormats = cf,
-        .depthAttachmentFormat = d->depth ? VK_FORMAT_D32_SFLOAT
+        .depthAttachmentFormat = key->depth ? VK_FORMAT_D32_SFLOAT
                                           : VK_FORMAT_UNDEFINED,
     };
     VkGraphicsPipelineCreateInfo ci = {
@@ -665,29 +838,10 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
     int64_t t0;
     unsigned i;
 
-    memset(&key, 0, sizeof(key));
-    key.vs = d->vs;
-    key.fs = d->fs;
-    key.ncolor = d->ncolor;
-    key.depth = d->depth != NULL;
-    for (i = 0; i < d->ncolor; i++) {
-        const VkrBlend *b = &d->blend[i];
+    for (i = 0; i < key->ncolor; i++) {
+        const VkrBlend *b = &key->blend[i];
 
-        key.fmt[i] = d->color[i]->fmt;
-        key.blend[i].mask = b->mask;
-        if (b->on) {
-            key.blend[i] = *b;
-            key.blend[i].on = 1;
-        }
-    }
-    p = g_hash_table_lookup(r->pipes, &key);
-    if (p) {
-        return p->pipe;
-    }
-    for (i = 0; i < d->ncolor; i++) {
-        const VkrBlend *b = &key.blend[i];
-
-        cf[i] = vkr_fmt[key.fmt[i]].f;
+        cf[i] = vkr_fmt[key->fmt[i]].f;
         ba[i] = (VkPipelineColorBlendAttachmentState){
             .blendEnable = b->on,
             .srcColorBlendFactor = vkr_factor(b->src),
@@ -700,16 +854,128 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
         };
     }
     t0 = g_get_monotonic_time();
-    p = g_new0(VkrPipe, 1);
-    p->key = key;
     if (vkCreateGraphicsPipelines(r->dev, r->pcache, 1, &ci, NULL,
                                   &p->pipe) != VK_SUCCESS) {
         p->pipe = VK_NULL_HANDLE;
     }
-    r->n_pipes++;
-    r->pipe_ns += (g_get_monotonic_time() - t0) * 1000;
-    g_hash_table_insert(r->pipes, &p->key, p);
+    qatomic_inc(&r->n_pipes);
+    qatomic_add(&r->pipe_ns, (g_get_monotonic_time() - t0) * 1000);
+}
+
+/* the description as the key: what does not matter is zero */
+static void vkr_pipe_key(const VkrPipeDesc *d, VkrPipeKey *key)
+{
+    unsigned i;
+
+    memset(key, 0, sizeof(*key));
+    key->vs = d->vs;
+    key->fs = d->fs;
+    key->ncolor = d->ncolor;
+    key->depth = d->depth != 0;
+    for (i = 0; i < d->ncolor; i++) {
+        const VkrBlend *b = &d->blend[i];
+
+        key->fmt[i] = d->fmt[i];
+        key->blend[i].mask = b->mask;
+        if (b->on) {
+            key->blend[i] = *b;
+            key->blend[i].on = 1;
+        }
+    }
+}
+
+static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
+{
+    VkrPipeDesc pd = { .vs = d->vs, .fs = d->fs, .ncolor = d->ncolor,
+                       .depth = d->depth != NULL };
+    VkrPipeKey key;
+    VkrPipe *p;
+    unsigned i;
+
+    for (i = 0; i < d->ncolor; i++) {
+        pd.fmt[i] = d->color[i]->fmt;
+        pd.blend[i] = d->blend[i];
+    }
+    vkr_pipe_key(&pd, &key);
+    p = g_hash_table_lookup(r->pipes, &key);
+    if (!p) {
+        p = g_new0(VkrPipe, 1);
+        p->key = key;
+        vkr_pipe_build(r, p);
+        g_hash_table_insert(r->pipes, &p->key, p);
+    }
     return p->pipe;
+}
+
+typedef struct VkrJob {
+    unsigned stage;
+    const char *glsl;
+    VkrShader **out;
+    VkrPipe *pipe;
+} VkrJob;
+
+static void vkr_job(gpointer data, gpointer opaque)
+{
+    VkrJob *j = data;
+    char *log;
+
+    if (j->pipe) {
+        vkr_pipe_build(opaque, j->pipe);
+    } else {
+        *j->out = vkr_shader_new(opaque, j->stage, j->glsl, &log);
+        g_free(log);
+    }
+}
+
+static void vkr_jobs(VkRaster *r, VkrJob *j, unsigned n)
+{
+    GThreadPool *pool;
+    unsigned i;
+
+    if (!n) {
+        return;
+    }
+    pool = g_thread_pool_new(vkr_job, r, MIN(n, MAX(g_get_num_processors(),
+                                                    2u) - 1), false, NULL);
+    for (i = 0; i < n; i++) {
+        g_thread_pool_push(pool, &j[i], NULL);
+    }
+    g_thread_pool_free(pool, false, true);
+    r->n_ahead += n;
+}
+
+void vkr_shaders_new(VkRaster *r, unsigned n, const unsigned *stage,
+                     char *const *glsl, VkrShader **out)
+{
+    g_autofree VkrJob *j = g_new0(VkrJob, n);
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        j[i].stage = stage[i];
+        j[i].glsl = glsl[i];
+        j[i].out = &out[i];
+    }
+    vkr_jobs(r, j, n);
+}
+
+void vkr_pipes_ahead(VkRaster *r, const VkrPipeDesc *d, unsigned n)
+{
+    g_autofree VkrJob *j = g_new0(VkrJob, n);
+    unsigned i, k = 0;
+
+    for (i = 0; i < n; i++) {
+        VkrPipe *p = g_new0(VkrPipe, 1);
+
+        vkr_pipe_key(&d[i], &p->key);
+        if (g_hash_table_contains(r->pipes, &p->key)) {
+            g_free(p);
+            continue;
+        }
+        /* in the table at once: one of a kind is built */
+        g_hash_table_insert(r->pipes, &p->key, p);
+        j[k++].pipe = p;
+    }
+    vkr_jobs(r, j, k);
 }
 
 static VkSampler vkr_samp(VkRaster *r, const VkrSampler *s)
@@ -895,11 +1161,13 @@ void vkr_stats(VkRaster *r, GString *out)
         "vk: %s: draws %" PRIu64 " scopes %" PRIu64 " submits %" PRIu64
         " waits %" PRIu64 " (%" PRId64 " ms) image writes %" PRIu64
         " reads %" PRIu64 " ring wraps %" PRIu64 "\n"
-        "vk: shaders %" PRIu64 " (%" PRId64 " ms) pipelines %" PRIu64
-        " (%" PRId64 " ms)\n", r->name, r->n_draws, r->n_scopes,
-        r->n_submits, r->n_waits, r->wait_ns / 1000000, r->n_writes,
-        r->n_reads, r->n_wraps, r->n_shaders, r->shader_ns / 1000000,
-        r->n_pipes, r->pipe_ns / 1000000);
+        "vk: stages %" PRIu64 " (%" PRIu64 " compiled, %" PRId64
+        " ms) pipelines %" PRIu64
+        " (%" PRId64 " ms); built ahead %" PRIu64 "\n", r->name, r->n_draws,
+        r->n_scopes, r->n_submits, r->n_waits, r->wait_ns / 1000000,
+        r->n_writes, r->n_reads, r->n_wraps, r->n_shaders, r->n_compiled,
+        r->shader_ns / 1000000, r->n_pipes, r->pipe_ns / 1000000,
+        r->n_ahead);
 }
 
 static void vkr_cache_save(VkRaster *r)
@@ -936,6 +1204,11 @@ void vkr_close(VkRaster *r)
     if (r->dev) {
         vkDeviceWaitIdle(r->dev);
         vkr_cache_save(r);
+        if (r->dead) {
+            vkr_dead(r);
+            g_ptr_array_free(r->dead, true);
+            g_ptr_array_free(r->blocks, true);
+        }
         if (r->pipes) {
             g_hash_table_iter_init(&it, r->pipes);
             while (g_hash_table_iter_next(&it, NULL, &v)) {
@@ -966,6 +1239,7 @@ void vkr_close(VkRaster *r)
         vkDestroyInstance(r->inst, NULL);
     }
     g_free(r->cache_path);
+    g_free(r->cache_dir);
     g_free(r);
 }
 
@@ -1177,14 +1451,18 @@ VkRaster *vkr_open(const char *cache, const char **err)
         goto fail;
     }
     plci.pSetLayouts = &r->dsl;
-    if (cache && g_file_get_contents(cache, &blob, &blob_len, NULL)) {
-        cci.initialDataSize = blob_len;
-        cci.pInitialData = blob;
+    if (cache) {
+        r->cache_dir = g_strdup(cache);
+        r->cache_path = g_build_filename(cache, "pipelines.bin", NULL);
+        if (g_file_get_contents(r->cache_path, &blob, &blob_len, NULL)) {
+            cci.initialDataSize = blob_len;
+            cci.pInitialData = blob;
+        }
     }
-    r->cache_path = g_strdup(cache);
     if (vkCreatePipelineLayout(r->dev, &plci, NULL, &r->layout) != VK_SUCCESS ||
         vkCreatePipelineCache(r->dev, &cci, NULL, &r->pcache) != VK_SUCCESS ||
-        !vkr_buffer(r, VKR_RING, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        !vkr_buffer(r, (size_t)VKR_RING + VKR_KEEP,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &r->ring, &r->ring_mem,
                     &r->ring_map)) {
@@ -1195,6 +1473,8 @@ VkRaster *vkr_open(const char *cache, const char **err)
     r->pipes = g_hash_table_new_full(vkr_key_hash, vkr_key_equal, NULL,
                                      vkr_pipe_free);
     r->samps = g_array_new(false, false, sizeof(VkrSamp));
+    r->blocks = g_ptr_array_new();
+    r->dead = g_ptr_array_new();
     glslang_initialize_process();
     vkr_begin(r);
     *err = NULL;
