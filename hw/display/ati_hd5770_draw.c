@@ -238,8 +238,6 @@ typedef struct Vtx {
     HD5770Val param[HD5770_PARAMS][4];
 } Vtx;
 
-#define VFP_N           64      /* vertex buffer pages kept */
-
 /* the state one draw needs, gathered once */
 typedef struct Draw {
     HD5770Gfx *g;
@@ -340,11 +338,6 @@ typedef struct Draw {
     /* vertex shader constant buffers read so far in this instance */
     HD5770Val (*kc[16])[4];
     uint64_t *kc_ok[16];
-    /* vertex buffer pages read so far in this instance: key = page + 1 */
-    struct {
-        uint64_t key;
-        const uint8_t *p;
-    } vfp[VFP_N];
 } Draw;
 
 #define KC_MAX          4096
@@ -1046,8 +1039,7 @@ static HD5770Val comp_value(uint32_t c, unsigned bits, bool is_float,
  * from SET_ALU_CONST: fetch buffer 128 reads it as float4 elements.
  */
 static void vfetch_stage(Draw *d, const uint32_t *w, uint32_t index,
-                         HD5770Val v[4], unsigned base_r, const uint32_t *cfile,
-                         bool pages)
+                         HD5770Val v[4], unsigned base_r, const uint32_t *cfile)
 {
     HD5770Gfx *g = d->g;
     unsigned bid = (w[0] >> 8) & 0xff, id = bid + base_r;
@@ -1056,7 +1048,7 @@ static void vfetch_stage(Draw *d, const uint32_t *w, uint32_t index,
     uint32_t size = r[1] + 1, stride = (r[2] >> 8) & 0x7ff;
     unsigned fmt, num, sgn, bits[4], n, k;
     uint32_t off = w[2] & 0xffff, c[4];
-    uint64_t at, mc, pg;
+    uint64_t at;
     uint8_t buf[16];
 
     if (bid == 128) {
@@ -1093,29 +1085,8 @@ static void vfetch_stage(Draw *d, const uint32_t *w, uint32_t index,
         v[0].u = v[1].u = v[2].u = 0;
         return;
     }
-    mc = base + at;
-    pg = mc >> 12;
-    pages &= pg == (mc + n - 1) >> 12;
-    if (pages && d->vfp[pg % VFP_N].key == pg + 1) {
-        memcpy(buf, d->vfp[pg % VFP_N].p + (mc & 0xfff), n);
-    } else if (pages) {
-        uint64_t len = 0;
-        const uint8_t *p;
-
-        /* the page once: checked whole, its memory kept for the instance */
-        pend_check(g, pg << 12, 0x1000);
-        p = g->mem.map(g->mem.opaque, pg << 12, &len, false);
-        if (p && len >= 0x1000) {
-            d->vfp[pg % VFP_N].key = pg + 1;
-            d->vfp[pg % VFP_N].p = p;
-            memcpy(buf, p + (mc & 0xfff), n);
-        } else {
-            hd5770_mem_read(&g->mem, mc, buf, n);
-        }
-    } else {
-        pend_check(g, mc, n);
-        hd5770_mem_read(&g->mem, mc, buf, n);
-    }
+    pend_check(g, base + at, n);
+    hd5770_mem_read(&g->mem, base + at, buf, n);
     hd5770_fmt_unpack(fmt, buf, c, bits);
     for (k = 0; k < 4 && bits[k]; k++) {
         v[k] = comp_value(c[k], bits[k], hd5770_fmt_is_float(fmt), sgn, num);
@@ -1139,7 +1110,7 @@ static void vfetch_vs(void *opaque, const uint32_t *w, uint32_t index,
         break;
     }
     vfetch_stage(d, w, index, v, stage == HD5770_STAGE_FS ? RES_FS : RES_VS,
-                 d->g->alu + 1024, d->g->gpu && d->g->gpu->ops->vf_pages);
+                 d->g->alu + 1024);
 }
 
 static void vfetch_ps(void *opaque, const uint32_t *w, uint32_t index,
@@ -1147,7 +1118,7 @@ static void vfetch_ps(void *opaque, const uint32_t *w, uint32_t index,
 {
     Draw *d = opaque;
 
-    vfetch_stage(d, w, index, v, 0, d->g->alu, false);
+    vfetch_stage(d, w, index, v, 0, d->g->alu);
 }
 
 /* ---------------------------------------------------------------- */
@@ -2039,7 +2010,6 @@ static void kcache_drop(Draw *d)
         d->kc_ok[k] = NULL;
         d->kc[k] = NULL;
     }
-    memset(d->vfp, 0, sizeof(d->vfp));
 }
 
 static float interp(void *opaque, unsigned p, unsigned chan, bool flat)
