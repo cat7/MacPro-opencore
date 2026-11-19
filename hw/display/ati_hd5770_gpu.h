@@ -556,6 +556,46 @@ HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
 HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,
                           const char **err);
 
+/*
+ * The rasterisation pipeline on Vulkan (Windows, ati_hd5770_vk.c with the
+ * card-neutral renderer vk_raster.c): the stages of a draw as Vulkan
+ * GLSL (ati_hd5770_glsl.c). The fragment stage of a pixel program for
+ * key k (2D units, cube and array units as layers of one image, 3D
+ * units as volumes: k->dim, k->nsl; a unit in padded lies in a larger
+ * image and is wrapped by the stage; bary: the host gives barycentrics;
+ * NULL: not expressible), the vertex
+ * stage that passes window-space triangles through, and a vertex
+ * shader's IR as the vertex stage (HD5770GpuDraw.vs). The draw's block
+ * of words is HD5770_NU_*, the vertex stage's set-up HD5770_NV_*.
+ */
+enum {
+    HD5770_NU_AREF, HD5770_NU_AFUNC, HD5770_NU_PC, HD5770_NU_PERSP,
+    HD5770_NU_CLIPRULE, HD5770_NU_VPX, HD5770_NU_VPY, HD5770_NU_ZMIN,
+    HD5770_NU_ZMAX, HD5770_NU_KV, HD5770_NU_VTX, HD5770_NU_ZERO,
+    HD5770_NU_CR = 12,          /* 16: the clip rectangles */
+    /*
+     * per unit: w, h, dst_sel[4], base level, levels, depth, cmp, cmp
+     * max, the part of the image the texture takes (x, y), wrap x, y
+     */
+    HD5770_NU_TEX = 28, HD5770_NU_TEX_WORDS = 16,
+    HD5770_NU_BCONST = HD5770_NU_TEX + HD5770_NU_TEX_WORDS * HD5770_GPU_TEX,
+    HD5770_NU_LCONST,           /* 32 */
+    /* per buffer of the program's vertex fetches: stride, bytes, at byte */
+    HD5770_NU_VB = HD5770_NU_LCONST + 32,
+    HD5770_NU_WORDS = HD5770_NU_VB + 3 * HD5770_GPU_VB,
+    /* vte, sc_mode, window offset, clip, vport[6], 2/w, 2/h, centre, zoff */
+    HD5770_NV_X = 152, HD5770_NV_DEF = 168,
+    HD5770_NV_WORDS = HD5770_NV_DEF + 128,
+};
+char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
+                            uint32_t padded, bool bary);
+uint32_t hd5770_glsl_native_flat(const HD5770IR *ir, const HD5770NatKey *k);
+char *hd5770_glsl_native_pvs(unsigned ninputs, uint32_t flat);
+char *hd5770_glsl_native_vs(const HD5770IR *ir, unsigned ninputs,
+                            uint32_t flat, const int32_t *src);
+HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size,
+                          const char **err);
+
 /* GLSL (ati_hd5770_glsl.c): a program, and the library alone */
 char *hd5770_glsl_program(const HD5770IR *ir);
 /* the same for draws whose texture units in mipmask are mipmapped */

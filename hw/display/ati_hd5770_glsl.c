@@ -2690,31 +2690,11 @@ static const char glsl_vs_lib[] =
 "    return true;\n"
 "}\n";
 
-char *hd5770_glsl_vs_program(const HD5770IR *ir)
+/* the operations of a vertex shader: records to recs[rec ..] */
+static void vs_body(GString *o, const HD5770IR *ir)
 {
-    GString *o = g_string_new(NULL);
-    unsigned i, j, k, ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
-    unsigned rw = HD5770_VS_REC(np);
+    unsigned i, j, k;
 
-    emit_head(o);
-    g_string_append(o, hd5770_glsl_lib);
-    g_string_append(o, glsl_vs_lib);
-    g_string_append_printf(o,
-        "void main()\n"
-        "{\n"
-        "    uint gid = gl_GlobalInvocationID.x;\n"
-        "    if (gid >= VW(0u) * VW(1u)) {\n        return;\n    }\n"
-        "    uint kvo = VW(4u), inst = gid / VW(0u), index, pm = 0u, fl = 0u;\n"
-        "    uint rec = gid * %uu;\n"
-        "    for (uint i = 0u; i < %uu; i++) {\n        recs[rec + i] = 0u;\n    }\n"
-        "    if (!hd_vsindex(gid %% VW(0u), index)) {\n"
-        "        recs[rec + %uu] = %uu;\n        return;\n    }\n"
-        "    bool killed = false;\n"
-        "    uvec4 r[%u];\n"
-        "    for (uint i = 0u; i < %uu; i++) {\n        r[i] = uvec4(0u);\n    }\n"
-        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n"
-        "    r[%u][0] = index;\n    r[%u][3] = inst;\n",
-        rw, rw, rw - 1, HD5770_VSF_RESTART, ng, ng, ir->map[0], ir->map[0]);
     for (i = 0; i < ir->nops; i++) {
         const HD5770IROp *op = &ir->ops[i];
 
@@ -2774,6 +2754,34 @@ char *hd5770_glsl_vs_program(const HD5770IR *ir)
             break;
         }
     }
+}
+
+char *hd5770_glsl_vs_program(const HD5770IR *ir)
+{
+    GString *o = g_string_new(NULL);
+    unsigned ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+    unsigned rw = HD5770_VS_REC(np);
+
+    emit_head(o);
+    g_string_append(o, hd5770_glsl_lib);
+    g_string_append(o, glsl_vs_lib);
+    g_string_append_printf(o,
+        "void main()\n"
+        "{\n"
+        "    uint gid = gl_GlobalInvocationID.x;\n"
+        "    if (gid >= VW(0u) * VW(1u)) {\n        return;\n    }\n"
+        "    uint kvo = VW(4u), inst = gid / VW(0u), index, pm = 0u, fl = 0u;\n"
+        "    uint rec = gid * %uu;\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        recs[rec + i] = 0u;\n    }\n"
+        "    if (!hd_vsindex(gid %% VW(0u), index)) {\n"
+        "        recs[rec + %uu] = %uu;\n        return;\n    }\n"
+        "    bool killed = false;\n"
+        "    uvec4 r[%u];\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        r[i] = uvec4(0u);\n    }\n"
+        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n"
+        "    r[%u][0] = index;\n    r[%u][3] = inst;\n",
+        rw, rw, rw - 1, HD5770_VSF_RESTART, ng, ng, ir->map[0], ir->map[0]);
+    vs_body(o, ir);
     g_string_append_printf(o, "    recs[rec + %uu] = pm;\n    recs[rec + %uu] = fl;\n}\n",
                            rw - 2, rw - 1);
     return g_string_free(o, false);
@@ -3119,5 +3127,743 @@ char *hd5770_glsl_setup_program(void)
     emit_head(o);
     g_string_append(o, hd5770_glsl_lib);
     g_string_append(o, glsl_setup_main);
+    return g_string_free(o, false);
+}
+
+/*
+ * The rasterisation pipeline (ati_hd5770_vk.c): a program as the stages
+ * of vk_raster.h. Push constant 0 (uo) is the word offset of the draw's
+ * block, HD5770_NU_* below; push constant 1 (vso) that of its vertex
+ * stage, laid out as glsl_vs_lib reads it, the set-up from word
+ * HD5770_NV_X on.
+ */
+static void nat_head(GString *o, bool formats)
+{
+    const char *a = strstr(hd5770_glsl_lib, "/* ---- exact arithmetic");
+    const char *f0 = strstr(hd5770_glsl_lib, "/* ---- formats ---- */");
+    const char *f1 = strstr(hd5770_glsl_lib, "/* ---- surfaces ---- */");
+    const char *b = strstr(hd5770_glsl_lib, "/* ---- ALU: eval()");
+    const char *c = strstr(hd5770_glsl_lib, "/* ---- fetches ---- */");
+
+    g_string_append_printf(o,
+        "#version 450\n#define HD_FUSED %d\n"
+        "layout(std430, set = 0, binding = 0) readonly buffer Words { uint words[]; };\n"
+        "layout(std430, set = 0, binding = 1) readonly buffer Tables {"
+        " uint hd_u8[256]; uint hd_fmt_bits[]; };\n"
+        "layout(push_constant) uniform PC { uint uo; uint vso; };\n"
+        "#define vram words\n"
+        "#define F(x) uintBitsToFloat(x)\n"
+        "#define U(x) floatBitsToUint(x)\n"
+        "#define I(x) int(x)\n"
+        "#define FLT_MAX uintBitsToFloat(0x7f7fffffu)\n", HD5770_GLSL_FUSED);
+    g_string_append_len(o, a, f0 - a);
+    if (formats) {
+        g_string_append_len(o, f0, f1 - f0);
+    }
+    g_string_append_len(o, b, c - b);
+    /* hd_pred(), hd_cube() */
+    a = strstr(hd5770_glsl_lib, "/* PRED_SET*");
+    b = strstr(strstr(a, "void hd_cube"), "\n\n/*");
+    g_string_append_len(o, a, b - a);
+    g_string_append(o, "\n");
+}
+
+/* hd_eval() for opcode op alone, as hd_e<op>(): its case of the library's */
+static void nat_eval_fn(GString *w, unsigned op)
+{
+    const char *ev = strstr(hd5770_glsl_lib, "uint hd_eval(");
+    const char *sw3 = strstr(ev, "switch (op & 0x1fu) {");
+    const char *sw2 = strstr(sw3, "    switch (op) {");
+    const char *end = strstr(sw2, "\nbool hd_isfloat");
+    const char *lo = op & 0x800 ? sw3 : sw2, *hi = op & 0x800 ? sw2 : end;
+    const char *p, *q;
+    char label[24];
+
+    snprintf(label, sizeof(label), "case 0x%02xu:",
+             op & 0x800 ? op & 0x1f : op);
+    g_string_append_printf(w,
+        "uint hd_e%x(uint mods, uint s0, uint s1, uint s2, inout bool kill)\n"
+        "{\n    float a, b, c;\n", op);
+    if (op & 0x800) {
+        g_string_append(w,
+            "    a = F(s0);\n    b = F(s1);\n    c = F(s2);\n"
+            "    if ((mods & 1u) != 0u) {\n        a = hd_neg(a);\n    }\n"
+            "    if ((mods & 2u) != 0u) {\n        b = hd_neg(b);\n    }\n"
+            "    if ((mods & 4u) != 0u) {\n        c = hd_neg(c);\n    }\n");
+    } else {
+        g_string_append(w,
+            "    a = hd_fmod(mods, 0u, s0);\n    b = hd_fmod(mods, 1u, s1);\n"
+            "    c = 0.0;\n");
+    }
+    g_string_append_printf(w, "    switch (0x%xu) {\n",
+                           op & 0x800 ? op & 0x1f : op);
+    p = g_strstr_len(lo, hi - lo, label);
+    while (p && p < hi) {
+        /* the lines of the case, to the next label */
+        while (p > lo && p[-1] != '\n') {
+            p--;
+        }
+        q = strchr(p, '\n');
+        g_string_append_len(w, p, q + 1 - p);
+        p = q + 1;
+        while (*p == ' ') {
+            p++;
+        }
+        if (g_str_has_prefix(p, "case ") || g_str_has_prefix(p, "default:")) {
+            break;
+        }
+    }
+    g_string_append(w, "    default: return 0u;\n    }\n}\n");
+}
+
+/*
+ * hd_eval() with a constant opcode becomes a function of that opcode
+ * alone: the host's compiler is not given the whole opcode switch for
+ * every instruction. from: where the program's own text begins.
+ */
+static void nat_eval(GString *o, size_t from)
+{
+    static const char call[] = "hd_eval(0x";
+    GString *w = g_string_new(NULL);
+    uint64_t seen[64] = { 0 };
+    char *p;
+
+    while ((p = strstr(o->str + from, call))) {
+        char *e;
+        unsigned op = strtoul(p + sizeof(call) - 1, &e, 16);
+        size_t at = p - o->str;
+        char name[24];
+
+        if (e[0] != 'u' || e[1] != ',' || e[2] != ' ' || op >= 4096) {
+            break;
+        }
+        if (!((seen[op >> 6] >> (op & 63)) & 1)) {
+            seen[op >> 6] |= 1ull << (op & 63);
+            nat_eval_fn(w, op);
+        }
+        snprintf(name, sizeof(name), "hd_e%x(", op);
+        g_string_erase(o, at, e + 3 - p);
+        g_string_insert(o, at, name);
+    }
+    g_string_insert(o, from, w->str);
+    g_string_free(w, true);
+}
+
+uint32_t hd5770_glsl_native_flat(const HD5770IR *ir, const HD5770NatKey *k)
+{
+    uint32_t iflat = 0;
+    unsigned i;
+
+    for (i = 0; i < ir->ninsts; i++) {
+        const HD5770IRInst *in = &ir->insts[i];
+
+        if (in->interp && in->needed && in->prm < k->ninputs && in->flat) {
+            iflat |= 1u << in->prm;
+        }
+    }
+    return k->flat | iflat;
+}
+
+static void nat_io(GString *o, unsigned ninputs, uint32_t flat, bool out)
+{
+    unsigned i;
+
+    for (i = 0; i < ninputs; i++) {
+        bool fl = (flat >> i) & 1;
+
+        g_string_append_printf(o, "layout(location = %u) %s%s %s p%u;\n", i,
+                               fl ? "flat " : "", out ? "out" : "in",
+                               fl ? "uvec4" : "vec4", i);
+    }
+}
+
+char *hd5770_glsl_native_pvs(unsigned ninputs, uint32_t flat)
+{
+    GString *o = g_string_new(NULL);
+    unsigned i;
+
+    nat_head(o, false);
+    nat_io(o, ninputs, flat, true);
+    g_string_append_printf(o,
+        "void main()\n{\n"
+        "    uint v = words[uo + %uu] + uint(gl_VertexIndex) * %uu;\n"
+        "    float pc = F(words[uo + %uu]);\n"
+        "    float cw = words[uo + %uu] != 0u ? 1.0 / F(words[v + 3u]) : 1.0;\n"
+        "    gl_Position = vec4(((F(words[v]) - pc + 0.5) * F(words[uo + %uu]) - 1.0) * cw,\n"
+        "        ((F(words[v + 1u]) - pc + 0.5) * F(words[uo + %uu]) - 1.0) * cw,\n"
+        "        F(words[v + 2u]) * cw, cw);\n",
+        HD5770_NU_VTX, 4 + 4 * ninputs, HD5770_NU_PC, HD5770_NU_PERSP,
+        HD5770_NU_VPX, HD5770_NU_VPY);
+    for (i = 0; i < ninputs; i++) {
+        bool fl = (flat >> i) & 1;
+
+        g_string_append_printf(o,
+            "    p%u = %s(words[v + %uu], words[v + %uu], words[v + %uu],"
+            " words[v + %uu])%s;\n", i, fl ? "uvec4" : "uintBitsToFloat(uvec4",
+            4 + 4 * i, 5 + 4 * i, 6 + 4 * i, 7 + 4 * i, fl ? "" : ")");
+    }
+    g_string_append(o, "}\n");
+    return g_string_free(o, false);
+}
+
+char *hd5770_glsl_native_vs(const HD5770IR *ir, unsigned ninputs,
+                            uint32_t flat, const int32_t *src)
+{
+    const char *lib = strstr(glsl_vs_lib, "#define VW(i)");
+    unsigned i, k, ng = MAX(ir->ngpr, 1u), np = hd5770_vs_np(ir);
+    unsigned rw = HD5770_VS_REC(np);
+    size_t from;
+    GString *o;
+
+    if (!ir->vs || ninputs > 32) {
+        return NULL;
+    }
+    for (i = 0; i < ir->nfetches; i++) {
+        if (ir->fetches[i].kind != HD5770_IRF_VTX) {
+            return NULL;
+        }
+    }
+    o = g_string_new(NULL);
+    nat_head(o, true);
+    g_string_append(o, lib);
+    nat_io(o, ninputs, flat, true);
+    from = o->len;
+    g_string_append_printf(o,
+        "#define VX(i) words[vso + %uu + (i)]\n"
+        "void main()\n{\n"
+        "    uint kvo = VW(4u), inst = uint(gl_InstanceIndex);\n"
+        "    uint index = uint(gl_VertexIndex), pm = 0u, fl = 0u, rec = 0u;\n"
+        "    uint recs[%u];\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        recs[i] = 0u;\n    }\n"
+        "    bool killed = false;\n"
+        "    uvec4 r[%u];\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        r[i] = uvec4(0u);\n    }\n"
+        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n"
+        "    r[%u][0] = index;\n    r[%u][3] = inst;\n",
+        HD5770_NV_X, rw, rw, ng, ng, ir->map[0], ir->map[0]);
+    vs_body(o, ir);
+    /* clip_dist(), vtx_window(), then the host's clip space */
+    g_string_append(o,
+        "    float x = F(recs[0]), y = F(recs[1]), z = F(recs[2]), w = F(recs[3]);\n"
+        "    uint clip = VX(3u), vte = VX(0u);\n"
+        "    float dn = (clip & 2u) != 0u ? z : z + w, df = w - z;\n"
+        "    if ((clip & 5u) != 5u) {\n        dn = 0.0;\n    }\n"
+        "    if ((clip & 9u) != 9u) {\n        df = 0.0;\n    }\n"
+        "    x /= w;\n    y /= w;\n    z /= w;\n"
+        "    if ((vte & 1u) != 0u) {\n        x *= F(VX(4u));\n    }\n"
+        "    if ((vte & 2u) != 0u) {\n        x += F(VX(5u));\n    }\n"
+        "    if ((vte & 4u) != 0u) {\n        y *= F(VX(6u));\n    }\n"
+        "    if ((vte & 8u) != 0u) {\n        y += F(VX(7u));\n    }\n"
+        "    if ((vte & 16u) != 0u) {\n        z *= F(VX(8u));\n    }\n"
+        "    if ((vte & 32u) != 0u) {\n        z += F(VX(9u));\n    }\n"
+        "    z += F(VX(13u));\n"
+        "    if ((VX(1u) & (1u << 16)) != 0u) {\n"
+        "        x += float(int(VX(2u) << 16) >> 16);\n"
+        "        y += float(int(VX(2u)) >> 16);\n"
+        "    }\n"
+        "    float pc = F(VX(12u));\n"
+        "    gl_Position = vec4(((x - pc + 0.5) * F(VX(10u)) - 1.0) * w,\n"
+        "                       ((y - pc + 0.5) * F(VX(11u)) - 1.0) * w, z * w, w);\n"
+        "    gl_ClipDistance[0] = dn;\n    gl_ClipDistance[1] = df;\n");
+    for (i = 0; i < ninputs; i++) {
+        bool fl = (flat >> i) & 1;
+
+        g_string_append_printf(o, "    p%u = %s(", i, fl ? "uvec4" : "vec4");
+        for (k = 0; k < 4; k++) {
+            if (src[i] < 0) {
+                g_string_append_printf(o, "%s%swords[vso + %uu]%s",
+                                       k ? ", " : "", fl ? "" : "F(",
+                                       HD5770_NV_DEF + 4 * i + k,
+                                       fl ? "" : ")");
+            } else if (src[i] >= (int)np) {
+                g_string_append_printf(o, "%s%s", k ? ", " : "",
+                                       fl ? "0u" : "0.0");
+            } else {
+                g_string_append_printf(o, "%s%srecs[%u]%s", k ? ", " : "",
+                                       fl ? "" : "F(", 4 + 4 * src[i] + k,
+                                       fl ? "" : ")");
+            }
+        }
+        g_string_append(o, ");\n");
+    }
+    g_string_append(o, "}\n");
+    nat_eval(o, from);
+    return g_string_free(o, false);
+}
+
+/* the TEX operations taken: LD, RESINFO, SAMPLE*, SAMPLE_C* */
+static bool nat_tex_op(unsigned op)
+{
+    return op == 0x03 || op == 0x04 || (op >= 0x10 && op <= 0x13) ||
+           (op >= 0x18 && op <= 0x1b);
+}
+
+/*
+ * hd_nt<unit>(): a fetch of the unit by its words, as tfetch_stage() in
+ * ati_hd5770_draw.c reads them, through the host's sampler; dv: the
+ * coordinates' change to the pixel on the right and below
+ */
+static void nat_unit(GString *o, unsigned unit, bool padded, unsigned dim,
+                     unsigned nsl)
+{
+    unsigned tu = HD5770_NU_TEX + HD5770_NU_TEX_WORDS * unit;
+    bool vol = dim == 2, arr = nsl > 1 || vol;
+    const char *tcs = arr ? "vec3(tc, sl)" : "tc";
+
+    g_string_append_printf(o,
+        "void hd_nt%u(uint w0, uint w1, uint w2, uint c[4], vec4 dv, out uint o[4])\n"
+        "{\n"
+        "    uint op = w0 & 0x1fu;\n"
+        "    int ox = int(w2 << 27u) >> 27, oy = int(w2 << 22u) >> 27;\n"
+        "    vec2 ts = vec2(F(words[uo + %uu]), F(words[uo + %uu]));\n"
+        "    vec4 v = vec4(0.0);\n"
+        "    bool cmp = false;\n"
+        "    float ref = 0.0;\n"
+        "    o[0] = 0u; o[1] = 0u; o[2] = 0u; o[3] = 0u;\n"
+        "    if (op >= 0x18u && op <= 0x1bu) {\n"
+        "        cmp = true;\n"
+        "        ref = op == 0x19u || op == 0x1au ? F(c[2]) : F(c[3]);\n"
+        "        op -= 8u;\n"
+        "    }\n"
+        "    if (op == 4u) {\n"
+        "        uint lv = min(c[0] + words[uo + %uu], 31u);\n"
+        "        o[0] = max(uint(ts.x) >> lv, 1u);\n"
+        "        o[1] = max(uint(ts.y) >> lv, 1u);\n"
+        "        o[2] = words[uo + %uu];\n"
+        "        o[3] = words[uo + %uu];\n"
+        "        return;\n"
+        "    }\n"
+        "    float sl = 0.0;\n", unit, tu, tu + 1, tu + 6, tu + 8, tu + 7);
+    /* tex_slice() */
+    if (vol) {
+        /* the slice as a coordinate, the host wraps and filters it */
+        g_string_append_printf(o,
+            "    sl = op == 3u ? float(I(c[2])) :\n"
+            "         ((w1 >> 30u) & 1u) != 0u ? F(c[2]) : F(c[2]) / %u.0;\n",
+            MAX(nsl, 1u));
+    } else if (arr && dim == 3) {
+        g_string_append(o,
+            "    sl = F(c[2]) > 0.0 ? min(floor(F(c[2])), 5.0) : 0.0;\n"
+            "    c[0] = U(F(c[0]) - 1.0);\n    c[1] = U(F(c[1]) - 1.0);\n");
+    } else if (arr) {
+        g_string_append_printf(o,
+            "    sl = float(clamp(op == 3u ? I(c[2]) : int(roundEven(F(c[2]))), 0, %d));\n",
+            (int)nsl - 1);
+    }
+    g_string_append_printf(o,
+        "    if (op == 3u) {\n"
+        "        ivec2 xy = ivec2(I(c[0]) + ox / 2, I(c[1]) + oy / 2);\n"
+        "        if (xy.x >= 0 && xy.y >= 0 && xy.x < int(ts.x) && xy.y < int(ts.y)) {\n"
+        "            v = texelFetch(t%u, %s, 0);\n"
+        "        }\n"
+        "    } else {\n"
+        "        vec2 tc = vec2(F(c[0]), F(c[1]));\n"
+        "        if (((w1 >> 28u) & 1u) == 0u) {\n"
+        "            tc.x /= ts.x;\n            dv.xz /= ts.x;\n        }\n"
+        "        if (((w1 >> 29u) & 1u) == 0u) {\n"
+        "            tc.y /= ts.y;\n            dv.yw /= ts.y;\n        }\n"
+        "        tc += vec2(float(ox), float(oy)) * 0.5 / ts;\n",
+        unit, arr ? "ivec3(xy, int(sl))" : "xy");
+    if (padded) {
+        g_string_append_printf(o,
+            "        vec2 sc = vec2(F(words[uo + %uu]), F(words[uo + %uu]));\n"
+            "        tc = vec2(hd_nwrap(tc.x, ts.x, words[uo + %uu]),\n"
+            "                  hd_nwrap(tc.y, ts.y, words[uo + %uu])) * sc;\n"
+            "        dv *= sc.xyxy;\n", tu + 11, tu + 12, tu + 13, tu + 14);
+    }
+    g_string_append_printf(o,
+        "        if (op == 0x11u) {\n"
+        "            v = textureLod(t%u, %s, F(c[3]));\n"
+        "        } else if (op == 0x13u) {\n"
+        "            v = textureLod(t%u, %s, 0.0);\n"
+        "        } else {\n"
+        "            float bias = float(int(w1 << 4u) >> 25) / 16.0;\n"
+        "            if (op == 0x12u) {\n                bias += F(c[3]);\n            }\n"
+        "            dv *= exp2(bias);\n"
+        "            v = textureGrad(t%u, %s, %s);\n"
+        "        }\n"
+        "    }\n"
+        "    if (cmp) {\n"
+        "        v = vec4(hd_ncmp(words[uo + %uu], words[uo + %uu], ref, v.x));\n"
+        "    }\n"
+        "    v = hd_nsel(v, uo + %uu);\n"
+        "    o[0] = U(v.x); o[1] = U(v.y); o[2] = U(v.z); o[3] = U(v.w);\n"
+        "}\n", unit, tcs, unit, tcs, unit, tcs,
+        vol ? "vec3(dv.xy, 0.0), vec3(dv.zw, 0.0)" : "dv.xy, dv.zw", tu + 9,
+        tu + 10, tu + 2);
+}
+
+/*
+ * a TEX fetch through its unit's function; a VTX fetch as vfetch_stage()
+ * in ati_hd5770_draw.c reads an 8 or 32 bit element
+ */
+static bool nat_fetch(GString *o, const HD5770IR *ir, const HD5770IRFetch *f,
+                      const HD5770NatKey *key)
+{
+    unsigned k, unit, op = f->w[0] & 0x1f;
+
+    g_string_append(o, "    {\n        uint o[4] = uint[4](0u, 0u, 0u, 0u);\n");
+    if (f->kind == HD5770_IRF_GRAD_H || f->kind == HD5770_IRF_GRAD_V) {
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "        o[%u] = U(%s(F(r[%u][%u])));\n",
+                                       k, f->kind == HD5770_IRF_GRAD_H ?
+                                       "dFdx" : "dFdy", f->src, sel);
+            } else {
+                g_string_append_printf(o, "        o[%u] = U(0.0);\n", k);
+            }
+        }
+    } else if (f->kind == HD5770_IRF_VTX) {
+        unsigned bid = (f->w[0] >> 8) & 0xff, fmt, num, sgn, n, vb;
+
+        for (k = 0; k < key->nvb && key->vb[k].id != bid; k++) {
+            /* search */
+        }
+        if (k == key->nvb) {
+            return false;
+        }
+        if ((f->w[1] >> 21) & 1) {
+            fmt = key->vb[k].fmt;
+            num = key->vb[k].num;
+            sgn = key->vb[k].sgn;
+        } else {
+            fmt = (f->w[1] >> 22) & 0x3f;
+            num = (f->w[1] >> 28) & 3;
+            sgn = (f->w[1] >> 30) & 1;
+        }
+        if (fmt != 0x01 && fmt != 0x0d) {
+            return false;
+        }
+        n = fmt == 0x01 ? 1 : 4;
+        vb = HD5770_NU_VB + 3 * k;
+        g_string_append_printf(o,
+            "        uint ix = r[%u][%u], st = words[uo + %uu], ln = words[uo + %uu];\n"
+            "        o[3] = U(1.0);\n"
+            "        if ((st == 0u || ix <= ln / st) && ix * st + %uu <= ln) {\n"
+            "            uint at = words[uo + %uu] + ix * st + %uu, sh = (at & 3u) * 8u;\n"
+            "            uint c = words[at >> 2] >> sh;\n",
+            f->src, (f->w[0] >> 24) & 3, vb, vb + 1, (f->w[2] & 0xffff) + n,
+            vb + 2, f->w[2] & 0xffff);
+        if (n == 1) {
+            g_string_append(o, sgn ? "            c = uint(int(c << 24) >> 24);\n"
+                                   : "            c &= 0xffu;\n");
+        } else {
+            g_string_append(o,
+                "            if (sh != 0u) {\n"
+                "                c |= words[(at >> 2) + 1u] << (32u - sh);\n"
+                "            }\n");
+        }
+        if (num == 1) {
+            g_string_append(o, "            o[0] = c;\n");
+        } else if (num != 0) {
+            g_string_append_printf(o, "            o[0] = U(float(%sc%s));\n",
+                                   sgn ? "int(" : "", sgn ? ")" : "");
+        } else if (n == 4) {
+            g_string_append_printf(o, "            o[0] = U(float(%sc%s) / %s);\n",
+                                   sgn ? "int(" : "", sgn ? ")" : "",
+                                   sgn ? "2147483647.0" : "4294967295.0");
+        } else if (sgn) {
+            g_string_append(o, "            o[0] = U(max(float(int(c)) / 127.0, -1.0));\n");
+        } else {
+            g_string_append(o, "            o[0] = U(float(c) / 255.0);\n");
+        }
+        g_string_append(o, "        }\n");
+    } else if (f->kind != HD5770_IRF_TEX || !nat_tex_op(op)) {
+        return false;
+    } else {
+        for (unit = 0; unit < ir->nres && ir->res[unit] != f->res; unit++) {
+            /* search */
+        }
+        if (unit == ir->nres) {
+            return false;
+        }
+        g_string_append(o, "        uint c[4] = uint[4](");
+        for (k = 0; k < 4; k++) {
+            unsigned sel = (f->w[2] >> (20 + 3 * k)) & 7;
+
+            if (sel < 4) {
+                g_string_append_printf(o, "r[%u][%u]", f->src, sel);
+            } else {
+                g_string_append(o, sel == 5 ? "U(1.0)" : "U(0.0)");
+            }
+            g_string_append(o, k < 3 ? ", " : ");\n");
+        }
+        g_string_append_printf(o,
+            "        vec2 cn = vec2(F(c[0]), F(c[1]));\n"
+            "        hd_nt%u(0x%08xu, 0x%08xu, 0x%08xu, c, vec4(dFdx(cn), dFdy(cn)), o);\n",
+            unit, f->w[0], f->w[1], f->w[2]);
+    }
+    for (k = 0; k < 4; k++) {
+        unsigned sel = (f->w[1] >> (9 + 3 * k)) & 7;
+
+        if (sel < 4) {
+            g_string_append_printf(o, "        r[%u][%u] = o[%u];\n", f->dst, k, sel);
+        } else if (sel == 4 || sel == 5) {
+            g_string_append_printf(o, "        r[%u][%u] = U(%s);\n", f->dst, k,
+                                   sel == 5 ? "1.0" : "0.0");
+        }
+    }
+    g_string_append(o, "    }\n");
+    return true;
+}
+
+char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
+                            uint32_t padded, bool bary)
+{
+    GString *o;
+    unsigned i, j, ng = MAX(ir->ngpr, 1u);
+    uint32_t iflat = 0, ivar = 0, flat;
+    size_t from;
+
+    if (ir->vs || k->ninputs > 32 || ir->nres > HD5770_GPU_TEX ||
+        k->nvb > HD5770_GPU_VB) {
+        return NULL;
+    }
+    for (i = 0; i < ir->nfetches; i++) {
+        const HD5770IRFetch *f = &ir->fetches[i];
+
+        /* the CF form: texture fetches only, no gradients */
+        if (ir->cf && (f->kind != HD5770_IRF_TEX ||
+                       !nat_tex_op(f->w[0] & 0x1f))) {
+            return NULL;
+        }
+    }
+    for (i = 0; i < ir->ninsts; i++) {
+        const HD5770IRInst *in = &ir->insts[i];
+
+        if (in->interp && in->needed && in->prm < k->ninputs) {
+            *(in->flat ? &iflat : &ivar) |= 1u << in->prm;
+        }
+    }
+    if (iflat & ivar & ~k->flat) {
+        return NULL;
+    }
+    flat = k->flat | iflat;
+    o = g_string_new(NULL);
+    nat_head(o, false);
+    if (bary) {
+        g_string_insert(o, strchr(o->str, '\n') + 1 - o->str,
+            "#extension GL_EXT_fragment_shader_barycentric : require\n");
+    }
+    nat_io(o, k->ninputs, flat, false);
+    for (i = 0; i < ir->nres; i++) {
+        g_string_append_printf(o,
+            "layout(set = 0, binding = %u) uniform sampler%s t%u;\n", 2 + i,
+            k->dim[i] == 2 ? "3D" : k->nsl[i] > 1 ? "2DArray" : "2D", i);
+    }
+    for (i = 0; i < MAX(k->ncol, 1u); i++) {
+        g_string_append_printf(o, "layout(location = %u) out vec4 o%u;\n", i, i);
+    }
+    g_string_append(o, "float hd_ni(uint p, uint ch)\n{\n    switch (p) {\n");
+    for (i = 0; i < k->ninputs; i++) {
+        g_string_append_printf(o, "    case %uu: return %s(p%u[ch]);\n", i,
+                               (flat >> i) & 1 ? "F" : "", i);
+    }
+    g_string_append_printf(o,
+        "    default: return 0.0;\n    }\n}\n"
+        "#define hd_interp(di, ti, pr, p, ch, fl, b0, b1, b2, pw) hd_ni(p, ch)\n"
+        "vec4 hd_nsel(vec4 v, uint at)\n"
+        "{\n"
+        "    vec4 q;\n"
+        "    for (uint k = 0u; k < 4u; k++) {\n"
+        "        uint s = words[at + k];\n"
+        "        q[k] = s < 4u ? v[s] : s == 5u ? 1.0 : 0.0;\n"
+        "    }\n"
+        "    return q;\n"
+        "}\n"
+        "bool hd_nalpha(uint fn, float r, float a)\n"
+        "{\n"
+        "    switch (fn) {\n"
+        "    case 0u: return false;\n"
+        "    case 1u: return a < r;\n"
+        "    case 2u: return a == r;\n"
+        "    case 3u: return a <= r;\n"
+        "    case 4u: return a > r;\n"
+        "    case 5u: return a != r;\n"
+        "    case 6u: return a >= r;\n"
+        "    default: return true;\n"
+        "    }\n"
+        "}\n"
+        "/* a normalised coordinate of a texture n texels wide, wrapped */\n"
+        "float hd_nwrap(float t, float n, uint m)\n"
+        "{\n"
+        "    switch (m) {\n"
+        "    case 0u: t = fract(t); break;\n"
+        "    case 1u: {\n"
+        "        float p = t - floor(t * 0.5) * 2.0;\n"
+        "        t = p < 1.0 ? p : 2.0 - p;\n"
+        "        break;\n"
+        "    }\n"
+        "    case 3u: case 5u: case 7u: t = abs(t); break;\n"
+        "    default: break;\n"
+        "    }\n"
+        "    return clamp(t, 0.5 / n, 1.0 - 0.5 / n);\n"
+        "}\n"
+        "float hd_ncmp(uint fn, uint mx, float ref, float f)\n"
+        "{\n"
+        "    if (mx != 0u) {\n"
+        "        ref = floor(clamp(ref, 0.0, 1.0) * float(mx) + 0.5) / float(mx);\n"
+        "    }\n"
+        "    return hd_nalpha(fn, f, ref) ? 1.0 : 0.0;\n"
+        "}\n");
+    for (i = 0; i < ir->nres; i++) {
+        nat_unit(o, i, (padded >> i) & 1, k->dim[i], k->nsl[i]);
+    }
+    from = o->len;
+    if (ir->cf) {
+        /* the program's functions (ati_hd5770_emit.c) */
+        g_string_append(o,
+            "void hd_ntex(uint fu, uint w0, uint w1, uint w2, uint c[4], vec4 dv,\n"
+            "             out uint o[4])\n"
+            "{\n"
+            "    switch (fu) {\n");
+        for (i = 0; i < ir->nres; i++) {
+            g_string_append_printf(o,
+                "    case %uu: hd_nt%u(w0, w1, w2, c, dv, o); break;\n", i, i);
+        }
+        g_string_append_printf(o,
+            "    default: o[0] = 0u; o[1] = 0u; o[2] = 0u; o[3] = 0u; break;\n"
+            "    }\n"
+            "}\n"
+            "#define HD_CTX_PARAMS uint ctx_\n"
+            "#define HD_CTX_ARGS 0u\n"
+            "#define HD_K(k) words[words[uo + %uu] + (k)]\n"
+            "#define HD_BCONST words[uo + %uu]\n"
+            "#define HD_LCONST(i) words[uo + %uu + (i)]\n"
+            "#define HD_POSGPR %d\n"
+            "#define HD_TEX(fu, w0, w1, w2, c, dv, o) { \\\n"
+            "    vec2 cn_ = vec2(F(c[0]), F(c[1])); \\\n"
+            "    hd_ntex(fu, w0, w1, w2, c, vec4(dFdx(cn_), dFdy(cn_)), o); }\n"
+            "#define HD_ZERO int(words[uo + %uu])\n"
+            "#define HD_VTX(w0, w1, w2, i, o)\n"
+            "#define HD_INTERP(p, ch, fl, b0, b1, b2, pw) hd_ni(p, ch)\n"
+            "#define HD_OUTA(n, a, b) out uint n[a][b]\n"
+            "#define HD_OUTBA(n, a) out bool n[a]\n"
+            "#define HD_OUTB(n) out bool n\n"
+            "#define HD_OUTU(n) out uint n\n"
+            "#define HD_OUTC(n) out uint n[8][4]\n",
+            HD5770_NU_KV, HD5770_NU_BCONST, HD5770_NU_LCONST,
+            k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr ? k->pos_gpr
+                                                               : -1,
+            HD5770_NU_ZERO);
+        hd5770_emit_cf(o, ir, 0, true);
+    }
+    g_string_append_printf(o,
+        "void main()\n{\n"
+        "    uint C[8][4];\n"
+        "    for (uint i = 0u; i < 8u; i++) {\n"
+        "        C[i][0] = 0u; C[i][1] = 0u; C[i][2] = 0u; C[i][3] = 0u;\n"
+        "    }\n"
+        "    uint cm = 0u, zd = 0u, sd = 0u, kvo = words[uo + %uu];\n"
+        "    bool killed = false, zw = false;\n"
+        "    float pc = F(words[uo + %uu]);\n"
+        "    uvec4 r[%u];\n"
+        "    for (uint i = 0u; i < %uu; i++) {\n        r[i] = uvec4(0u);\n    }\n"
+        "    uint pv[5] = uint[5](0u, 0u, 0u, 0u, 0u);\n",
+        HD5770_NU_KV, HD5770_NU_PC, ng, ng);
+    if (ir->cf) {
+        g_string_append_printf(o,
+            "    hd_run(HD_CTX_ARGS, %s, 0.0,\n"
+            "           gl_FragCoord.x - 0.5 + pc, gl_FragCoord.y - 0.5 + pc,\n"
+            "           0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,\n"
+            "           killed, C, cm, zd, sd, zw);\n",
+            bary ? "gl_BaryCoordNoPerspEXT.x, gl_BaryCoordNoPerspEXT.y,"
+                   " gl_BaryCoordNoPerspEXT.z" : "0.0, 0.0, 0.0");
+    } else if (k->pos_gpr >= 0 && (unsigned)k->pos_gpr < ir->ngpr) {
+        g_string_append_printf(o,
+            "    r[%d] = uvec4(U(gl_FragCoord.x - 0.5 + pc), U(gl_FragCoord.y - 0.5 + pc),"
+            " U(0.0), U(1.0));\n", k->pos_gpr);
+    }
+    if (bary && !ir->cf) {
+        g_string_append_printf(o,
+            "    r[%u][0] = U(gl_BaryCoordNoPerspEXT.y);\n"
+            "    r[%u][1] = U(gl_BaryCoordNoPerspEXT.z);\n", ir->map[0],
+            ir->map[0]);
+    }
+    for (i = 0; i < ir->nops && !ir->cf; i++) {
+        const HD5770IROp *op = &ir->ops[i];
+
+        switch (op->kind) {
+        case HD5770_IRO_ALU:
+            for (j = 0; j < op->n; j++) {
+                emit_group(o, ir, &ir->groups[op->first + j], 0);
+            }
+            break;
+        case HD5770_IRO_FETCH:
+            for (j = 0; j < op->n; j++) {
+                if (!nat_fetch(o, ir, &ir->fetches[op->first + j], k)) {
+                    g_string_free(o, true);
+                    return NULL;
+                }
+            }
+            break;
+        default:
+            emit_export(o, ir, op);
+            break;
+        }
+    }
+    if (k->clip) {
+        /* clip_pass() in ati_hd5770_draw.c */
+        g_string_append_printf(o,
+            "    {\n"
+            "        ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "        uint idx = 0u;\n"
+            "        for (uint i = 0u; i < 4u; i++) {\n"
+            "            uint a = uo + %uu + i * 4u;\n"
+            "            if (p.x >= int(words[a]) && p.x < int(words[a + 2u]) &&\n"
+            "                p.y >= int(words[a + 1u]) && p.y < int(words[a + 3u])) {\n"
+            "                idx |= 1u << i;\n"
+            "            }\n"
+            "        }\n"
+            "        killed = killed || ((words[uo + %uu] >> idx) & 1u) == 0u;\n"
+            "    }\n", HD5770_NU_CR, HD5770_NU_CLIPRULE);
+    }
+    /* shade(): the alpha test reads export 0 */
+    g_string_append_printf(o,
+        "    if (killed || %s ||\n"
+        "        ((cm & 1u) != 0u && !hd_nalpha(words[uo + %uu], F(words[uo + %uu]),"
+        " F(C[0][3])))) {\n"
+        "        discard;\n"
+        "    }\n", k->ncol ? "cm == 0u" : "(cm & 1u) == 0u", HD5770_NU_AFUNC,
+        HD5770_NU_AREF);
+    for (i = 0; i < MAX(k->ncol, 1u); i++) {
+        unsigned cb = k->ncol ? k->col[i].cb & 7 : 0;
+        unsigned out = k->ncol ? k->col[i].out : k->out;
+        unsigned comps = k->ncol ? k->col[i].comps : k->rt_comps;
+        const uint8_t *src = k->ncol ? k->col[i].src : k->rt_src;
+
+        if (out == 1) {
+            /* an integer target: the bytes of the channel */
+            g_string_append_printf(o,
+                "    uint v%u = C[%u][%u];\n"
+                "    o%u = vec4(float(v%u & 0xffu), float((v%u >> 8) & 0xffu),\n"
+                "              float((v%u >> 16) & 0xffu), float(v%u >> 24)) / 255.0;\n",
+                i, cb, src[0] & 3, i, i, i, i, i);
+        } else if (comps == 1) {
+            g_string_append_printf(o,
+                "    o%u = vec4(F(C[%u][%u]), 0.0, 0.0, 0.0);\n", i, cb,
+                src[0] & 3);
+        } else {
+            /* channel i of the target is component src[i] */
+            g_string_append_printf(o,
+                "    o%u = vec4(F(C[%u][%u]), F(C[%u][%u]), F(C[%u][%u]), F(C[%u][%u]));\n",
+                i, cb, src[0] & 3, cb, src[1] & 3, cb, src[2] & 3, cb,
+                src[3] & 3);
+        }
+        if (out != 2) {
+            g_string_append_printf(o,
+                "    o%u = mix(o%u, vec4(0.0), isnan(o%u));\n", i, i, i);
+        }
+    }
+    if (k->zout) {
+        g_string_append_printf(o,
+            "    gl_FragDepth = min(max(%s, F(words[uo + %uu])), F(words[uo + %uu]));\n",
+            k->zexp ? "(zw ? F(zd) : gl_FragCoord.z)" : "gl_FragCoord.z",
+            HD5770_NU_ZMIN, HD5770_NU_ZMAX);
+    }
+    g_string_append(o, "}\n");
+    nat_eval(o, from);
     return g_string_free(o, false);
 }
