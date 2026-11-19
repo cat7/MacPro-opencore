@@ -56,9 +56,6 @@ struct VkrMark {
     GPtrArray *reads;           /* the reads queued in it */
     bool done;                  /* reached, its command buffer freed */
     bool held;                  /* the caller has it */
-    /* its words lie from here to where the ring was when it was handed over */
-    size_t ring_from;
-    uint32_t ring_gen;
 };
 
 struct VkrShader {
@@ -102,8 +99,6 @@ struct VkRaster {
     uint8_t *ring_map;
     size_t ring_at, keep_at, tables_size;
     uint32_t ring_gen;
-    /* where the command buffer's words begin; the ring is free up to ring_end */
-    size_t ring_from, ring_end;
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -406,9 +401,6 @@ static VkrMark *vkr_submit(VkRaster *r)
     vkr_end_scope(r);
     vkCreateFence(r->dev, &fi, NULL, &k->fence);
     k->cb = r->cb;
-    k->ring_from = r->ring_from;
-    k->ring_gen = r->ring_gen;
-    r->ring_from = r->ring_at;
     k->reads = r->reads;
     r->reads = g_ptr_array_new();
     vkEndCommandBuffer(r->cb);
@@ -464,36 +456,18 @@ void vkr_mark_free(VkRaster *r, VkrMark *k)
 }
 
 /*
- * At its end the ring starts again; the words of command buffers the GPU
- * still has, from the oldest one's on, are waited for only when the room
- * before them runs out.
+ * At its end the ring starts again. A draw may read any block of its
+ * generation, so the GPU is waited for first.
  */
 void vkr_data_room(VkRaster *r, size_t n)
 {
     n = ROUND_UP(n, 16) + 4096;
     g_assert(n <= VKR_RING);
     if (r->ring_at + n > VKR_RING) {
-        vkr_flush(r, false);
-        r->ring_at = r->ring_from = r->ring_end = 0;
+        vkr_flush(r, true);
+        r->ring_at = 0;
         r->ring_gen++;
         r->n_wraps++;
-    }
-    while (r->ring_at + n > r->ring_end) {
-        VkrMark *k;
-
-        vkr_reap(r, false);
-        k = g_queue_peek_head(&r->subs);
-        if (!k || k->ring_gen == r->ring_gen) {
-            r->ring_end = VKR_RING;
-        } else if (r->ring_at + n <= k->ring_from) {
-            r->ring_end = k->ring_from;
-        } else {
-            int64_t t0 = g_get_monotonic_time();
-
-            vkWaitForFences(r->dev, 1, &k->fence, VK_TRUE, UINT64_MAX);
-            r->n_waits++;
-            r->wait_ns += (g_get_monotonic_time() - t0) * 1000;
-        }
     }
 }
 
