@@ -90,6 +90,14 @@ typedef struct VkSurf {
     uint64_t settled;           /* HD5770Vk.drawn when it last settled */
     uint64_t flight;            /* the ticket that writes it back */
     bool flying;                /* in HD5770Vk.flying */
+    /*
+     * PARTS. A target that is one level's slice of a texture's image is
+     * copied into it on the GPU, not written back for it. serial names
+     * an image; into: the image this one was last copied into; copied:
+     * nothing was drawn to it since.
+     */
+    uint64_t serial, into;
+    bool copied;
     int64_t tdraw;
     struct VkSurf *hnext;       /* the next that starts at the same place */
 } VkSurf;
@@ -166,6 +174,7 @@ typedef struct HD5770Vk {
     GHashTable *progs;          /* key -> VkrShader, or vk_fail */
     GHashTable *pairs;          /* VkPair by its key */
     uint64_t drawn;             /* counts the images that became dirty */
+    uint64_t serial;
     /* build ahead: stages to compile (key -> VkNote), pipelines to build */
     GHashTable *noted;
     GArray *jobs;
@@ -177,7 +186,7 @@ typedef struct HD5770Vk {
     GHashTable *vbs;            /* VRAM offset -> VkVb */
     uint64_t nd[VD_N], dims[8], rtf[64], txf[64];
     uint64_t uploads, upload_bytes, nback[VB_N], back_bytes[VB_N];
-    uint64_t fences, syncs, ranges;
+    uint64_t fences, syncs, ranges, parts;
     uint64_t vs_draws, vs_tris, tris, vb_bytes, evicted;
     int64_t draw_ns, sync_ns, wait_ns;
     int64_t part_ns[VP_N];
@@ -487,14 +496,69 @@ static void vk_backs_now(HD5770Vk *m)
 }
 
 /*
- * images newer than memory over VRAM [lo, hi), but e, are written back,
- * and none over it is on its way there
+ * images newer than memory over VRAM [lo, hi), but e and its parts, are
+ * written back, and none over it is on its way there
  */
+/* o's surface is slice sl of level l of the texture image e */
+static bool vk_part(const VkSurf *e, const VkSurf *o, unsigned *l,
+                    unsigned *sl)
+{
+    const HD5770Surf *b = &o->lv[0].s;
+
+    if (!e->mip || o->mip || e->hf != o->hf || e->zfmt || o->zfmt ||
+        e->blk != 1 || e->lv[0].space || o->lv[0].space) {
+        return false;
+    }
+    for (*l = 0; *l < e->nlv; (*l)++) {
+        const HD5770Surf *a = &e->lv[*l].s;
+        uint64_t at = o->lv[0].voff - e->lv[*l].voff;
+        unsigned n = e->vol ? MAX(e->slices >> *l, 1u) : e->slices;
+
+        if (o->lv[0].voff < e->lv[*l].voff || !e->sb[*l] ||
+            at % e->sb[*l] || at / e->sb[*l] >= n) {
+            continue;
+        }
+        *sl = at / e->sb[*l];
+        return a->pitch == b->pitch && a->mode == b->mode &&
+               a->bpe == b->bpe && a->fast == b->fast &&
+               a->row_bytes == b->row_bytes && a->banks == b->banks &&
+               a->bankw == b->bankw && a->bankh == b->bankh &&
+               a->mtilea == b->mtilea && a->tile_split == b->tile_split &&
+               a->pipes == b->pipes &&
+               a->pipe_interleave == b->pipe_interleave &&
+               a->nondisp == b->nondisp && o->lh[0] >= e->lh[*l];
+    }
+    return false;
+}
+
+/* PARTS: the parts of e drawn since they were copied to it are copied */
+static void vk_parts(HD5770Vk *m, VkSurf *e)
+{
+    GPtrArray *from[2] = { m->dirty, m->flying };
+    unsigned i, k, l, sl;
+
+    for (k = 0; k < 2 && e->mip; k++) {
+        for (i = 0; i < from[k]->len; i++) {
+            VkSurf *o = g_ptr_array_index(from[k], i);
+
+            if (o == e || o->lo >= e->hi || e->lo >= o->hi ||
+                (o->copied && o->into == e->serial) ||
+                !vk_part(e, o, &l, &sl)) {
+                continue;
+            }
+            vkr_image_copy(m->r, o->img, e->img, l, sl, e->lw[l], e->lh[l]);
+            o->into = e->serial;
+            o->copied = true;
+            m->parts++;
+        }
+    }
+}
+
 static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi,
                       unsigned why)
 {
     uint64_t retired = qatomic_read(&m->retired), wait = 0;
-    unsigned i;
+    unsigned i, l, sl;
 
     for (i = 0; i < m->flying->len; i++) {
         VkSurf *o = g_ptr_array_index(m->flying, i);
@@ -502,14 +566,16 @@ static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi,
         if (o->flight <= retired) {
             o->flying = false;
             g_ptr_array_remove_index_fast(m->flying, i--);
-        } else if (o != e && o->lo < hi && lo < o->hi) {
+        } else if (o != e && o->lo < hi && lo < o->hi &&
+                   !(e && vk_part(e, o, &l, &sl))) {
             wait = MAX(wait, o->flight);
         }
     }
     for (i = 0; i < m->dirty->len; i++) {
         VkSurf *o = g_ptr_array_index(m->dirty, i);
 
-        if (o != e && o->lo < hi && lo < o->hi) {
+        if (o != e && o->lo < hi && lo < o->hi &&
+            !(e && vk_part(e, o, &l, &sl))) {
             wait = MAX(wait, o->flight);
             vk_back_queue(m, o, why);
             i--;
@@ -520,18 +586,11 @@ static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi,
 }
 
 /* the image is what memory holds, or newer */
-static void vk_ready(HD5770Vk *m, VkSurf *e)
+static void vk_fresh(HD5770Vk *m, VkSurf *e)
 {
     unsigned l;
     bool diff = !e->loaded;
 
-    e->used = m->seq;
-    /* no image became dirty since it settled: none lies over it */
-    for (l = 0; l < e->nlv && !e->lv[l].space && e->settled != m->drawn;
-         l++) {
-        vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
-    }
-    e->settled = m->drawn;
     if (e->dirty || e->flight > qatomic_read(&m->retired) ||
         (e->epoch == m->epoch && e->loaded)) {
         return;
@@ -558,6 +617,25 @@ static void vk_ready(HD5770Vk *m, VkSurf *e)
     if (diff) {
         vk_load(m, e);
     }
+}
+
+/* the image is ready for a draw: none over it is newer than it */
+static void vk_ready(HD5770Vk *m, VkSurf *e)
+{
+    unsigned l;
+
+    e->used = m->seq;
+    /* nothing over it was drawn to since it settled */
+    if (e->settled == m->drawn) {
+        vk_fresh(m, e);
+        return;
+    }
+    for (l = 0; l < e->nlv && !e->lv[l].space; l++) {
+        vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
+    }
+    vk_fresh(m, e);
+    vk_parts(m, e);
+    e->settled = m->drawn;
 }
 
 static void vk_surf_free(gpointer p)
@@ -716,6 +794,7 @@ static VkSurf *vk_surf(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
         vk_evict(m);
     }
     e = g_new0(VkSurf, 1);
+    e->serial = ++m->serial;
     e->hf = hf;
     e->zfmt = zfmt;
     e->blk = blk;
@@ -778,6 +857,10 @@ static VkSurf *vk_surf(HD5770Vk *m, const HD5770GpuSurf *s, unsigned hf,
 
 static void vk_drew(HD5770Vk *m, VkSurf *e, int x0, int y0, int x1, int y1)
 {
+    if (e->dirty && e->copied) {
+        m->drawn++;
+    }
+    e->copied = false;
     if (!e->dirty) {
         e->dirty = true;
         m->drawn++;
@@ -2014,6 +2097,7 @@ static void vk_stats(void *opaque, GString *out)
                                vb_name[i], m->nback[i],
                                m->back_bytes[i] >> 20);
     }
+    g_string_append_printf(out, " parts copied %" PRIu64 ";", m->parts);
     g_string_append(out, "\nvk: ms in a draw's parts:");
     for (i = 0; i < VP_N; i++) {
         g_string_append_printf(out, " %s %" PRId64 ";", vp_name[i],
