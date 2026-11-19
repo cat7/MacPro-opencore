@@ -914,6 +914,9 @@ static unsigned vk_tex_fmt(const HD5770GpuTex *t)
     if (t->fmt == HD5770_FMT_32_FLOAT && t->is_float && t->comps == 1) {
         return VKR_FMT_R32F;
     }
+    if (t->fmt == HD5770_FMT_32_32_FLOAT && t->is_float && t->comps == 2) {
+        return VKR_FMT_RG32F;
+    }
     if (t->comps == 4 &&
         ((t->fmt == HD5770_FMT_32_32_32_32_FLOAT && t->is_float) ||
          (t->fmt == HD5770_FMT_32_32_32_32 && t->num == HD5770_NUM_INT))) {
@@ -967,6 +970,13 @@ static unsigned vk_rt(const HD5770Surf *s, uint32_t fmt, uint32_t num,
         src[0] < 4 && src[1] < 4) {
         *mask = ((wmask >> src[0]) & 1) | ((wmask >> src[1]) & 1) << 1;
         *rhf = VKR_FMT_RG8;
+        return *blend ? VD_BLEND_ORDER : VD_TAKEN;
+    }
+    if (is_float && comps == 2 && fmt == HD5770_FMT_32_32_FLOAT &&
+        src[0] < 4 && src[1] < 4) {
+        *out = 2;
+        *mask = ((wmask >> src[0]) & 1) | ((wmask >> src[1]) & 1) << 1;
+        *rhf = VKR_FMT_RG32F;
         return *blend ? VD_BLEND_ORDER : VD_TAKEN;
     }
     for (i = 0; i < 4; i++) {
