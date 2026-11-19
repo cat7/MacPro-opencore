@@ -91,6 +91,8 @@
 #define SQ_ALU_CONST_CACHE_VS_0         0x28980
 #define PA_SC_MODE_CNTL_0               0x28a48
 #define PA_SC_AA_CONFIG                 0x28be0
+#define PA_CL_GB_VERT_CLIP_ADJ          0x28be8
+#define PA_CL_GB_HORZ_CLIP_ADJ          0x28bf0
 #define PA_SU_VTX_CNTL                  0x28c08
 #define CB_COLOR0_BASE                  0x28c60
 #define CB_COLOR_STRIDE                 0x3c
@@ -3147,6 +3149,43 @@ static void scissor(Draw *d, uint32_t tl, uint32_t br, bool woff, int wx,
     d->y1 = MIN(d->y1, y1);
 }
 
+/*
+ * The clipper cuts at the viewport widened by the guard band
+ * (PA_CL_GB_*_CLIP_ADJ, 1.0 while not written): nothing is drawn outside
+ * that rectangle, which is applied as a scissor
+ */
+static void clip_scissor(Draw *d, unsigned prim)
+{
+    HD5770Gfx *g = d->g;
+    const float *vp = (const float *)&g->ctx[(PA_CL_VPORT_XSCALE_0 - 0x28000)
+                                             / 4];
+    uint32_t wo = CTX(g, PA_SC_WINDOW_OFFSET);
+    bool woff = CTX(g, PA_SU_SC_MODE_CNTL) & (1u << 16);
+    float pc = (CTX(g, PA_SU_VTX_CNTL) & 1) ? 0.5f : 0.0f;
+    int *c[2][2] = { { &d->x0, &d->x1 }, { &d->y0, &d->y1 } };
+    unsigned a;
+
+    if (prim == PRIM_RECTLIST || ((CTX(g, PA_CL_CLIP_CNTL) >> 16) & 1) ||
+        (CTX(g, PA_CL_VTE_CNTL) & 0x10f) != 0xf) {
+        return;
+    }
+    for (a = 0; a < 2; a++) {
+        float gb, ext, off, lo, hi;
+
+        memcpy(&gb, &g->ctx[((a ? PA_CL_GB_VERT_CLIP_ADJ
+                                : PA_CL_GB_HORZ_CLIP_ADJ) - 0x28000) / 4], 4);
+        ext = fabsf(vp[a * 2]) * (gb >= 1.0f ? gb : 1.0f);
+        off = vp[a * 2 + 1] + (woff ? (int16_t)(wo >> (16 * a)) : 0);
+        /* a pixel is in when its centre is */
+        lo = fminf(fmaxf(off - ext - pc, 0.0f), 16384.0f);
+        hi = fminf(fmaxf(off + ext - pc, 0.0f), 16384.0f);
+        if (lo == lo && hi == hi) {
+            *c[a][0] = MAX(*c[a][0], (int)ceilf(lo));
+            *c[a][1] = MIN(*c[a][1], (int)ceilf(hi));
+        }
+    }
+}
+
 /* R0 on entry: x vertex index, w instance index */
 /* window coordinates of clip space position x, y, z, w */
 static void vtx_window(Draw *d, Vtx *v, float x, float y, float z, float w)
@@ -5511,6 +5550,7 @@ void hd5770_gfx_draw(HD5770Gfx *g, const uint32_t *b, uint32_t n)
         scissor(d, CTX(g, PA_SC_VPORT_SCISSOR_0_TL),
                 CTX(g, PA_SC_VPORT_SCISSOR_0_BR), true, wx, wy);
     }
+    clip_scissor(d, prim);
     for (i = 0; i < 4; i++) {
         uint32_t tl = CTX(g, PA_SC_CLIPRECT_RULE + 4 + 8 * i);
         uint32_t br = CTX(g, PA_SC_CLIPRECT_RULE + 8 + 8 * i);
