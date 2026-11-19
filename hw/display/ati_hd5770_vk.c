@@ -13,6 +13,14 @@
  * lies over the scanout or has not been drawn to for a second, or when
  * another image over the same memory is used.
  *
+ * FENCES. A fence with images to write back queues their read-out behind
+ * the draws and returns a ticket; the thread vk_retire() waits for the
+ * GPU, puts the pixels in memory and retires the ticket, tickets in
+ * order. Until then the image stands for its memory: it is not compared
+ * with it, another image over the same bytes waits for the ticket, and
+ * so does a sync. The engine's thread owns everything else here; the
+ * two share tickets, issued and retired under lock.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -21,6 +29,8 @@
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
+#include "qemu/rcu.h"
 #include "ati_hd5770_gpu.h"
 #include "vk_raster.h"
 
@@ -30,6 +40,8 @@
 
 #define VK_HASH         4096
 #define VK_LAZY_NS      1000000000ll
+/* draws queued before a fence hands them to the GPU */
+#define VK_UNSENT       128
 
 enum {
     VD_TAKEN, VD_EMPTY, VD_RESOLVE, VD_PROG_FORM, VD_PROG_VTX,
@@ -52,6 +64,13 @@ static const char *const vb_name[VB_N] = {
     "sync", "range sync", "scanout", "idle", "other image",
 };
 
+/* the parts of a draw, timed */
+enum { VP_STATE, VP_IMAGES, VP_STAGES, VP_READY, VP_WORDS, VP_QUEUE, VP_N };
+
+static const char *const vp_name[VP_N] = {
+    "state", "images", "stages", "coherence", "words", "renderer",
+};
+
 typedef struct VkSurf {
     HD5770GpuSurf lv[HD5770_GPU_LEVELS];    /* lv[0]: the surface */
     uint32_t lw[HD5770_GPU_LEVELS], lh[HD5770_GPU_LEVELS];  /* elements */
@@ -68,6 +87,8 @@ typedef struct VkSurf {
     bool loaded, dirty;
     int r[4];                   /* drawn and not written back */
     uint64_t gen, epoch, used;
+    uint64_t flight;            /* the ticket that writes it back */
+    bool flying;                /* in HD5770Vk.flying */
     int64_t tdraw;
     struct VkSurf *hnext;       /* the next that starts at the same place */
 } VkSurf;
@@ -77,6 +98,27 @@ typedef struct VkVb {
     uint64_t voff, gen, epoch;
     uint32_t len, off;
 } VkVb;
+
+/* buffers one thread works in */
+typedef struct VkScratch {
+    uint8_t *tmp;
+    size_t tmp_len;
+    uint64_t *offs;
+    size_t noffs;
+} VkScratch;
+
+/* an image's pixels on their way to memory */
+typedef struct VkBack {
+    VkSurf *e;
+    int r[4];
+    const uint8_t *px;
+} VkBack;
+
+typedef struct VkTicket {
+    uint64_t id;
+    VkrMark *mark;
+    GArray *backs;
+} VkTicket;
 
 typedef struct VkNote {
     unsigned stage;
@@ -95,6 +137,16 @@ typedef struct HD5770Vk {
     uint8_t *vram, *ram;
     uint64_t vram_size, ram_size;
     GPtrArray *surfs, *dirty;
+    GPtrArray *flying;          /* images a ticket may still write back */
+    GArray *backs;              /* read-outs queued, not yet with the GPU */
+    QemuThread thread;
+    QemuMutex lock;
+    QemuCond work, done;
+    GQueue tickets;
+    uint64_t issued, retired;
+    bool quit;
+    VkScratch sc, rsc;          /* the engine's, the retiring thread's */
+    unsigned unsent;            /* draws queued since the last hand-over */
     VkSurf *hb[VK_HASH];        /* the images by where they start */
     uint64_t limit;             /* device memory the images may take */
     GHashTable *progs;          /* key -> VkrShader, or vk_fail */
@@ -106,15 +158,14 @@ typedef struct HD5770Vk {
     char *fail_log;
     char last_surf[160];        /* the last surface without an image */
     GHashTable *vbs;            /* VRAM offset -> VkVb */
-    uint8_t *tmp;
-    size_t tmp_len;
-    uint64_t *offs;
-    size_t noffs;
     uint64_t nd[VD_N], dims[8], rtf[64], txf[64];
-    uint64_t uploads, upload_bytes, backs[VB_N], back_bytes[VB_N];
+    uint64_t uploads, upload_bytes, nback[VB_N], back_bytes[VB_N];
     uint64_t fences, syncs, ranges;
     uint64_t vs_draws, vs_tris, tris, vb_bytes, evicted;
-    int64_t draw_ns, sync_ns;
+    int64_t draw_ns, sync_ns, wait_ns;
+    int64_t part_ns[VP_N];
+    /* the retiring thread's: waiting for the GPU, copying to memory */
+    int64_t rgpu_ns, rcopy_ns;
 } HD5770Vk;
 
 static int vk_fail;
@@ -129,14 +180,14 @@ static bool vk_decline(HD5770Vk *m, unsigned r, unsigned why)
     return false;
 }
 
-static void *vk_tmp(HD5770Vk *m, size_t n)
+static void *vk_tmp(VkScratch *c, size_t n)
 {
-    if (m->tmp_len < n) {
-        g_free(m->tmp);
-        m->tmp = g_malloc(n);
-        m->tmp_len = n;
+    if (c->tmp_len < n) {
+        g_free(c->tmp);
+        c->tmp = g_malloc(n);
+        c->tmp_len = n;
     }
-    return m->tmp;
+    return c->tmp;
 }
 
 /* surface bytes from o on in memory: *n of them are contiguous there */
@@ -154,17 +205,17 @@ static inline uint8_t *vk_at(HD5770Vk *m, const HD5770GpuSurf *s, uint64_t o,
 }
 
 /* w x h elements at (x0, y0) of a surface from or to rows of px */
-static void vk_rect_io(HD5770Vk *m, const HD5770GpuSurf *s, uint32_t x0,
-                       uint32_t y0, uint32_t w, uint32_t h, uint8_t *px,
-                       bool put)
+static void vk_rect_io(HD5770Vk *m, VkScratch *c, const HD5770GpuSurf *s,
+                       uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
+                       uint8_t *px, bool put)
 {
     uint32_t bpe = s->s.bpe, x, y;
     size_t n;
 
-    if (m->noffs < w) {
-        g_free(m->offs);
-        m->offs = g_new(uint64_t, w);
-        m->noffs = w;
+    if (c->noffs < w) {
+        g_free(c->offs);
+        c->offs = g_new(uint64_t, w);
+        c->noffs = w;
     }
     for (y = 0; y < h; y++) {
         uint8_t *row = px + (size_t)y * w * bpe;
@@ -182,9 +233,9 @@ static void vk_rect_io(HD5770Vk *m, const HD5770GpuSurf *s, uint32_t x0,
             }
             continue;
         }
-        hd5770_surf_row(&s->s, x0, y0 + y, w, m->offs);
+        hd5770_surf_row(&s->s, x0, y0 + y, w, c->offs);
         for (x = 0; x < w; x++) {
-            uint8_t *p = vk_at(m, s, m->offs[x], &n);
+            uint8_t *p = vk_at(m, s, c->offs[x], &n);
 
             if (put) {
                 memcpy(p, row + (size_t)x * bpe, bpe);
@@ -285,7 +336,7 @@ static void vk_load(HD5770Vk *m, VkSurf *e)
 
     for (l = 0; l < e->nlv; l++) {
         size_t n = (size_t)e->lw[l] * e->lh[l] * e->lv[l].s.bpe;
-        uint8_t *px = vk_tmp(m, n + (size_t)e->lw[l] * e->lh[l] * 4);
+        uint8_t *px = vk_tmp(&m->sc, n + (size_t)e->lw[l] * e->lh[l] * 4);
         uint8_t *src = px;
 
         for (sl = 0; sl < (e->vol ? MAX(e->slices >> l, 1u) : e->slices);
@@ -294,7 +345,7 @@ static void vk_load(HD5770Vk *m, VkSurf *e)
 
             s.s.base += sl * e->sb[l];
             s.voff += sl * e->sb[l];
-            vk_rect_io(m, &s, 0, 0, e->lw[l], e->lh[l], px, false);
+            vk_rect_io(m, &m->sc, &s, 0, 0, e->lw[l], e->lh[l], px, false);
             if (s.space) {
                 if (e->shadow[l] && !memcmp(e->shadow[l], px, n) &&
                     e->loaded) {
@@ -324,66 +375,126 @@ static void vk_load(HD5770Vk *m, VkSurf *e)
     e->loaded = true;
 }
 
-/* the image's pixels drawn go to memory */
-static void vk_back(HD5770Vk *m, VkSurf *e, unsigned why)
+/* the read-out of the pixels drawn is queued: the image is not dirty */
+static void vk_back_queue(HD5770Vk *m, VkSurf *e, unsigned why)
 {
-    const HD5770GpuSurf *s = &e->lv[0];
-    uint32_t w, h;
-    uint64_t lo, hi;
-    uint8_t *px, *dst;
-    size_t n;
+    VkBack b = { .e = e, .r = { e->r[0], e->r[1], e->r[2], e->r[3] } };
+    uint32_t w = e->r[2] - e->r[0], h = e->r[3] - e->r[1];
 
-    if (!e->dirty) {
-        return;
-    }
     e->dirty = false;
     g_ptr_array_remove_fast(m->dirty, e);
-    w = e->r[2] - e->r[0];
-    h = e->r[3] - e->r[1];
-    n = (size_t)w * h;
-    px = vk_tmp(m, n * (s->s.bpe + 4));
-    dst = px;
+    b.px = vkr_image_read_later(m->r, e->img, e->r[0], e->r[1], w, h);
+    g_array_append_val(m->backs, b);
+    m->nback[why]++;
+    m->back_bytes[why] += (uint64_t)w * h * e->lv[0].s.bpe;
+}
+
+/*
+ * pixels read out go to memory, the bytes written are reported. own: on
+ * the engine's thread, which also notes memory as seen; the retiring
+ * thread leaves that to the write log.
+ */
+static void vk_back_apply(HD5770Vk *m, const VkBack *b, VkScratch *c,
+                          bool own)
+{
+    VkSurf *e = b->e;
+    const HD5770GpuSurf *s = &e->lv[0];
+    uint32_t w = b->r[2] - b->r[0], h = b->r[3] - b->r[1];
+    size_t n = (size_t)w * h;
+    uint8_t *dst = (uint8_t *)b->px;
+    uint64_t lo, hi;
+
     if (e->zfmt) {
-        dst = px + n * 4;
-        vkr_image_read(m->r, e->img, e->r[0], e->r[1], w, h, px);
+        dst = vk_tmp(c, n * s->s.bpe);
         if (e->zfmt == 2) {
             /* the bits above the depth stay */
-            vk_rect_io(m, s, e->r[0], e->r[1], w, h, dst, false);
+            vk_rect_io(m, c, s, b->r[0], b->r[1], w, h, dst, false);
         }
-        vk_z_out(e->zfmt, px, dst, n);
-    } else {
-        vkr_image_read(m->r, e->img, e->r[0], e->r[1], w, h, px);
+        vk_z_out(e->zfmt, b->px, dst, n);
     }
-    vk_rect_io(m, s, e->r[0], e->r[1], w, h, dst, true);
-    hd5770_surf_rows(&s->s, e->r[1], e->r[3], &lo, &hi);
+    vk_rect_io(m, c, s, b->r[0], b->r[1], w, h, dst, true);
+    hd5770_surf_rows(&s->s, b->r[1], b->r[3], &lo, &hi);
     lo = MIN(lo - s->s.base, e->cov[0]);
     hi = MIN(hi - s->s.base, e->cov[0]);
     if (e->shadow[0]) {
         memcpy(e->shadow[0] + lo, m->vram + s->voff + lo, hi - lo);
     }
-    vk_named(m, s->voff + lo, s->voff + hi);
-    e->gen = m->gen;
+    if (own) {
+        vk_named(m, s->voff + lo, s->voff + hi);
+        e->gen = m->gen;
+    }
     if (m->pub.done) {
         m->pub.done(m->pub.opaque, s->voff + lo, s->voff + hi);
     }
-    m->backs[why]++;
-    m->back_bytes[why] += n * s->s.bpe;
 }
 
-/* images newer than memory over VRAM [lo, hi), but e, are written back */
+/* ticket id, and so every one before it, is retired */
+static void vk_wait(HD5770Vk *m, uint64_t id)
+{
+    int64_t t0;
+
+    if (qatomic_read(&m->retired) >= id) {
+        return;
+    }
+    t0 = get_clock();
+    qemu_mutex_lock(&m->lock);
+    while (m->retired < id) {
+        qemu_cond_wait(&m->done, &m->lock);
+    }
+    qemu_mutex_unlock(&m->lock);
+    m->wait_ns += get_clock() - t0;
+}
+
+/* the read-outs queued are in memory */
+static void vk_backs_now(HD5770Vk *m)
+{
+    VkrMark *k;
+    unsigned i;
+
+    if (!m->backs->len) {
+        return;
+    }
+    k = vkr_mark(m->r);
+    vkr_flush(m->r, true);
+    m->unsent = 0;
+    for (i = 0; i < m->backs->len; i++) {
+        vk_back_apply(m, &g_array_index(m->backs, VkBack, i), &m->sc, true);
+    }
+    g_array_set_size(m->backs, 0);
+    vkr_mark_free(m->r, k);
+}
+
+/*
+ * images newer than memory over VRAM [lo, hi), but e, are written back,
+ * and none over it is on its way there
+ */
 static void vk_settle(HD5770Vk *m, const VkSurf *e, uint64_t lo, uint64_t hi,
                       unsigned why)
 {
+    uint64_t retired = qatomic_read(&m->retired), wait = 0;
     unsigned i;
 
+    for (i = 0; i < m->flying->len; i++) {
+        VkSurf *o = g_ptr_array_index(m->flying, i);
+
+        if (o->flight <= retired) {
+            o->flying = false;
+            g_ptr_array_remove_index_fast(m->flying, i--);
+        } else if (o != e && o->lo < hi && lo < o->hi) {
+            wait = MAX(wait, o->flight);
+        }
+    }
     for (i = 0; i < m->dirty->len; i++) {
         VkSurf *o = g_ptr_array_index(m->dirty, i);
 
         if (o != e && o->lo < hi && lo < o->hi) {
-            vk_back(m, o, why);
+            wait = MAX(wait, o->flight);
+            vk_back_queue(m, o, why);
             i--;
         }
     }
+    vk_wait(m, wait);
+    vk_backs_now(m);
 }
 
 /* the image is what memory holds, or newer */
@@ -396,7 +507,8 @@ static void vk_ready(HD5770Vk *m, VkSurf *e)
     for (l = 0; l < e->nlv && !e->lv[l].space; l++) {
         vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
     }
-    if (e->dirty || (e->epoch == m->epoch && e->loaded)) {
+    if (e->dirty || e->flight > qatomic_read(&m->retired) ||
+        (e->epoch == m->epoch && e->loaded)) {
         return;
     }
     e->epoch = m->epoch;
@@ -460,8 +572,12 @@ static void vk_evict(HD5770Vk *m)
     for (i = 0; i < m->surfs->len && n; i++) {
         VkSurf *e = g_ptr_array_index(m->surfs, i), **h;
 
-        if (e->dirty || e->used == m->seq) {
+        if (e->dirty || e->used == m->seq ||
+            e->flight > qatomic_read(&m->retired)) {
             continue;
+        }
+        if (e->flying) {
+            g_ptr_array_remove_fast(m->flying, e);
         }
         for (h = &m->hb[vk_hash(&e->lv[0])]; *h != e; h = &(*h)->hnext) {
             /* search */
@@ -1012,6 +1128,8 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     unsigned hf[HD5770_GPU_TEX], lvs[HD5770_GPU_TEX];
     unsigned nrt, nt = 0, nat = 0, i, j, c, mask = 0;
     bool hasz = d->db && d->zfmt;
+    int64_t tp = get_clock(), tn;
+#define VK_PART(i) (tn = get_clock(), m->part_ns[i] += tn - tp, tp = tn)
     uint32_t vw = UINT32_MAX, vh = UINT32_MAX, padded = 0, flat, *u, uo, vo;
     int sc[4] = { d->sc[0], d->sc[1], d->sc[2], d->sc[3] };
     int x0, y0, x1, y1, bx0 = INT_MAX, by0 = INT_MAX, bx1 = -1, by1 = -1;
@@ -1184,6 +1302,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
             return vk_decline(m, VD_VS, HD5770_WHY_BK_NATIVE_STATE);
         }
     }
+    VK_PART(VP_STATE);
     for (i = 0; i < nt && !m->dry; i++) {
         tg[i].e = vk_surf(m, tg[i].surf, tg[i].hf, 0, 1, NULL, 1);
         if (!tg[i].e) {
@@ -1294,6 +1413,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     for (i = 0; i < 4; i++) {
         k.rt_src[i] = tg[0].src[i];
     }
+    VK_PART(VP_IMAGES);
     flat = hd5770_glsl_native_flat(ir, &k);
     key = g_string_new(NULL);
     g_string_printf(key, "f%016" PRIx64 "/%u/%u/%d/%08x/%u%u%u%u/%u%u%u/%u%u/%x",
@@ -1371,6 +1491,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     if (!q.vs) {
         return vk_decline(m, v ? VD_VS : VD_PROG_BUILD, HD5770_WHY_BK_PROG);
     }
+    VK_PART(VP_STAGES);
     for (i = 0; i < d->ntex; i++) {
         vk_ready(m, ts[i]);
     }
@@ -1391,6 +1512,7 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     if (need > (64u << 20)) {
         return vk_decline(m, VD_ROOM, HD5770_WHY_BK_ROOM);
     }
+    VK_PART(VP_READY);
     vkr_data_room(m->r, need);
     u = vkr_data(m->r, (HD5770_NU_WORDS + ir->nconsts + 1) * 4, &uo);
     memset(u, 0, HD5770_NU_WORDS * 4);
@@ -1545,7 +1667,11 @@ static bool vk_draw_locked(HD5770Vk *m, const HD5770GpuDraw *d)
     q.scissor[1] = y0;
     q.scissor[2] = x1;
     q.scissor[3] = y1;
+    VK_PART(VP_WORDS);
     vkr_draw(m->r, &q);
+    VK_PART(VP_QUEUE);
+#undef VK_PART
+    m->unsent++;
     for (i = 0; i < nt; i++) {
         vk_drew(m, tg[i].e, x0, y0, x1, y1);
     }
@@ -1645,10 +1771,11 @@ static void vk_sync(void *opaque)
     HD5770Vk *m = opaque;
     int64_t t0 = get_clock();
 
+    vk_wait(m, m->issued);
     while (m->dirty->len) {
-        vk_back(m, g_ptr_array_index(m->dirty, 0), VB_SYNC);
+        vk_back_queue(m, g_ptr_array_index(m->dirty, 0), VB_SYNC);
     }
-    vkr_flush(m->r, false);
+    vk_backs_now(m);
     vk_epoch(m);
     m->syncs++;
     m->sync_ns += get_clock() - t0;
@@ -1658,14 +1785,57 @@ static void vk_sync_range(void *opaque, uint64_t off, uint64_t len)
 {
     HD5770Vk *m = opaque;
     int64_t t0 = get_clock();
-    unsigned n = m->dirty->len;
+    uint64_t seen = m->nback[VB_RANGE];
 
     vk_settle(m, NULL, off, off + len, VB_RANGE);
-    if (n != m->dirty->len) {
+    if (seen != m->nback[VB_RANGE]) {
         vk_epoch(m);
     }
     m->ranges++;
     m->sync_ns += get_clock() - t0;
+}
+
+/* the retiring thread: FENCES above */
+static void *vk_retire(void *opaque)
+{
+    HD5770Vk *m = opaque;
+    VkTicket *t;
+    int64_t t0, t1;
+    unsigned i;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_mutex_lock(&m->lock);
+        while (!m->quit && g_queue_is_empty(&m->tickets)) {
+            qemu_cond_wait(&m->work, &m->lock);
+        }
+        t = g_queue_pop_head(&m->tickets);
+        qemu_mutex_unlock(&m->lock);
+        if (!t) {
+            break;
+        }
+        t0 = get_clock();
+        vkr_mark_wait(m->r, t->mark);
+        t1 = get_clock();
+        for (i = 0; i < t->backs->len; i++) {
+            vk_back_apply(m, &g_array_index(t->backs, VkBack, i), &m->rsc,
+                          false);
+        }
+        vkr_mark_free(m->r, t->mark);
+        qatomic_set(&m->rgpu_ns, m->rgpu_ns + t1 - t0);
+        qatomic_set(&m->rcopy_ns, m->rcopy_ns + get_clock() - t1);
+        qemu_mutex_lock(&m->lock);
+        qatomic_set(&m->retired, t->id);
+        qemu_cond_broadcast(&m->done);
+        qemu_mutex_unlock(&m->lock);
+        if (m->pub.retired) {
+            m->pub.retired(m->pub.opaque, t->id);
+        }
+        g_array_free(t->backs, true);
+        g_free(t);
+    }
+    rcu_unregister_thread();
+    return NULL;
 }
 
 static uint64_t vk_fence(void *opaque)
@@ -1680,15 +1850,41 @@ static uint64_t vk_fence(void *opaque)
         VkSurf *e = g_ptr_array_index(m->dirty, i);
 
         if ((e->lo < hi && lo < e->hi) || t0 - e->tdraw >= VK_LAZY_NS) {
-            vk_back(m, e, e->lo < hi && lo < e->hi ? VB_SCANOUT : VB_IDLE);
+            vk_back_queue(m, e, e->lo < hi && lo < e->hi ? VB_SCANOUT
+                                                         : VB_IDLE);
             i--;
         }
     }
-    vkr_flush(m->r, false);
+    if (m->backs->len) {
+        VkTicket *t = g_new0(VkTicket, 1);
+
+        t->id = m->issued + 1;
+        for (i = 0; i < m->backs->len; i++) {
+            VkSurf *e = g_array_index(m->backs, VkBack, i).e;
+
+            e->flight = t->id;
+            if (!e->flying) {
+                e->flying = true;
+                g_ptr_array_add(m->flying, e);
+            }
+        }
+        t->backs = m->backs;
+        m->backs = g_array_new(false, false, sizeof(VkBack));
+        t->mark = vkr_mark(m->r);
+        m->unsent = 0;
+        qemu_mutex_lock(&m->lock);
+        m->issued = t->id;
+        g_queue_push_tail(&m->tickets, t);
+        qemu_cond_signal(&m->work);
+        qemu_mutex_unlock(&m->lock);
+    } else if (m->unsent >= VK_UNSENT) {
+        vkr_flush(m->r, false);
+        m->unsent = 0;
+    }
     vk_epoch(m);
     m->fences++;
     m->sync_ns += get_clock() - t0;
-    return 0;
+    return qatomic_read(&m->retired) < m->issued ? m->issued : 0;
 }
 
 static void vk_wrote(void *opaque, uint64_t off, uint64_t len)
@@ -1722,15 +1918,24 @@ static void vk_stats(void *opaque, GString *out)
         " MB (%u newer than memory, %" PRIu64 " dropped)\n"
         "vk: loads %" PRIu64 " (%" PRIu64 " MB) fences %" PRIu64 " syncs %"
         PRIu64 " range syncs %" PRIu64 "; ms in draws %" PRId64
-        " in syncs and fences %" PRId64 "\nvk: write-backs",
+        " in syncs and fences %" PRId64 " (waiting for tickets %" PRId64
+        "); tickets %" PRIu64 ", their thread ms for the GPU %" PRId64
+        " copying %" PRId64 "\nvk: write-backs",
         m->vs_draws, m->vs_tris, m->tris, m->vb_bytes >> 20, m->surfs->len,
         vkr_image_bytes(m->r) >> 20, m->dirty->len, m->evicted, m->uploads, m->upload_bytes >> 20,
         m->fences, m->syncs, m->ranges, m->draw_ns / 1000000,
-        m->sync_ns / 1000000);
+        m->sync_ns / 1000000, m->wait_ns / 1000000, m->issued,
+        qatomic_read(&m->rgpu_ns) / 1000000,
+        qatomic_read(&m->rcopy_ns) / 1000000);
     for (i = 0; i < VB_N; i++) {
         g_string_append_printf(out, " %s %" PRIu64 " (%" PRIu64 " MB);",
-                               vb_name[i], m->backs[i],
+                               vb_name[i], m->nback[i],
                                m->back_bytes[i] >> 20);
+    }
+    g_string_append(out, "\nvk: ms in a draw's parts:");
+    for (i = 0; i < VP_N; i++) {
+        g_string_append_printf(out, " %s %" PRId64 ";", vp_name[i],
+                               m->part_ns[i] / 1000000);
     }
     g_string_append(out, "\nvk: draws");
     for (i = 0; i < VD_N; i++) {
@@ -1767,11 +1972,21 @@ static void vk_close(void *opaque)
     unsigned i;
 
     vk_sync(m);
+    qemu_mutex_lock(&m->lock);
+    m->quit = true;
+    qemu_cond_signal(&m->work);
+    qemu_mutex_unlock(&m->lock);
+    qemu_thread_join(&m->thread);
+    qemu_mutex_destroy(&m->lock);
+    qemu_cond_destroy(&m->work);
+    qemu_cond_destroy(&m->done);
     for (i = 0; i < m->surfs->len; i++) {
         vkr_image_free(m->r, ((VkSurf *)g_ptr_array_index(m->surfs, i))->img);
     }
     g_ptr_array_free(m->surfs, true);
     g_ptr_array_free(m->dirty, true);
+    g_ptr_array_free(m->flying, true);
+    g_array_free(m->backs, true);
     g_hash_table_destroy(m->progs);
     g_hash_table_destroy(m->noted);
     g_array_free(m->jobs, true);
@@ -1779,8 +1994,10 @@ static void vk_close(void *opaque)
     vkr_close(m->r);
     g_free(m->pgen);
     g_free(m->fail_log);
-    g_free(m->tmp);
-    g_free(m->offs);
+    g_free(m->sc.tmp);
+    g_free(m->sc.offs);
+    g_free(m->rsc.tmp);
+    g_free(m->rsc.offs);
     g_free(m);
 }
 
@@ -1830,6 +2047,12 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     m->vram_size = vram_size;
     m->surfs = g_ptr_array_new_with_free_func(vk_surf_free);
     m->dirty = g_ptr_array_new();
+    m->flying = g_ptr_array_new();
+    m->backs = g_array_new(false, false, sizeof(VkBack));
+    g_queue_init(&m->tickets);
+    qemu_mutex_init(&m->lock);
+    qemu_cond_init(&m->work);
+    qemu_cond_init(&m->done);
     m->progs = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     m->noted = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
                                      vk_note_free);
@@ -1843,5 +2066,7 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     m->pub.ops = &vk_ops;
     m->pub.b = m;
     m->pub.vs_draw = true;
+    qemu_thread_create(&m->thread, "hd5770-vk", vk_retire, m,
+                       QEMU_THREAD_JOINABLE);
     return &m->pub;
 }
