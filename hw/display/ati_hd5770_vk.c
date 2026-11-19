@@ -93,8 +93,9 @@ typedef struct VkSurf {
     /*
      * PARTS. A target that is one level's slice of a texture's image is
      * copied into it on the GPU, not written back for it. serial names
-     * an image; into: the image this one was last copied into; copied:
-     * nothing was drawn to it since.
+     * an image as it is since its last load from memory; into: the image
+     * this one was last copied into; copied: nothing was drawn to it
+     * since.
      */
     uint64_t serial, into;
     bool copied;
@@ -374,6 +375,8 @@ static void vk_load(HD5770Vk *m, VkSurf *e)
 {
     unsigned l, sl;
 
+    /* PARTS copied into it are gone */
+    e->serial = ++m->serial;
     for (l = 0; l < e->nlv; l++) {
         size_t n = (size_t)e->lw[l] * e->lh[l] * e->lv[l].s.bpe;
         uint8_t *px = vk_tmp(&m->sc, n + (size_t)e->lw[l] * e->lh[l] * 4);
@@ -631,19 +634,20 @@ static void vk_fresh(HD5770Vk *m, VkSurf *e)
 /* the image is ready for a draw: none over it is newer than it */
 static void vk_ready(HD5770Vk *m, VkSurf *e)
 {
+    /* nothing over it was drawn to since it settled */
+    bool settled = e->settled == m->drawn;
+    uint64_t serial = e->serial;
     unsigned l;
 
     e->used = m->seq;
-    /* nothing over it was drawn to since it settled */
-    if (e->settled == m->drawn) {
-        vk_fresh(m, e);
-        return;
-    }
-    for (l = 0; l < e->nlv && !e->lv[l].space; l++) {
+    for (l = 0; l < e->nlv && !e->lv[l].space && !settled; l++) {
         vk_settle(m, e, e->lv[l].voff, e->lv[l].voff + e->cov[l], VB_ALIAS);
     }
     vk_fresh(m, e);
-    vk_parts(m, e);
+    /* a load from memory lost the parts copied before */
+    if (!settled || e->serial != serial) {
+        vk_parts(m, e);
+    }
     e->settled = m->drawn;
 }
 
