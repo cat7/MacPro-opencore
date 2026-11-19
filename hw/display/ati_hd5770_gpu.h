@@ -552,10 +552,6 @@ char *hd5770_msl_native_vs(const HD5770IR *ir, unsigned ninputs,
 HD5770Gpu *hd5770_mtlr_open(uint8_t *vram, uint64_t vram_size,
                             const char **err);
 
-/* the OpenGL backend (Windows); NULL and *err set if there is none */
-HD5770Gpu *hd5770_gl_open(uint8_t *vram, uint64_t vram_size,
-                          const char **err);
-
 /*
  * The rasterisation pipeline on Vulkan (Windows, ati_hd5770_vk.c with the
  * card-neutral renderer vk_raster.c): the stages of a draw as Vulkan

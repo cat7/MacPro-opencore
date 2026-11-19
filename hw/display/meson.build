@@ -105,16 +105,13 @@ system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: files('ati_hd5770.c', 'ati_hd5
                                                         'ati_hd5770_mc.c', 'ati_hd5770_cp.c', 'ati_hd5770_dma.c',
                                                         'ati_hd5770_surf.c', 'ati_hd5770_sh.c', 'ati_hd5770_draw.c',
                                                         'ati_hd5770_emit.c'))
-# the HD 5770's 3D engine on the host GPU: Metal on macOS, OpenGL (WGL) on
+# the HD 5770's 3D engine on the host GPU: Metal on macOS, Vulkan on
 # Windows
 if host_os == 'darwin'
   system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_msl.c', 'ati_hd5770_mtl.m',
                                                          'ati_hd5770_mtlr.m'),
                 dependency('appleframeworks', modules: ['Metal', 'Foundation'])])
 elif host_os == 'windows'
-  system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('ati_hd5770_glsl.c', 'ati_hd5770_gl.c'),
-                cc.find_library('opengl32'), cc.find_library('gdi32'),
-                cc.find_library('user32')])
   # the rasterisation pipeline on Vulkan, shaders through glslang
   hd5770_vk = [dependency('vulkan', required: false)]
   foreach l : ['glslang', 'glslang-default-resource-limits', 'SPIRV-Tools-opt',
@@ -126,7 +123,8 @@ elif host_os == 'windows'
     hd5770_vk_found = hd5770_vk_found and d.found()
   endforeach
   if hd5770_vk_found
-    system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('vk_raster.c', 'ati_hd5770_vk.c'),
+    system_ss.add(when: 'CONFIG_ATI_HD5770', if_true: [files('vk_raster.c', 'ati_hd5770_vk.c',
+                                                           'ati_hd5770_glsl.c'),
                   declare_dependency(compile_args: '-DCONFIG_ATI_HD5770_VK'),
                   hd5770_vk])
   endif

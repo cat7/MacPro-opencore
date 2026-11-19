@@ -2012,18 +2012,12 @@ static void gpu_open(ATIHD5770State *s)
                             &err)
          : hd5770_mtl_open(memory_region_get_ram_ptr(&s->vram), s->vram_size,
                            &err);
-#elif defined(CONFIG_WIN32)
-#ifdef CONFIG_ATI_HD5770_VK
-    if (strcmp(mode, "verify")) {
+#elif defined(CONFIG_ATI_HD5770_VK)
+    if (!strcmp(mode, "verify")) {
+        /* the host's rasteriser does not draw bit for bit as the CPU */
+        err = "nothing to verify against on this host";
+    } else {
         gp = hd5770_vk_open(memory_region_get_ram_ptr(&s->vram),
-                            s->vram_size, &err);
-        if (!gp) {
-            warn_report("ati-hd5770: no Vulkan renderer: %s", err);
-        }
-    }
-#endif
-    if (!gp) {
-        gp = hd5770_gl_open(memory_region_get_ram_ptr(&s->vram),
                             s->vram_size, &err);
     }
 #endif
