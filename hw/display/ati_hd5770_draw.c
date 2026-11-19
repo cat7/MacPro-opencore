@@ -696,6 +696,45 @@ void hd5770_gfx_touch(HD5770Gfx *g, uint64_t off, uint64_t len)
     pend_touch(g, off, len, true);
 }
 
+/*
+ * The CPU writes surface s: after the queued draws that touch it. With
+ * the native pipeline a surface not in one piece of VRAM is taken page
+ * by page: runs of VRAM pages by range, and guest RAM minds only the
+ * draws that use guest RAM.
+ */
+static void pend_write(HD5770Gfx *g, const HD5770Surf *s)
+{
+    uint64_t size = hd5770_surf_size(s), off, at, n, lo = 0, hi = 0;
+    bool all = !rd_written(g);
+
+    if (vram_off(g, s->base, size, &off)) {
+        hd5770_gfx_touch(g, off, size);
+        return;
+    }
+    if (!g->ram_pend && !g->npend) {
+        return;
+    }
+    for (at = s->base & ~0xfffull; !all && at < s->base + size; at += 4096) {
+        uint8_t *p = g->mem.map(g->mem.opaque, at, &n, false);
+
+        if (p && p >= g->vram && p < g->vram + g->vram_size) {
+            off = p - g->vram;
+            if (off != hi) {
+                hd5770_gfx_touch(g, lo, hi - lo);
+                lo = off;
+            }
+            hi = off + 4096;
+        } else if (p) {
+            all = g->ram_pend || g->ram_vpend;
+        }
+    }
+    if (all) {
+        hd5770_gfx_sync(g);
+    } else {
+        hd5770_gfx_touch(g, lo, hi - lo);
+    }
+}
+
 /* the CPU wrote memory at mc: a backend with a copy of it checks it again */
 static void cpu_wrote(HD5770Gfx *g, uint64_t mc, uint64_t len)
 {
@@ -4684,7 +4723,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
         /* the vertex buffers are read in place */
         const HD5770GpuSurf *b = &q->vs->vb[i].buf;
 
-        g->ram_vpend |= b->space;
+        g->ram_vpend |= b->space && !g->gpu->ram_copied;
         if (!b->space) {
             uint64_t lo = b->voff;
             uint64_t hi = MIN(b->voff + b->s.pitch, g->vram_size);
@@ -4710,7 +4749,7 @@ static bool gpu_draw(Draw *d, Vtx *const *vb, unsigned nv, unsigned prim,
     }
     for (i = 0; i < q->ntex; i++) {
         /* guest RAM the GPU reads is not tracked by range */
-        g->ram_pend |= q->tex[i].surf.space;
+        g->ram_pend |= q->tex[i].surf.space && !g->gpu->ram_copied;
         if (!q->tex[i].surf.space) {
             pend_add(g, q->tex[i].surf.voff, q->tex[i].surf.voff +
                      MAX(q->tex[i].slice_bytes[0] * q->tex[i].slices,
@@ -5349,26 +5388,12 @@ static void draw_prims(Draw *d, Vtx *const *vp, unsigned nv, unsigned prim,
         }
         /* the CPU writes the targets: after queued draws that touch them */
         for (i = 0; i < nws; i++) {
-            uint64_t off;
-
-            if (!ws[i]) {
-                continue;
-            }
-            if (vram_off(g, ws[i]->base, hd5770_surf_size(ws[i]), &off)) {
-                hd5770_gfx_touch(g, off, hd5770_surf_size(ws[i]));
-            } else if (g->ram_pend || g->npend) {
-                /* guest RAM, or VRAM through GART pages */
-                hd5770_gfx_sync(g);
+            if (ws[i]) {
+                pend_write(g, ws[i]);
             }
         }
         if (d->resolve) {
-            uint64_t off;
-
-            if (vram_off(g, d->rs.base, hd5770_surf_size(&d->rs), &off)) {
-                hd5770_gfx_touch(g, off, hd5770_surf_size(&d->rs));
-            } else if (g->ram_pend || g->npend) {
-                hd5770_gfx_sync(g);
-            }
+            pend_write(g, &d->rs);
         }
         int64_t t0 = get_clock();
         uint64_t px0 = d->st->pixels;

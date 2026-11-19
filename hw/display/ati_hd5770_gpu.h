@@ -434,6 +434,12 @@ typedef struct HD5770Gpu {
     uint64_t scan_lo, scan_hi;
     /* added 2026-11-18: set by a draw() that built a program or pipeline */
     bool built;
+    /*
+     * added 2026-11-19: draw() copies what the request reads of guest
+     * RAM; a later write to guest RAM does not wait for queued draws
+     * that only read it
+     */
+    bool ram_copied;
 } HD5770Gpu;
 
 /* the Metal backend (macOS); NULL and *err set if there is none */
