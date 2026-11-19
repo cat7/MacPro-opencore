@@ -52,7 +52,8 @@ typedef struct VkrRead {
 /* a command buffer handed to the GPU; done and held under VkRaster.lock */
 struct VkrMark {
     VkFence fence;
-    VkCommandBuffer cb;
+    VkCommandBuffer *cbs;
+    unsigned ncb;
     GPtrArray *reads;           /* the reads queued in it */
     bool done;                  /* reached, its command buffer freed */
     bool held;                  /* the caller has it */
@@ -61,6 +62,7 @@ struct VkrMark {
 struct VkrShader {
     VkShaderModule mod;
     unsigned stage;
+    char *sum;                  /* the text's checksum, with a cache */
 };
 
 typedef VkrPipeDesc VkrPipeKey;
@@ -68,7 +70,19 @@ typedef VkrPipeDesc VkrPipeKey;
 typedef struct VkrPipe {
     VkrPipeKey key;
     VkPipeline pipe;
+    bool ready;                 /* built, or failed; set under the lock */
+    char *line;                 /* of the list: built for the cache alone */
 } VkrPipe;
+
+/*
+ * A command buffer kept back. pipe: it is recorded from d once the
+ * pipeline is built, which the draw came before.
+ */
+typedef struct VkrHeld {
+    VkCommandBuffer cb;
+    VkrPipe *pipe;
+    VkrDraw d;
+} VkrHeld;
 
 typedef struct VkrSamp {
     VkrSampler s;
@@ -103,8 +117,12 @@ struct VkRaster {
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkPipelineCache pcache;
-    char *cache_dir, *cache_path;
+    char *cache_dir, *cache_path, *list_path;
     GHashTable *pipes;
+    GHashTable *listed;         /* the list's lines */
+    GThreadPool *builders;      /* VkrPipe: pipelines to build */
+    GCond built;                /* with lock: a pipeline became ready */
+    GArray *held;               /* VkrHeld, in the order they go to the GPU */
     GArray *samps;
     GPtrArray *blocks, *dead;
     uint64_t image_bytes;
@@ -128,10 +146,10 @@ struct VkRaster {
     } cur_state;
 
     uint64_t n_draws, n_scopes, n_submits, n_waits, n_pipes, n_shaders;
-    uint64_t n_compiled, n_ahead;
+    uint64_t n_compiled, n_ahead, n_held, n_listed;
     uint64_t n_writes, n_reads, n_copies, n_wraps, saved_pipes;
     int64_t saved_at;
-    int64_t pipe_ns, shader_ns, wait_ns;
+    int64_t pipe_ns, shader_ns, wait_ns, held_ns, listed_ns;
 };
 
 static const struct {
@@ -376,7 +394,8 @@ static void vkr_reap(VkRaster *r, bool all)
     while ((k = g_queue_peek_head(&r->subs)) &&
            (all || vkGetFenceStatus(r->dev, k->fence) == VK_SUCCESS)) {
         g_queue_pop_head(&r->subs);
-        vkFreeCommandBuffers(r->dev, r->pool, 1, &k->cb);
+        vkFreeCommandBuffers(r->dev, r->pool, k->ncb, k->cbs);
+        g_free(k->cbs);
         g_mutex_lock(&r->lock);
         k->done = true;
         if (!k->held) {
@@ -384,27 +403,69 @@ static void vkr_reap(VkRaster *r, bool all)
         }
         g_mutex_unlock(&r->lock);
     }
-    if (g_queue_is_empty(&r->subs)) {
+    if (g_queue_is_empty(&r->subs) && !r->held->len) {
         vkr_dead(r);
     }
 }
 
+/* the pipeline is built, or has failed; wait: not before */
+static bool vkr_built(VkRaster *r, VkrPipe *p, bool wait)
+{
+    bool ready = qatomic_read(&p->ready);
+
+    if (!ready) {
+        g_mutex_lock(&r->lock);
+        while (!p->ready && wait) {
+            g_cond_wait(&r->built, &r->lock);
+        }
+        ready = p->ready;
+        g_mutex_unlock(&r->lock);
+    }
+    return ready;
+}
+
+static void vkr_record(VkRaster *r, const VkrDraw *d, VkPipeline pipe);
+
+/*
+ * The command buffers kept back and the current one go to the GPU in
+ * their order, after the pipelines the draws kept back wait for.
+ */
 static VkrMark *vkr_submit(VkRaster *r)
 {
     VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &r->cb,
-    };
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkrMark *k = g_new0(VkrMark, 1);
+    unsigned i;
 
     vkr_end_scope(r);
     vkCreateFence(r->dev, &fi, NULL, &k->fence);
-    k->cb = r->cb;
     k->reads = r->reads;
     r->reads = g_ptr_array_new();
     vkEndCommandBuffer(r->cb);
+    k->ncb = r->held->len + 1;
+    k->cbs = g_new(VkCommandBuffer, k->ncb);
+    k->cbs[r->held->len] = r->cb;
+    for (i = 0; i < r->held->len; i++) {
+        VkrHeld *h = &g_array_index(r->held, VkrHeld, i);
+
+        if (h->pipe) {
+            int64_t t0 = g_get_monotonic_time();
+
+            vkr_built(r, h->pipe, true);
+            r->held_ns += (g_get_monotonic_time() - t0) * 1000;
+            vkr_begin(r);
+            if (h->pipe->pipe) {
+                vkr_record(r, &h->d, h->pipe->pipe);
+                vkr_end_scope(r);
+            }
+            vkEndCommandBuffer(r->cb);
+            h->cb = r->cb;
+        }
+        k->cbs[i] = h->cb;
+    }
+    g_array_set_size(r->held, 0);
+    si.commandBufferCount = k->ncb;
+    si.pCommandBuffers = k->cbs;
     vkQueueSubmit(r->queue, 1, &si, k->fence);
     g_queue_push_tail(&r->subs, k);
     r->n_submits++;
@@ -414,13 +475,23 @@ static VkrMark *vkr_submit(VkRaster *r)
 
 void vkr_flush(VkRaster *r, bool wait)
 {
+    unsigned i;
+
     vkr_end_scope(r);
-    if (r->n_pipes != r->saved_pipes &&
+    if (qatomic_read(&r->n_pipes) != r->saved_pipes &&
         g_get_monotonic_time() - r->saved_at > 10 * G_USEC_PER_SEC) {
         /* a run that is cut short keeps what it built */
         vkr_cache_save(r);
     }
-    if (r->cb_used) {
+    for (i = 0; !wait && i < r->held->len; i++) {
+        VkrHeld *h = &g_array_index(r->held, VkrHeld, i);
+
+        if (h->pipe && !vkr_built(r, h->pipe, false)) {
+            /* sent once the pipeline is built */
+            return;
+        }
+    }
+    if (r->cb_used || r->held->len) {
         vkr_submit(r);
     }
     if (wait && !g_queue_is_empty(&r->subs)) {
@@ -850,6 +921,8 @@ VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
         *log = g_strdup("the module was not accepted");
         g_free(s);
         s = NULL;
+    } else {
+        s->sum = g_steal_pointer(&sum);
     }
 out:
     if (pg) {
@@ -988,7 +1061,6 @@ static void vkr_pipe_build(VkRaster *r, VkrPipe *p)
         .pDynamicState = &dy,
         .layout = r->layout,
     };
-    int64_t t0;
     unsigned i;
 
     for (i = 0; i < key->ncolor; i++) {
@@ -1006,13 +1078,147 @@ static void vkr_pipe_build(VkRaster *r, VkrPipe *p)
             .colorWriteMask = b->mask & 0xf,
         };
     }
-    t0 = g_get_monotonic_time();
     if (vkCreateGraphicsPipelines(r->dev, r->pcache, 1, &ci, NULL,
                                   &p->pipe) != VK_SUCCESS) {
         p->pipe = VK_NULL_HANDLE;
     }
-    qatomic_inc(&r->n_pipes);
+}
+
+/*
+ * THE LIST. A line of it names a pipeline that was built: the checksums
+ * of its stages' texts and the rest of its key. At the start the
+ * pipelines of the lines whose stages are kept are built into the
+ * pipeline cache, so that a draw's is built from there.
+ */
+#define VKR_KEY_REST    offsetof(VkrPipeKey, ncolor)
+
+static void vkr_list_add(VkRaster *r, const VkrPipeKey *key)
+{
+    const uint8_t *b = (const uint8_t *)key;
+    GString *l;
+    char *line;
+    FILE *f;
+    size_t i;
+
+    if (!r->listed || !key->vs->sum || !key->fs->sum) {
+        return;
+    }
+    l = g_string_new(NULL);
+    g_string_printf(l, "%s %s ", key->vs->sum, key->fs->sum);
+    for (i = VKR_KEY_REST; i < sizeof(*key); i++) {
+        g_string_append_printf(l, "%02x", b[i]);
+    }
+    line = g_string_free(l, false);
+    if (!g_hash_table_add(r->listed, line)) {
+        return;
+    }
+    f = fopen(r->list_path, "ab");
+    if (f) {
+        fprintf(f, "%s\n", line);
+        fclose(f);
+    }
+}
+
+/* the stage kept under the checksum; any thread */
+static bool vkr_list_stage(VkRaster *r, const char *sum, unsigned stage,
+                           VkrShader *s)
+{
+    g_autofree char *path = g_strdup_printf("%s/%s.%u.spv", r->cache_dir,
+                                            sum, stage);
+    g_autofree char *spv = NULL;
+    gsize n = 0;
+    VkShaderModuleCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+    };
+
+    if (!g_file_get_contents(path, &spv, &n, NULL) || !n || (n & 3)) {
+        return false;
+    }
+    ci.codeSize = n;
+    ci.pCode = (const uint32_t *)spv;
+    return vkCreateShaderModule(r->dev, &ci, NULL, &s->mod) == VK_SUCCESS;
+}
+
+/* the pipeline of a line, for the pipeline cache; any thread */
+static void vkr_list_build(VkRaster *r, VkrPipe *p)
+{
+    g_auto(GStrv) w = g_strsplit(p->line, " ", 3);
+    VkrShader vs = { 0 }, fs = { 0 };
+    uint8_t *b = (uint8_t *)&p->key;
+    size_t i, n = sizeof(p->key) - VKR_KEY_REST;
+    bool ok = g_strv_length(w) == 3 && strlen(w[2]) == n * 2;
+    unsigned v;
+
+    for (i = 0; ok && i < n; i++) {
+        ok = sscanf(w[2] + i * 2, "%2x", &v) == 1;
+        b[VKR_KEY_REST + i] = v;
+    }
+    ok = ok && p->key.ncolor <= VKR_COLORS;
+    for (i = 0; ok && i < p->key.ncolor; i++) {
+        ok = p->key.fmt[i] < VKR_FMT_N;
+    }
+    if (ok && vkr_list_stage(r, w[0], 0, &vs) &&
+        vkr_list_stage(r, w[1], 1, &fs)) {
+        p->key.vs = &vs;
+        p->key.fs = &fs;
+        vkr_pipe_build(r, p);
+        vkDestroyPipeline(r->dev, p->pipe, NULL);
+    }
+    vkDestroyShaderModule(r->dev, vs.mod, NULL);
+    vkDestroyShaderModule(r->dev, fs.mod, NULL);
+    g_free(p->line);
+    g_free(p);
+}
+
+static void vkr_list_load(VkRaster *r)
+{
+    g_autofree char *text = NULL;
+    g_auto(GStrv) l = NULL;
+    unsigned i;
+
+    r->listed = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    if (!g_file_get_contents(r->list_path, &text, NULL, NULL)) {
+        return;
+    }
+    l = g_strsplit(text, "\n", -1);
+    for (i = 0; l[i]; i++) {
+        if (*l[i] && g_hash_table_add(r->listed, g_strdup(l[i]))) {
+            VkrPipe *p = g_new0(VkrPipe, 1);
+
+            p->line = g_strdup(l[i]);
+            g_thread_pool_push(r->builders, p, NULL);
+        }
+    }
+}
+
+/* a builder thread */
+static void vkr_builder(gpointer data, gpointer opaque)
+{
+    VkRaster *r = opaque;
+    VkrPipe *p = data;
+    int64_t t0 = g_get_monotonic_time();
+
+    if (p->line) {
+        vkr_list_build(r, p);
+        qatomic_inc(&r->n_listed);
+        qatomic_add(&r->listed_ns, (g_get_monotonic_time() - t0) * 1000);
+        return;
+    }
+    vkr_pipe_build(r, p);
     qatomic_add(&r->pipe_ns, (g_get_monotonic_time() - t0) * 1000);
+    qatomic_inc(&r->n_pipes);
+    g_mutex_lock(&r->lock);
+    qatomic_set(&p->ready, true);
+    g_cond_broadcast(&r->built);
+    g_mutex_unlock(&r->lock);
+}
+
+/* a new pipeline: in the table at once, built by a builder thread */
+static void vkr_pipe_start(VkRaster *r, VkrPipe *p)
+{
+    g_hash_table_insert(r->pipes, &p->key, p);
+    vkr_list_add(r, &p->key);
+    g_thread_pool_push(r->builders, p, NULL);
 }
 
 /* the description as the key: what does not matter is zero */
@@ -1037,7 +1243,7 @@ static void vkr_pipe_key(const VkrPipeDesc *d, VkrPipeKey *key)
     }
 }
 
-static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
+static VkrPipe *vkr_pipe(VkRaster *r, const VkrDraw *d)
 {
     VkrPipeDesc pd = { .vs = d->vs, .fs = d->fs, .ncolor = d->ncolor,
                        .depth = d->depth != NULL };
@@ -1054,17 +1260,15 @@ static VkPipeline vkr_pipe(VkRaster *r, const VkrDraw *d)
     if (!p) {
         p = g_new0(VkrPipe, 1);
         p->key = key;
-        vkr_pipe_build(r, p);
-        g_hash_table_insert(r->pipes, &p->key, p);
+        vkr_pipe_start(r, p);
     }
-    return p->pipe;
+    return p;
 }
 
 typedef struct VkrJob {
     unsigned stage;
     const char *glsl;
     VkrShader **out;
-    VkrPipe *pipe;
 } VkrJob;
 
 static void vkr_job(gpointer data, gpointer opaque)
@@ -1072,16 +1276,14 @@ static void vkr_job(gpointer data, gpointer opaque)
     VkrJob *j = data;
     char *log;
 
-    if (j->pipe) {
-        vkr_pipe_build(opaque, j->pipe);
-    } else {
-        *j->out = vkr_shader_new(opaque, j->stage, j->glsl, &log);
-        g_free(log);
-    }
+    *j->out = vkr_shader_new(opaque, j->stage, j->glsl, &log);
+    g_free(log);
 }
 
-static void vkr_jobs(VkRaster *r, VkrJob *j, unsigned n)
+void vkr_shaders_new(VkRaster *r, unsigned n, const unsigned *stage,
+                     char *const *glsl, VkrShader **out)
 {
+    g_autofree VkrJob *j = g_new0(VkrJob, n);
     GThreadPool *pool;
     unsigned i;
 
@@ -1091,30 +1293,18 @@ static void vkr_jobs(VkRaster *r, VkrJob *j, unsigned n)
     pool = g_thread_pool_new(vkr_job, r, MIN(n, MAX(g_get_num_processors(),
                                                     2u) - 1), false, NULL);
     for (i = 0; i < n; i++) {
+        j[i].stage = stage[i];
+        j[i].glsl = glsl[i];
+        j[i].out = &out[i];
         g_thread_pool_push(pool, &j[i], NULL);
     }
     g_thread_pool_free(pool, false, true);
     r->n_ahead += n;
 }
 
-void vkr_shaders_new(VkRaster *r, unsigned n, const unsigned *stage,
-                     char *const *glsl, VkrShader **out)
-{
-    g_autofree VkrJob *j = g_new0(VkrJob, n);
-    unsigned i;
-
-    for (i = 0; i < n; i++) {
-        j[i].stage = stage[i];
-        j[i].glsl = glsl[i];
-        j[i].out = &out[i];
-    }
-    vkr_jobs(r, j, n);
-}
-
 void vkr_pipes_ahead(VkRaster *r, const VkrPipeDesc *d, unsigned n)
 {
-    g_autofree VkrJob *j = g_new0(VkrJob, n);
-    unsigned i, k = 0;
+    unsigned i;
 
     for (i = 0; i < n; i++) {
         VkrPipe *p = g_new0(VkrPipe, 1);
@@ -1124,11 +1314,9 @@ void vkr_pipes_ahead(VkRaster *r, const VkrPipeDesc *d, unsigned n)
             g_free(p);
             continue;
         }
-        /* in the table at once: one of a kind is built */
-        g_hash_table_insert(r->pipes, &p->key, p);
-        j[k++].pipe = p;
+        vkr_pipe_start(r, p);
+        r->n_ahead++;
     }
-    vkr_jobs(r, j, k);
 }
 
 static VkSampler vkr_samp(VkRaster *r, const VkrSampler *s)
@@ -1189,7 +1377,34 @@ static VkSampler vkr_samp(VkRaster *r, const VkrSampler *s)
 
 void vkr_draw(VkRaster *r, const VkrDraw *d)
 {
-    VkPipeline pipe = vkr_pipe(r, d);
+    VkrPipe *p = vkr_pipe(r, d);
+
+    if (vkr_built(r, p, false)) {
+        if (p->pipe) {
+            vkr_record(r, d, p->pipe);
+        }
+    } else {
+        /*
+         * the pipeline is being built: what is recorded and the draw
+         * are kept back, what follows is recorded behind them
+         */
+        VkrHeld h = { .cb = r->cb };
+
+        vkr_end_scope(r);
+        vkEndCommandBuffer(r->cb);
+        g_array_append_val(r->held, h);
+        h.cb = VK_NULL_HANDLE;
+        h.pipe = p;
+        h.d = *d;
+        g_array_append_val(r->held, h);
+        vkr_begin(r);
+        r->n_held++;
+    }
+    r->n_draws++;
+}
+
+static void vkr_record(VkRaster *r, const VkrDraw *d, VkPipeline pipe)
+{
     VkDescriptorImageInfo ii[VKR_TEXTURES];
     VkWriteDescriptorSet wr[VKR_TEXTURES + 2];
     VkDescriptorBufferInfo bi[2] = {
@@ -1207,9 +1422,6 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
     bool set = r->cur_state.set;
     unsigned i, n = 0;
 
-    if (!pipe) {
-        return;
-    }
     for (i = 0; i < d->ncolor && same; i++) {
         same = r->cur[i] == d->color[i];
     }
@@ -1350,7 +1562,6 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
     } else {
         vkCmdDraw(r->cb, d->nvert, MAX(d->ninst, 1), 0, 0);
     }
-    r->n_draws++;
 }
 
 void vkr_stats(VkRaster *r, GString *out)
@@ -1361,12 +1572,16 @@ void vkr_stats(VkRaster *r, GString *out)
         " reads %" PRIu64 " copies %" PRIu64 " ring wraps %" PRIu64 "\n"
         "vk: stages %" PRIu64 " (%" PRIu64 " compiled, %" PRId64
         " ms) pipelines %" PRIu64
-        " (%" PRId64 " ms); built ahead %" PRIu64 "\n", r->name, r->n_draws,
+        " (%" PRId64 " ms); built ahead %" PRIu64 "; draws kept back %" PRIu64
+        " (%" PRId64 " ms waited); of the list %" PRIu64 " (%" PRId64
+        " ms)\n", r->name, r->n_draws,
         r->n_scopes, r->n_submits, r->n_waits, r->wait_ns / 1000000,
         r->n_writes, r->n_reads, r->n_copies, r->n_wraps, r->n_shaders,
         r->n_compiled,
-        r->shader_ns / 1000000, r->n_pipes, r->pipe_ns / 1000000,
-        r->n_ahead);
+        r->shader_ns / 1000000, qatomic_read(&r->n_pipes),
+        qatomic_read(&r->pipe_ns) / 1000000, r->n_ahead, r->n_held,
+        r->held_ns / 1000000, qatomic_read(&r->n_listed),
+        qatomic_read(&r->listed_ns) / 1000000);
 }
 
 static void vkr_cache_save(VkRaster *r)
@@ -1374,7 +1589,7 @@ static void vkr_cache_save(VkRaster *r)
     size_t n = 0;
     void *p;
 
-    r->saved_pipes = r->n_pipes;
+    r->saved_pipes = qatomic_read(&r->n_pipes);
     r->saved_at = g_get_monotonic_time();
     if (!r->cache_path ||
         vkGetPipelineCacheData(r->dev, r->pcache, &n, NULL) != VK_SUCCESS) {
@@ -1385,7 +1600,6 @@ static void vkr_cache_save(VkRaster *r)
         g_file_set_contents(r->cache_path, p, n, NULL);
     }
     g_free(p);
-    r->saved_pipes = r->n_pipes;
     r->saved_at = g_get_monotonic_time();
 }
 
@@ -1401,6 +1615,15 @@ void vkr_close(VkRaster *r)
     unsigned i;
 
     if (r->dev) {
+        if (r->builders) {
+            /* the builds under way end; the ones waiting are dropped */
+            g_thread_pool_free(r->builders, true, true);
+            g_array_free(r->held, true);
+            g_cond_clear(&r->built);
+        }
+        if (r->listed) {
+            g_hash_table_destroy(r->listed);
+        }
         vkDeviceWaitIdle(r->dev);
         vkr_cache_save(r);
         if (r->dead) {
@@ -1447,6 +1670,7 @@ void vkr_close(VkRaster *r)
     if (r->inst) {
         vkDestroyInstance(r->inst, NULL);
     }
+    g_free(r->list_path);
     g_free(r->cache_path);
     g_free(r->cache_dir);
     g_free(r);
@@ -1663,6 +1887,7 @@ VkRaster *vkr_open(const char *cache, const char **err)
     if (cache) {
         r->cache_dir = g_strdup(cache);
         r->cache_path = g_build_filename(cache, "pipelines.bin", NULL);
+        r->list_path = g_build_filename(cache, "pipelines.list", NULL);
         if (g_file_get_contents(r->cache_path, &blob, &blob_len, NULL)) {
             cci.initialDataSize = blob_len;
             cci.pInitialData = blob;
@@ -1688,6 +1913,14 @@ VkRaster *vkr_open(const char *cache, const char **err)
     r->idle = g_ptr_array_new();
     g_queue_init(&r->subs);
     g_mutex_init(&r->lock);
+    g_cond_init(&r->built);
+    r->held = g_array_new(false, false, sizeof(VkrHeld));
+    r->builders = g_thread_pool_new(vkr_builder, r,
+                                    MAX(g_get_num_processors(), 2u) - 1,
+                                    false, NULL);
+    if (r->list_path) {
+        vkr_list_load(r);
+    }
     glslang_initialize_process();
     vkr_begin(r);
     *err = NULL;

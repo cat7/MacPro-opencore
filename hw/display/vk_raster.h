@@ -23,6 +23,11 @@
  * at a time calls in, but for vkr_mark_wait() and vkr_mark_free(), which
  * any thread may call at any time.
  *
+ * PIPELINES are built on other threads. A draw whose pipeline is not
+ * built yet is kept back with all that is queued behind it, and no call
+ * waits for the build but one that waits for the GPU or makes a mark:
+ * the pipelines of the draws queued meanwhile are built side by side.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -110,7 +115,10 @@ typedef struct VkrPipeDesc {
     uint32_t depth;             /* a depth image is attached */
 } VkrPipeDesc;
 
-/* cache: folder the stages and pipelines built are kept in, or NULL */
+/*
+ * cache: folder the stages and pipelines built are kept in, or NULL;
+ * the pipelines used are listed there and built again at the start
+ */
 VkRaster *vkr_open(const char *cache, const char **err);
 void vkr_close(VkRaster *r);
 const char *vkr_device(VkRaster *r);
@@ -161,7 +169,10 @@ void vkr_mark_free(VkRaster *r, VkrMark *k);
 /* stage 0 vertex, 1 fragment; NULL and *log (g_free) when it fails */
 VkrShader *vkr_shader_new(VkRaster *r, unsigned stage, const char *glsl,
                           char **log);
-/* n stages, and the pipelines of n descriptions, several at a time */
+/*
+ * n stages, several at a time; the pipelines of n descriptions start
+ * to be built
+ */
 void vkr_shaders_new(VkRaster *r, unsigned n, const unsigned *stage,
                      char *const *glsl, VkrShader **out);
 void vkr_pipes_ahead(VkRaster *r, const VkrPipeDesc *d, unsigned n);
