@@ -56,6 +56,9 @@ struct VkrMark {
     GPtrArray *reads;           /* the reads queued in it */
     bool done;                  /* reached, its command buffer freed */
     bool held;                  /* the caller has it */
+    /* its words lie from here to where the ring was when it was handed over */
+    size_t ring_from;
+    uint32_t ring_gen;
 };
 
 struct VkrShader {
@@ -99,6 +102,8 @@ struct VkRaster {
     uint8_t *ring_map;
     size_t ring_at, keep_at, tables_size;
     uint32_t ring_gen;
+    /* where the command buffer's words begin; the ring is free up to ring_end */
+    size_t ring_from, ring_end;
 
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -117,7 +122,7 @@ struct VkRaster {
 
     uint64_t n_draws, n_scopes, n_submits, n_waits, n_pipes, n_shaders;
     uint64_t n_compiled, n_ahead;
-    uint64_t n_writes, n_reads, n_wraps, saved_pipes;
+    uint64_t n_writes, n_reads, n_copies, n_wraps, saved_pipes;
     int64_t saved_at;
     int64_t pipe_ns, shader_ns, wait_ns;
 };
@@ -388,6 +393,9 @@ static VkrMark *vkr_submit(VkRaster *r)
     vkr_end_scope(r);
     vkCreateFence(r->dev, &fi, NULL, &k->fence);
     k->cb = r->cb;
+    k->ring_from = r->ring_from;
+    k->ring_gen = r->ring_gen;
+    r->ring_from = r->ring_at;
     k->reads = r->reads;
     r->reads = g_ptr_array_new();
     vkEndCommandBuffer(r->cb);
@@ -442,15 +450,37 @@ void vkr_mark_free(VkRaster *r, VkrMark *k)
     g_mutex_unlock(&r->lock);
 }
 
+/*
+ * At its end the ring starts again; the words of command buffers the GPU
+ * still has, from the oldest one's on, are waited for only when the room
+ * before them runs out.
+ */
 void vkr_data_room(VkRaster *r, size_t n)
 {
     n = ROUND_UP(n, 16) + 4096;
     g_assert(n <= VKR_RING);
     if (r->ring_at + n > VKR_RING) {
-        vkr_flush(r, true);
-        r->ring_at = 0;
+        vkr_flush(r, false);
+        r->ring_at = r->ring_from = r->ring_end = 0;
         r->ring_gen++;
         r->n_wraps++;
+    }
+    while (r->ring_at + n > r->ring_end) {
+        VkrMark *k;
+
+        vkr_reap(r, false);
+        k = g_queue_peek_head(&r->subs);
+        if (!k || k->ring_gen == r->ring_gen) {
+            r->ring_end = VKR_RING;
+        } else if (r->ring_at + n <= k->ring_from) {
+            r->ring_end = k->ring_from;
+        } else {
+            int64_t t0 = g_get_monotonic_time();
+
+            vkWaitForFences(r->dev, 1, &k->fence, VK_TRUE, UINT64_MAX);
+            r->n_waits++;
+            r->wait_ns += (g_get_monotonic_time() - t0) * 1000;
+        }
     }
 }
 
@@ -686,6 +716,32 @@ void vkr_image_write(VkRaster *r, VkrImage *i, uint32_t level, uint32_t layer,
     vkr_settle(r);
     r->cb_used = true;
     r->n_writes++;
+}
+
+void vkr_image_copy(VkRaster *r, VkrImage *from, VkrImage *to, uint32_t level,
+                    uint32_t layer, uint32_t w, uint32_t h)
+{
+    VkImageAspectFlags a = vkr_depth(to) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                         : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageCopy c = {
+        .srcSubresource = { a, 0, 0, 1 },
+        .dstSubresource = { a, level, to->volume ? 0 : layer, 1 },
+        .dstOffset = { 0, 0, to->volume ? layer : 0 },
+        .extent = { w, h, 1 },
+    };
+
+    if (from->fmt != to->fmt || level >= to->levels || layer >= to->layers ||
+        w > from->w || h > from->h || w > MAX(to->w >> level, 1u) ||
+        h > MAX(to->h >> level, 1u)) {
+        return;
+    }
+    vkr_end_scope(r);
+    vkr_settle(r);
+    vkCmdCopyImage(r->cb, from->img, VK_IMAGE_LAYOUT_GENERAL, to->img,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vkr_settle(r);
+    r->cb_used = true;
+    r->n_copies++;
 }
 
 const void *vkr_image_read_later(VkRaster *r, VkrImage *i, uint32_t x,
@@ -1269,12 +1325,13 @@ void vkr_stats(VkRaster *r, GString *out)
     g_string_append_printf(out,
         "vk: %s: draws %" PRIu64 " scopes %" PRIu64 " submits %" PRIu64
         " waits %" PRIu64 " (%" PRId64 " ms) image writes %" PRIu64
-        " reads %" PRIu64 " ring wraps %" PRIu64 "\n"
+        " reads %" PRIu64 " copies %" PRIu64 " ring wraps %" PRIu64 "\n"
         "vk: stages %" PRIu64 " (%" PRIu64 " compiled, %" PRId64
         " ms) pipelines %" PRIu64
         " (%" PRId64 " ms); built ahead %" PRIu64 "\n", r->name, r->n_draws,
         r->n_scopes, r->n_submits, r->n_waits, r->wait_ns / 1000000,
-        r->n_writes, r->n_reads, r->n_wraps, r->n_shaders, r->n_compiled,
+        r->n_writes, r->n_reads, r->n_copies, r->n_wraps, r->n_shaders,
+        r->n_compiled,
         r->shader_ns / 1000000, r->n_pipes, r->pipe_ns / 1000000,
         r->n_ahead);
 }

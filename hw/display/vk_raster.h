@@ -139,6 +139,12 @@ void vkr_image_write(VkRaster *r, VkrImage *i, uint32_t level, uint32_t layer,
 void vkr_image_read(VkRaster *r, VkrImage *i, uint32_t x, uint32_t y,
                     uint32_t w, uint32_t h, void *px);
 /*
+ * w x h pixels at the origin of from become those of to's level and
+ * layer; the images have one format
+ */
+void vkr_image_copy(VkRaster *r, VkrImage *from, VkrImage *to, uint32_t level,
+                    uint32_t layer, uint32_t w, uint32_t h);
+/*
  * the same without waiting: the pixels are at the address returned once
  * the mark made next is reached, until that mark is freed
  */
