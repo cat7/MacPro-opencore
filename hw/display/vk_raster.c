@@ -119,6 +119,18 @@ struct VkRaster {
     VkrImage *cur[VKR_COLORS], *cur_z;
     uint32_t cur_w, cur_h;
     VkPipeline cur_pipe;
+    /* what the command buffer has set and bound; set: it has any */
+    struct {
+        bool set;
+        uint32_t width, height;
+        int32_t scissor[4];
+        float blend_const[4], zbias_const, zbias_slope;
+        uint8_t cull, front_cw, ztest, zwrite, zfunc;
+        struct {
+            VkSampler samp;
+            VkImageView view;
+        } tex[VKR_TEXTURES];
+    } cur_state;
 
     uint64_t n_draws, n_scopes, n_submits, n_waits, n_pipes, n_shaders;
     uint64_t n_compiled, n_ahead;
@@ -334,6 +346,7 @@ static void vkr_begin(VkRaster *r)
     vkBeginCommandBuffer(r->cb, &bi);
     r->cb_used = false;
     r->cur_pipe = VK_NULL_HANDLE;
+    memset(&r->cur_state, 0, sizeof(r->cur_state));
 }
 
 static void vkr_end_scope(VkRaster *r)
@@ -1215,6 +1228,8 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
     bool same = r->rendering && r->cur_n == d->ncolor &&
                 r->cur_z == d->depth && r->cur_w == d->width &&
                 r->cur_h == d->height;
+    bool ztest = d->depth && d->ztest, zwrite = ztest && d->zwrite;
+    bool set = r->cur_state.set;
     unsigned i, n = 0;
 
     if (!pipe) {
@@ -1268,7 +1283,7 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
         vkCmdBindPipeline(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         r->cur_pipe = pipe;
     }
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 2 && !r->cur_state.set; i++) {
         wr[n++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstBinding = i,
@@ -1278,12 +1293,20 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
         };
     }
     for (i = 0; i < d->ntex; i++) {
+        VkSampler samp;
+
         if (!d->tex[i].img) {
             continue;
         }
+        samp = vkr_samp(r, &d->tex[i].s);
+        if (r->cur_state.tex[i].samp == samp &&
+            r->cur_state.tex[i].view == d->tex[i].img->view) {
+            continue;
+        }
+        r->cur_state.tex[i].samp = samp;
+        r->cur_state.tex[i].view = d->tex[i].img->view;
         ii[i] = (VkDescriptorImageInfo){
-            vkr_samp(r, &d->tex[i].s), d->tex[i].img->view,
-            VK_IMAGE_LAYOUT_GENERAL,
+            samp, d->tex[i].img->view, VK_IMAGE_LAYOUT_GENERAL,
         };
         wr[n++] = (VkWriteDescriptorSet){
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1293,23 +1316,58 @@ void vkr_draw(VkRaster *r, const VkrDraw *d)
             .pImageInfo = &ii[i],
         };
     }
-    r->push(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout,
-                           0, n, wr);
+    if (n) {
+        r->push(r->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r->layout, 0, n, wr);
+    }
     vkCmdPushConstants(r->cb, r->layout, VK_SHADER_STAGE_VERTEX_BIT |
                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(d->pc), d->pc);
-    vkCmdSetViewport(r->cb, 0, 1, &vp);
-    vkCmdSetScissor(r->cb, 0, 1, &sc);
-    vkCmdSetBlendConstants(r->cb, d->blend_const);
-    vkCmdSetCullMode(r->cb, (d->cull & 1 ? VK_CULL_MODE_FRONT_BIT : 0) |
-                     (d->cull & 2 ? VK_CULL_MODE_BACK_BIT : 0));
-    vkCmdSetFrontFace(r->cb, d->front_cw ? VK_FRONT_FACE_CLOCKWISE
-                                         : VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    vkCmdSetDepthTestEnable(r->cb, d->depth && d->ztest);
-    vkCmdSetDepthWriteEnable(r->cb, d->depth && d->ztest && d->zwrite);
-    vkCmdSetDepthCompareOp(r->cb, d->zfunc & 7);
-    vkCmdSetDepthBiasEnable(r->cb, d->zbias_const != 0.0f ||
-                            d->zbias_slope != 0.0f);
-    vkCmdSetDepthBias(r->cb, d->zbias_const, 0.0f, d->zbias_slope);
+    if (!set || r->cur_state.width != d->width ||
+        r->cur_state.height != d->height) {
+        vkCmdSetViewport(r->cb, 0, 1, &vp);
+        r->cur_state.width = d->width;
+        r->cur_state.height = d->height;
+    }
+    if (!set || memcmp(r->cur_state.scissor, d->scissor, sizeof(d->scissor))) {
+        vkCmdSetScissor(r->cb, 0, 1, &sc);
+        memcpy(r->cur_state.scissor, d->scissor, sizeof(d->scissor));
+    }
+    if (!set || memcmp(r->cur_state.blend_const, d->blend_const,
+                       sizeof(d->blend_const))) {
+        vkCmdSetBlendConstants(r->cb, d->blend_const);
+        memcpy(r->cur_state.blend_const, d->blend_const,
+               sizeof(d->blend_const));
+    }
+    if (!set || r->cur_state.cull != d->cull) {
+        vkCmdSetCullMode(r->cb, (d->cull & 1 ? VK_CULL_MODE_FRONT_BIT : 0) |
+                         (d->cull & 2 ? VK_CULL_MODE_BACK_BIT : 0));
+        r->cur_state.cull = d->cull;
+    }
+    if (!set || r->cur_state.front_cw != d->front_cw) {
+        vkCmdSetFrontFace(r->cb, d->front_cw ? VK_FRONT_FACE_CLOCKWISE
+                                             : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        r->cur_state.front_cw = d->front_cw;
+    }
+    if (!set || r->cur_state.ztest != ztest) {
+        vkCmdSetDepthTestEnable(r->cb, ztest);
+        r->cur_state.ztest = ztest;
+    }
+    if (!set || r->cur_state.zwrite != zwrite) {
+        vkCmdSetDepthWriteEnable(r->cb, zwrite);
+        r->cur_state.zwrite = zwrite;
+    }
+    if (!set || r->cur_state.zfunc != (d->zfunc & 7)) {
+        vkCmdSetDepthCompareOp(r->cb, d->zfunc & 7);
+        r->cur_state.zfunc = d->zfunc & 7;
+    }
+    if (!set || memcmp(&r->cur_state.zbias_const, &d->zbias_const, 4) ||
+        memcmp(&r->cur_state.zbias_slope, &d->zbias_slope, 4)) {
+        vkCmdSetDepthBiasEnable(r->cb, d->zbias_const != 0.0f ||
+                                d->zbias_slope != 0.0f);
+        vkCmdSetDepthBias(r->cb, d->zbias_const, 0.0f, d->zbias_slope);
+        r->cur_state.zbias_const = d->zbias_const;
+        r->cur_state.zbias_slope = d->zbias_slope;
+    }
+    r->cur_state.set = true;
     if (d->nindex) {
         vkCmdBindIndexBuffer(r->cb, r->ring, (VkDeviceSize)d->index * 4,
                              VK_INDEX_TYPE_UINT32);
