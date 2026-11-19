@@ -311,6 +311,11 @@ typedef struct HD5770GpuVs {
     const uint32_t *tidx;
     unsigned ntidx;
     /*
+     * added 2026-11-19: not 0: names the content of tidx; two requests
+     * with one id have the same triangles
+     */
+    uint64_t tidx_id;
+    /*
      * the polygon offset of the sides not culled (alike, not clamped):
      * zoff_const + zoff_slope * the steeper of the depth's slopes
      */

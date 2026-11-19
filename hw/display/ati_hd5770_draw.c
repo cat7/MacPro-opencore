@@ -157,6 +157,7 @@ typedef struct IdxEntry {
     uint8_t *raw;
     uint32_t *idx, *slot, *vid, *tidx;
     unsigned nu, ntidx;
+    uint64_t tidx_id;           /* names tidx's content */
     uint64_t used, bytes;
     struct IdxEntry *next;
 } IdxEntry;
@@ -222,7 +223,7 @@ struct HD5770ShaderCache {
     ShEntry *b[SH_BUCKETS];
     ShEntry *last[4][SH_LAST];  /* by stage and address: the last program */
     IdxEntry *ib[IDX_BUCKETS];
-    uint64_t idx_bytes, idx_tick;
+    uint64_t idx_bytes, idx_tick, tidx_ids;
     TexMemo tm[TEX_MEMO];
 };
 
@@ -4929,12 +4930,14 @@ static bool vsb_draw(Draw *d, const IdxSrc *is, IdxEntry *ic,
         if (ic) {
             ic->tidx = tidx;
             ic->ntidx = n * 3;
+            ic->tidx_id = ++d->g->cache->tidx_ids;
             ic->bytes += 12ull * MAX(n, 1u);
             d->g->cache->idx_bytes += 12ull * MAX(n, 1u);
         }
     }
     v.tidx = tidx;
     v.ntidx = n * 3;
+    v.tidx_id = ic ? ic->tidx_id : 0;
     d->gvs = &v;
     d->gfb = GFB_NONE;
     d->cwhy = HD5770_WHY_N;

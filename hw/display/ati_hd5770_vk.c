@@ -109,6 +109,12 @@ typedef struct VkVb {
     uint8_t *seen;              /* the bytes as copied */
 } VkVb;
 
+/* a vertex stage's triangles in the words, of ring gen */
+typedef struct VkTix {
+    uint64_t id;
+    uint32_t off, gen;
+} VkTix;
+
 /* buffers one thread works in */
 typedef struct VkScratch {
     uint8_t *tmp;
@@ -184,6 +190,9 @@ typedef struct HD5770Vk {
     char *fail_log;
     char last_surf[160];        /* the last surface without an image */
     GHashTable *vbs;            /* VRAM offset -> VkVb */
+    VkTix tix[4096];
+    /* the vertex stages' constant file in the words, of ring cf_gen */
+    uint32_t cf_seen[1024], cf_off, cf_gen;
     uint64_t nd[VD_N], dims[8], rtf[64], txf[64];
     uint64_t uploads, upload_bytes, nback[VB_N], back_bytes[VB_N];
     uint64_t fences, syncs, ranges, parts;
@@ -1740,17 +1749,25 @@ staged:
     q.pc[0] = uo;
     if (v) {
         uint32_t *n, *ix;
+        VkTix *ti;
         float f;
 
-        n = vkr_data(m->r, (HD5770_NV_WORDS + v->ir->nconsts + 1024) * 4, &vo);
+        /* the constant file stays where it is while it is the same */
+        if (m->cf_gen != vkr_data_gen(m->r) ||
+            memcmp(m->cf_seen, v->cfile, sizeof(m->cf_seen))) {
+            memcpy(vkr_data(m->r, sizeof(m->cf_seen), &m->cf_off), v->cfile,
+                   sizeof(m->cf_seen));
+            memcpy(m->cf_seen, v->cfile, sizeof(m->cf_seen));
+            m->cf_gen = vkr_data_gen(m->r);
+        }
+        n = vkr_data(m->r, (HD5770_NV_WORDS + v->ir->nconsts) * 4, &vo);
         memset(n, 0, HD5770_NV_WORDS * 4);
         n[0] = v->nslot;
         n[1] = v->ninst;
         n[2] = v->np;
         n[4] = vo + HD5770_NV_WORDS;
         memcpy(n + HD5770_NV_WORDS, v->kv, v->ir->nconsts * 4);
-        n[5] = vo + HD5770_NV_WORDS + v->ir->nconsts;
-        memcpy(n + HD5770_NV_WORDS + v->ir->nconsts, v->cfile, 4096);
+        n[5] = m->cf_off;
         n[6] = v->nvb;
         n[7] = v->base_vtx;
         n[8] = v->start_inst;
@@ -1774,8 +1791,18 @@ staged:
         memcpy(n + HD5770_NV_X + 12, &v->pix_center, 4);
         memcpy(n + HD5770_NV_X + 13, &v->zoff_const, 4);
         memcpy(n + HD5770_NV_DEF, v->def, 128 * 4);
-        ix = vkr_data(m->r, (size_t)v->ntidx * 4, &q.index);
-        memcpy(ix, v->tidx, (size_t)v->ntidx * 4);
+        /* triangles with a name stay where they are in the words */
+        ti = &m->tix[v->tidx_id % ARRAY_SIZE(m->tix)];
+        if (v->tidx_id && ti->id == v->tidx_id &&
+            ti->gen == vkr_data_gen(m->r)) {
+            q.index = ti->off;
+        } else {
+            ix = vkr_data(m->r, (size_t)v->ntidx * 4, &q.index);
+            memcpy(ix, v->tidx, (size_t)v->ntidx * 4);
+            ti->id = v->tidx_id;
+            ti->off = q.index;
+            ti->gen = vkr_data_gen(m->r);
+        }
         q.nindex = v->ntidx;
         q.ninst = v->ninst;
         q.pc[1] = vo;
@@ -2240,6 +2267,8 @@ HD5770Gpu *hd5770_vk_open(uint8_t *vram, uint64_t vram_size, const char **err)
     m->pub.ops = &vk_ops;
     m->pub.b = m;
     m->pub.vs_draw = true;
+    m->pub.ram_copied = true;
+    m->cf_gen = UINT32_MAX;
     qemu_thread_create(&m->thread, "hd5770-vk", vk_retire, m,
                        QEMU_THREAD_JOINABLE);
     return &m->pub;
