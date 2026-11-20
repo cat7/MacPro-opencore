@@ -1,35 +1,57 @@
+====================================================
+Intel Mac OS X on a Mac Pro for qemu-system-x86_64
+====================================================
+
+This ``MacPro-opencore`` branch is a personal fork of QEMU. It runs Intel
+Mac OS X 10.5 Leopard to 10.10 Yosemite on ``qemu-system-x86_64`` as a Mac
+Pro (MacPro1,1 to MacPro5,1): the ``q35`` machine with OVMF and OpenCore,
+an Apple SMC, and emulated ATI Radeon graphics cards that Mac OS X drives
+with its own drivers, so nothing has to be installed in the guest. It is an
+experiment and is not meant for upstream QEMU.
+
+QEMU as a whole is released under the GNU General Public License, version
+2. For full licensing details, consult the LICENSE file.
+
+Download
+========
+
+A ready-made build for macOS (Apple silicon and Intel), with a GUI for
+setting up and starting machines:
+
+  https://github.com/cat7/MacPro-opencore/releases/tag/MacPro-opencore-2026-11-20
+
+All releases: https://github.com/cat7/MacPro-opencore/releases
+
+The GUI is developed in https://github.com/cat7/Qemu-GUI-MacPro-Opencore.
+Mac OS X itself and the SMC key are not included; the readme in the
+download says where to start.
+
+The machine
 ===========
-QEMU README
-===========
 
-QEMU is a generic and open source machine & userspace emulator and
-virtualizer.
+=====================  ======================================================
+Models                 MacPro1,1 to MacPro5,1; the processor is QEMU's
+                       Penryn (1,1 to 3,1), Nehalem (4,1) or Westmere (5,1)
+                       model, named as a Xeon the model shipped with
+Mac OS X               10.5 to 10.10 (10.8 and later on MacPro3,1 and newer)
+Firmware               OVMF (UEFI) with OpenCore on a generated boot disk
+Graphics               ATI Radeon HD 5770 (10.6 to 10.10), ATI Radeon X1900
+                       XT (10.5 to 10.7) or standard VGA; each Radeon has
+                       its own UEFI GOP option ROM, built from ``roms/``
+Storage                ICH9 AHCI (SATA)
+Input                  USB keyboard and tablet; host USB devices
+Acceleration           TCG everywhere; HVF on an Intel Mac; WHPX on Windows
+=====================  ======================================================
 
-QEMU is capable of emulating a complete machine in software without any
-need for hardware virtualization support. By using dynamic translation,
-it achieves very good performance. QEMU can also integrate with the Xen
-and KVM hypervisors to provide emulated hardware while allowing the
-hypervisor to manage the CPU. With hypervisor support, QEMU can achieve
-near native performance for CPUs. When QEMU emulates CPUs directly it is
-capable of running operating systems made for one machine (e.g. an ARMv7
-board) on a different machine (e.g. an x86_64 PC board).
+The HD 5770
+-----------
 
-QEMU is also capable of providing userspace API virtualization for Linux
-and BSD kernel interfaces. This allows binaries compiled against one
-architecture ABI (e.g. the Linux PPC64 ABI) to be run on a host using a
-different architecture ABI (e.g. the Linux x86_64 ABI). This does not
-involve any hardware emulation, simply CPU and syscall emulation.
-
-QEMU aims to fit into a variety of use cases. It can be invoked directly
-by users wishing to have full control over its behaviour and settings.
-It also aims to facilitate integration into higher level management
-layers, by providing a stable command line interface and monitor API.
-It is commonly invoked indirectly via the libvirt library when using
-open source applications such as oVirt, OpenStack and virt-manager.
-
-QEMU as a whole is released under the GNU General Public License,
-version 2. For full licensing details, consult the LICENSE file.
-
+The HD 5770 (``-device ati-radeon-hd5770``) is modelled at the register
+level: display controller, command processor and the 3D engine, which runs
+the guest driver's shader programs. Drawing goes to the host's GPU, through
+Metal on macOS and through Vulkan on Windows, with a CPU path for the rest.
+Accelerated OpenGL in Mac OS X, Quartz Extreme and Core Animation work
+with Apple's own driver.
 
 Documentation
 =============
