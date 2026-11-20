@@ -15,8 +15,8 @@ QEMU as a whole is released under the GNU General Public License, version
 Download
 ========
 
-A ready-made build for macOS (Apple silicon and Intel), with a GUI for
-setting up and starting machines:
+Ready-made builds for macOS (Apple silicon and Intel) and 64-bit Windows,
+with a GUI for setting up and starting machines:
 
   https://github.com/cat7/MacPro-opencore/releases/tag/MacPro-opencore-2026-11-20
 
