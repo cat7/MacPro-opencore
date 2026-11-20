@@ -1770,6 +1770,7 @@ staged:
         tu[14] = (t->samp[0] >> 3) & 7;
         q.tex[i].img = ts[i]->img;
         vk_sampler(t, lvs[i] > 1, lvs[i] - 1, &q.tex[i].s);
+        tu[15] = q.tex[i].s.mag_linear | q.tex[i].s.border << 1;
     }
     for (i = 0; i < d->nvb; i++) {
         uint32_t off;

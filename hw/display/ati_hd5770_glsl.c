@@ -1523,9 +1523,13 @@ static void nat_unit(GString *o, unsigned unit, bool padded, unsigned dim,
     if (padded) {
         g_string_append_printf(o,
             "        vec2 sc = vec2(F(words[uo + %uu]), F(words[uo + %uu]));\n"
+            "        uint bw = words[uo + %uu];\n"
+            "        float in_ = hd_nin(tc.x, ts.x, words[uo + %uu], bw) *\n"
+            "                    hd_nin(tc.y, ts.y, words[uo + %uu], bw);\n"
             "        tc = vec2(hd_nwrap(tc.x, ts.x, words[uo + %uu]),\n"
             "                  hd_nwrap(tc.y, ts.y, words[uo + %uu])) * sc;\n"
-            "        dv *= sc.xyxy;\n", tu + 11, tu + 12, tu + 13, tu + 14);
+            "        dv *= sc.xyxy;\n", tu + 11, tu + 12, tu + 15, tu + 13,
+            tu + 14, tu + 13, tu + 14);
     }
     g_string_append_printf(o,
         "        if (op == 0x11u) {\n"
@@ -1537,16 +1541,22 @@ static void nat_unit(GString *o, unsigned unit, bool padded, unsigned dim,
         "            if (op == 0x12u) {\n                bias += F(c[3]);\n            }\n"
         "            dv *= exp2(bias);\n"
         "            v = textureGrad(t%u, %s, %s);\n"
-        "        }\n"
+        "        }\n", unit, tcs, unit, tcs, unit, tcs,
+        vol ? "vec3(dv.xy, 0.0), vec3(dv.zw, 0.0)" : "dv.xy, dv.zw");
+    if (padded) {
+        /* the border the host's sampler would give */
+        g_string_append(o,
+            "        v = mix((bw & 6u) == 0u ? vec4(0.0) : (bw & 6u) == 2u ?\n"
+            "                vec4(0.0, 0.0, 0.0, 1.0) : vec4(1.0), v, in_);\n");
+    }
+    g_string_append_printf(o,
         "    }\n"
         "    if (cmp) {\n"
         "        v = vec4(hd_ncmp(words[uo + %uu], words[uo + %uu], ref, v.x));\n"
         "    }\n"
         "    v = hd_nsel(v, uo + %uu);\n"
         "    o[0] = U(v.x); o[1] = U(v.y); o[2] = U(v.z); o[3] = U(v.w);\n"
-        "}\n", unit, tcs, unit, tcs, unit, tcs,
-        vol ? "vec3(dv.xy, 0.0), vec3(dv.zw, 0.0)" : "dv.xy, dv.zw", tu + 9,
-        tu + 10, tu + 2);
+        "}\n", tu + 9, tu + 10, tu + 2);
 }
 
 /*
@@ -1760,6 +1770,21 @@ char *hd5770_glsl_native_fs(const HD5770IR *ir, const HD5770NatKey *k,
         "    default: break;\n"
         "    }\n"
         "    return clamp(t, 0.5 / n, 1.0 - 0.5 / n);\n"
+        "}\n"
+        "/*\n"
+        " * the part of a sample the texture gives, the rest is the border:\n"
+        " * m the address mode, f bit 0 a linear filter\n"
+        " */\n"
+        "float hd_nin(float t, float n, uint m, uint f)\n"
+        "{\n"
+        "    if (m != 4u && m != 6u) {\n"
+        "        return 1.0;\n"
+        "    }\n"
+        "    if ((f & 1u) == 0u) {\n"
+        "        return t >= 0.0 && t < 1.0 ? 1.0 : 0.0;\n"
+        "    }\n"
+        "    return clamp(t * n + 0.5, 0.0, 1.0) *\n"
+        "           clamp((1.0 - t) * n + 0.5, 0.0, 1.0);\n"
         "}\n"
         "float hd_ncmp(uint fn, uint mx, float ref, float f)\n"
         "{\n"

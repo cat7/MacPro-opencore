@@ -570,7 +570,8 @@ enum {
     HD5770_NU_CR = 12,          /* 16: the clip rectangles */
     /*
      * per unit: w, h, dst_sel[4], base level, levels, depth, cmp, cmp
-     * max, the part of the image the texture takes (x, y), wrap x, y
+     * max, the part of the image the texture takes (x, y), wrap x, y,
+     * bit 0 linear filter and bits 1-2 border (0 none, 1 black, 2 white)
      */
     HD5770_NU_TEX = 28, HD5770_NU_TEX_WORDS = 16,
     HD5770_NU_BCONST = HD5770_NU_TEX + HD5770_NU_TEX_WORDS * HD5770_GPU_TEX,
