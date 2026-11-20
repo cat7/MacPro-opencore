@@ -5076,9 +5076,9 @@ static void prim_rows(const Draw *d, unsigned prim, float lo, float hi,
 
 /*
  * a texture of the pixel shader overlaps rows y0..y1-1 of a target the
- * draw writes
+ * draw writes; own: but for a texture that is the target's surface
  */
-static bool ps_feedback(Draw *d, bool all, int y0, int y1)
+static bool ps_feedback(Draw *d, bool all, bool own, int y0, int y1)
 {
     uint8_t ids[16];
     unsigned nres, i, k, nt = d->mrt ? d->nmrt : 1;
@@ -5107,7 +5107,10 @@ static bool ps_feedback(Draw *d, bool all, int y0, int y1)
 
             hd5770_surf_rows(rs, MAX(y0, 0),
                              MIN(MAX(y1, 0), (int)rs->height), &rlo, &rhi);
-            if (lo < rhi && rlo < hi) {
+            if (lo < rhi && rlo < hi &&
+                !(own && !t->mip && t->dim == 1 && t->slices <= 1 &&
+                  t->s.base == rs->base && t->s.pitch == rs->pitch &&
+                  t->s.mode == rs->mode && t->s.bpe == rs->bpe)) {
                 return true;
             }
         }
@@ -5118,9 +5121,11 @@ static bool ps_feedback(Draw *d, bool all, int y0, int y1)
 /*
  * The pixel shader runs on lanes unless it samples the render target:
  * then each pixel must see the ones drawn before it. A program with an
- * IR may go to the host GPU under the same condition (gpu_prog). The
- * draw writes rows y0..y1-1 at most: the clip box, and once the vertices
- * are known the rows they span, if a texture overlapped the first (fb).
+ * IR may go to the host GPU under the same condition (gpu_prog), or to
+ * a backend with feedback when the textures over the target are the
+ * target's own surface. The draw writes rows y0..y1-1 at most: the clip
+ * box, and once the vertices are known the rows they span, if a texture
+ * overlapped the first (fb).
  */
 static void lanes_setup(Draw *d, int y0, int y1)
 {
@@ -5134,10 +5139,12 @@ static void lanes_setup(Draw *d, int y0, int y1)
     g_free(d->kv);
     d->kv = NULL;
     d->gpu_prog = false;
-    fb_all = ps_feedback(d, true, y0, y1);
-    fb = ps_feedback(d, false, y0, y1);
+    fb_all = ps_feedback(d, true, false, y0, y1);
+    fb = ps_feedback(d, false, false, y0, y1);
     d->fb = fb_all || fb;
-    if (d->g->gpu && d->g->gpu_mode != HD5770_GPU_OFF && !fb_all) {
+    if (d->g->gpu && d->g->gpu_mode != HD5770_GPU_OFF &&
+        (!fb_all || (d->g->gpu->ops->feedback &&
+                     !ps_feedback(d, true, true, y0, y1)))) {
         d->gpu_prog = true;
     }
     if (!hd5770_prog_lanes(d->ps, &nconst, &grad) || fb) {

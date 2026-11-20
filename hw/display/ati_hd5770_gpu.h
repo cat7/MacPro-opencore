@@ -392,6 +392,12 @@ typedef struct HD5770GpuOps {
      * register 0x8e30 busy while the engine has work.
      */
     bool native;
+    /*
+     * added 2026-11-20: takes a draw with a texture that is the surface
+     * of one of its colour targets; the texture is what the target held
+     * before the draw
+     */
+    bool feedback;
 } HD5770GpuOps;
 
 typedef struct HD5770Gpu {
